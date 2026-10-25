@@ -1,0 +1,64 @@
+{
+  "commit": "b983465",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": false
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 0.0,
+      "cache_hits_por_consulta": 28.101,
+      "conjunto": "t-medio",
+      "consultas": 1000,
+      "gets_por_consulta": 9.367,
+      "max_us": 183.318,
+      "media_us": 66.394265,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 0.0,
+      "modo": "search",
+      "p50_us": 61.07,
+      "p95_us": 98.128,
+      "p99_us": 121.853,
+      "qps": 14234.90320543401,
+      "resultados_media": 415.519,
+      "threads": 1
+    },
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 0.0,
+      "cache_hits_por_consulta": 48.948,
+      "conjunto": "titulos",
+      "consultas": 1000,
+      "gets_por_consulta": 16.316,
+      "max_us": 1264.53,
+      "media_us": 161.613727,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 0.0,
+      "modo": "search",
+      "p50_us": 125.318,
+      "p95_us": 362.096,
+      "p99_us": 519.534,
+      "qps": 6002.253209841455,
+      "resultados_media": 143.642,
+      "threads": 1
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 4078891008,
+    "ram_total": 8266137600,
+    "swap_usado": 764035072
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-25T20-37-33",
+  "rotulo": "teste-256",
+  "threads": 1,
+  "tipo": "bench"
+}

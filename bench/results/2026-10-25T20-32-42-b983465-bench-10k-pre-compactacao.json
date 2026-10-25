@@ -1,0 +1,83 @@
+{
+  "commit": "b983465",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": false
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 2.933,
+      "cache_hits_por_consulta": 7.906,
+      "conjunto": "t-freq",
+      "consultas": 1000,
+      "gets_por_consulta": 5.664,
+      "max_us": 277.147,
+      "media_us": 93.175922,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 2.0,
+      "modo": "search",
+      "p50_us": 84.689,
+      "p95_us": 148.429,
+      "p99_us": 172.018,
+      "qps": 10432.88578305125,
+      "resultados_media": 6344.298,
+      "threads": 1
+    },
+    {
+      "block_reads_por_consulta": 1.657,
+      "bloom_util_por_consulta": 9.909,
+      "cache_hits_por_consulta": 17.005,
+      "conjunto": "titulos",
+      "consultas": 1000,
+      "gets_por_consulta": 16.316,
+      "max_us": 863.022,
+      "media_us": 161.676155,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 2.989,
+      "modo": "search",
+      "p50_us": 120.069,
+      "p95_us": 399.485,
+      "p99_us": 590.374,
+      "qps": 6057.503774294308,
+      "resultados_media": 143.642,
+      "threads": 1
+    },
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 7.431,
+      "cache_hits_por_consulta": 17.616,
+      "conjunto": "and-freq",
+      "consultas": 1000,
+      "gets_por_consulta": 14.298,
+      "max_us": 884.952,
+      "media_us": 277.813299,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 2.5,
+      "modo": "search",
+      "p50_us": 286.067,
+      "p95_us": 407.185,
+      "p99_us": 490.545,
+      "qps": 3550.390970651364,
+      "resultados_media": 4220.785,
+      "threads": 1
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 4188585984,
+    "ram_total": 8266137600,
+    "swap_usado": 716324864
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-25T20-32-42",
+  "rotulo": "10k-pre-compactacao",
+  "threads": 1,
+  "tipo": "bench"
+}

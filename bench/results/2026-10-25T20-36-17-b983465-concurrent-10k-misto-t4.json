@@ -1,0 +1,83 @@
+{
+  "batch": 1000,
+  "commit": "b983465",
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-10000.jsonl",
+  "db": "/home/evertondays/bench-db/perf/tmp-concorrencia",
+  "escrita_antes": {
+    "block_cache_hit": 3673797,
+    "block_cache_miss": 10729,
+    "bloom_util": 2621377,
+    "bytes_compactacao": 36610154,
+    "bytes_escritos_usuario": 0,
+    "bytes_flush": 0,
+    "stall_micros": 0,
+    "write_amp": 0.0
+  },
+  "escrita_depois": {
+    "block_cache_hit": 4367934,
+    "block_cache_miss": 11344,
+    "bloom_util": 3147572,
+    "bytes_compactacao": 36610154,
+    "bytes_escritos_usuario": 1995020,
+    "bytes_flush": 0,
+    "stall_micros": 0,
+    "write_amp": 18.35077041834167
+  },
+  "indexacao": {
+    "bytes": 6197831,
+    "docs": 1000,
+    "docs_por_s": 1237.713484349264,
+    "segundos": 0.807941428
+  },
+  "leitura_com_escrita": {
+    "block_reads_por_consulta": 0.0,
+    "bloom_util_por_consulta": 20.095107885055185,
+    "cache_hits_por_consulta": 28.184697225812865,
+    "conjunto": "misto",
+    "consultas": 20114,
+    "gets_por_consulta": 25.49348712339664,
+    "max_us": 3715.83,
+    "media_us": 157.6955363925624,
+    "merge_us_por_consulta": 0.0,
+    "merges_por_consulta": 2.5783533857015013,
+    "modo": "com escrita",
+    "p50_us": 103.469,
+    "p95_us": 389.386,
+    "p99_us": 1047.479,
+    "qps": 24895.369024201096,
+    "resultados_media": 267.4394948791886,
+    "threads": 4
+  },
+  "leitura_sem_escrita": {
+    "block_reads_por_consulta": 0.0730269907510973,
+    "bloom_util_por_consulta": 20.220901440175258,
+    "cache_hits_por_consulta": 28.305398921604173,
+    "conjunto": "misto",
+    "consultas": 129637,
+    "gets_por_consulta": 25.617740305622622,
+    "max_us": 9164.671,
+    "media_us": 151.34002953632066,
+    "merge_us_por_consulta": 0.0,
+    "merges_por_consulta": 3.022686424400441,
+    "modo": "sem escrita",
+    "p50_us": 99.788,
+    "p95_us": 375.516,
+    "p99_us": 993.089,
+    "qps": 25927.4,
+    "resultados_media": 267.7592585450142,
+    "threads": 4
+  },
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3976060928,
+    "ram_total": 8266137600,
+    "swap_usado": 755384320
+  },
+  "quando": "2026-10-25T20-36-17",
+  "rotulo": "10k-misto-t4",
+  "skip": 9000,
+  "take": null,
+  "threads": 4,
+  "tipo": "concurrent"
+}

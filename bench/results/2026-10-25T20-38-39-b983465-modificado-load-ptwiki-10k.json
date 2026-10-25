@@ -1,0 +1,48 @@
+{
+  "arquivos_l0": 1,
+  "banco_bytes": 23436391,
+  "banco_por_texto": 0.2410241917465812,
+  "batch": 1000,
+  "bytes_corpus": 97236675,
+  "chaves_estimadas": 1129400,
+  "commit": "b983465-modificado",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": true
+  },
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-10000.jsonl",
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "docs": 10000,
+  "docs_por_s": 860.1994852256953,
+  "escrita": {
+    "block_cache_hit": 24186,
+    "block_cache_miss": 3002,
+    "bloom_util": 0,
+    "bytes_compactacao": 0,
+    "bytes_escritos_usuario": 36467658,
+    "bytes_flush": 19815791,
+    "stall_micros": 0,
+    "write_amp": 0.5433798627814268
+  },
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3941560320,
+    "ram_total": 8266137600,
+    "swap_usado": 764035072
+  },
+  "mb_por_s": 7.976812150960754,
+  "nos_trie": 728633,
+  "pico_rss": 168292352,
+  "quando": "2026-10-25T20-38-39",
+  "remap_ids": false,
+  "rotulo": "ptwiki-10k",
+  "segundos": 11.625210398,
+  "skip": 0,
+  "streaming": false,
+  "swap_aumento": 0,
+  "take": null,
+  "tipo": "load"
+}

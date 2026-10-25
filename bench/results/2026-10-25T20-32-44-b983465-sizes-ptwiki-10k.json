@@ -1,0 +1,151 @@
+{
+  "commit": "b983465",
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "espacos": [
+    {
+      "bytes_chaves": 84626,
+      "bytes_valores": 146629,
+      "chaves": 10000,
+      "espaco": "doc"
+    },
+    {
+      "bytes_chaves": 33,
+      "bytes_valores": 6,
+      "chaves": 2,
+      "espaco": "meta"
+    },
+    {
+      "bytes_chaves": 7903853,
+      "bytes_valores": 4368321,
+      "chaves": 728633,
+      "espaco": "node"
+    },
+    {
+      "bytes_chaves": 3119850,
+      "bytes_valores": 7075667,
+      "chaves": 288493,
+      "espaco": "post"
+    }
+  ],
+  "listas": {
+    "a": 9318,
+    "de": 9950,
+    "e": 9527,
+    "em": 8519,
+    "o": 8322
+  },
+  "maiores": [
+    {
+      "bytes": 9950,
+      "chave": "post:1216",
+      "termo": "de"
+    },
+    {
+      "bytes": 9559,
+      "chave": "post:1513",
+      "termo": "do"
+    },
+    {
+      "bytes": 9527,
+      "chave": "post:1532",
+      "termo": "e"
+    },
+    {
+      "bytes": 9318,
+      "chave": "post:51",
+      "termo": "a"
+    },
+    {
+      "bytes": 8876,
+      "chave": "post:1205",
+      "termo": "da"
+    },
+    {
+      "bytes": 8849,
+      "chave": "post:4244",
+      "termo": "uma"
+    },
+    {
+      "bytes": 8653,
+      "chave": "post:882",
+      "termo": "com"
+    },
+    {
+      "bytes": 8519,
+      "chave": "post:1614",
+      "termo": "em"
+    },
+    {
+      "bytes": 8322,
+      "chave": "post:3090",
+      "termo": "o"
+    },
+    {
+      "bytes": 8238,
+      "chave": "post:3036",
+      "termo": "no"
+    },
+    {
+      "bytes": 7726,
+      "chave": "post:2078",
+      "termo": "foi"
+    },
+    {
+      "bytes": 7469,
+      "chave": "post:3602",
+      "termo": "que"
+    },
+    {
+      "bytes": 7415,
+      "chave": "post:2945",
+      "termo": "na"
+    },
+    {
+      "bytes": 7144,
+      "chave": "post:3244",
+      "termo": "para"
+    },
+    {
+      "bytes": 7124,
+      "chave": "post:3963",
+      "termo": "sua"
+    },
+    {
+      "bytes": 7078,
+      "chave": "post:3816",
+      "termo": "se"
+    },
+    {
+      "bytes": 7078,
+      "chave": "post:4243",
+      "termo": "um"
+    },
+    {
+      "bytes": 6952,
+      "chave": "post:3400",
+      "termo": "por"
+    },
+    {
+      "bytes": 6942,
+      "chave": "post:1213",
+      "termo": "das"
+    },
+    {
+      "bytes": 6837,
+      "chave": "post:1517",
+      "termo": "dos"
+    }
+  ],
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 4193767424,
+    "ram_total": 8266137600,
+    "swap_usado": 716324864
+  },
+  "nos_trie": 728633,
+  "quando": "2026-10-25T20-32-44",
+  "raiz_bytes": 4959,
+  "rotulo": "ptwiki-10k",
+  "tipo": "sizes"
+}

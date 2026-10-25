@@ -34,6 +34,8 @@ enum Command {
         caminhos: Vec<PathBuf>,
         #[command(flatten)]
         idiomas: Idiomas,
+        #[command(flatten)]
+        posicoes: Posicoes,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
     IndexJsonl {
@@ -52,12 +54,15 @@ enum Command {
         progresso_json: bool,
         #[command(flatten)]
         idiomas: Idiomas,
+        #[command(flatten)]
+        posicoes: Posicoes,
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos
     Compact {
         banco: PathBuf,
     },
-    /// Busca: termos combinados com E; termo* casa por prefixo
+    /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
+    /// Os resultados saem por relevância (BM25), com a nota.
     Search {
         banco: PathBuf,
         #[arg(required = true)]
@@ -65,6 +70,9 @@ enum Command {
         /// Quantos resultados imprimir
         #[arg(short = 'n', long, default_value_t = 50)]
         limite: usize,
+        /// Ordena por ID do documento, sem ranking
+        #[arg(long)]
+        por_id: bool,
     },
     /// Autocompletar: palavras indexadas que começam com o prefixo
     Suggest {
@@ -82,6 +90,21 @@ struct Idiomas {
     /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_idiomas)]
     idiomas: Option<ListaIdiomas>,
+}
+
+#[derive(clap::Args)]
+struct Posicoes {
+    /// Cria o banco sem posições: menor e mais rápido de carregar, mas sem
+    /// busca por frase. Num banco existente, precisa combinar com a criação.
+    #[arg(long)]
+    sem_posicoes: bool,
+}
+
+impl Posicoes {
+    /// `None` (usa o que o banco tiver) quando a opção não foi dada.
+    fn config(&self) -> Option<bool> {
+        self.sem_posicoes.then_some(false)
+    }
 }
 
 /// Lista de idiomas já validada (o clap precisa de um tipo só para o valor).
@@ -106,25 +129,28 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { banco } => open(&banco, None).and_then(|engine| {
+        Command::Tui { banco } => open(&banco, None, None).and_then(|engine| {
             tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
         }),
-        Command::Index { banco, caminhos, idiomas } => index(&banco, &caminhos, idiomas.idiomas),
-        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas } => {
+        Command::Index { banco, caminhos, idiomas, posicoes } => {
+            index(&banco, &caminhos, idiomas.idiomas, posicoes.config())
+        }
+        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas, posicoes } => {
             let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
-            open(&banco, idiomas.idiomas).and_then(|engine| {
+            open(&banco, idiomas.idiomas, posicoes.config()).and_then(|engine| {
                 if !progresso_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
+                    eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
                 }
                 jsonl::index(&engine, &arquivo, &opts)
             })
         }
-        Command::Compact { banco } => open(&banco, None).map(|engine| {
+        Command::Compact { banco } => open(&banco, None, None).map(|engine| {
             let started = Instant::now();
             engine.compact();
             println!("compactado em {:.2?}", started.elapsed());
         }),
-        Command::Search { banco, consulta, limite } => search(&banco, &consulta.join(" "), limite),
+        Command::Search { banco, consulta, limite, por_id } => search(&banco, &consulta.join(" "), limite, por_id),
         Command::Suggest { banco, prefixo, limite } => suggest(&banco, &prefixo, limite),
     };
     match result {
@@ -136,14 +162,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `idiomas` só importa na criação; `None` usa o que está gravado.
-fn open(db: &Path, idiomas: Option<ListaIdiomas>) -> Result<Engine, Box<dyn std::error::Error>> {
-    let config = Config { languages: idiomas.map(|i| i.0), ..Config::default() };
+/// Abre o banco. `idiomas` e `posicoes` só importam na criação; `None` usa o
+/// que está gravado.
+fn open(db: &Path, idiomas: Option<ListaIdiomas>, posicoes: Option<bool>) -> Result<Engine, Box<dyn std::error::Error>> {
+    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, ..Config::default() };
     Ok(Engine::open(db, config)?)
 }
 
-fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>) -> AnyResult {
-    let engine = open(db, idiomas)?;
+fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>, posicoes: Option<bool>) -> AnyResult {
+    let engine = open(db, idiomas, posicoes)?;
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     let started = Instant::now();
     let mut files = Vec::new();
@@ -191,27 +218,37 @@ fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>) -> AnyResu
     Ok(())
 }
 
-fn search(db: &Path, query: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None)?;
+fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
+    let engine = open(db, None, None)?;
     let started = Instant::now();
-    let docs = engine.search(query)?;
+    // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
+    let (hits, total) = if by_id {
+        let docs = engine.search(query)?;
+        let total = docs.len();
+        (docs.into_iter().take(limit).map(|doc| (doc, None)).collect::<Vec<_>>(), total)
+    } else {
+        let top = engine.search_ranked(query, limit)?;
+        (top.hits.into_iter().map(|h| (h.doc, Some(h.score))).collect(), top.total)
+    };
     let elapsed = started.elapsed();
 
-    for &doc in docs.iter().take(limit) {
-        match engine.label(doc)? {
-            Some(label) => println!("{doc}\t{label}"),
-            None => println!("{doc}"),
+    for (doc, score) in &hits {
+        let label = engine.label(*doc)?;
+        let score = score.map(|s| format!("{s:.3}\t")).unwrap_or_default();
+        match label {
+            Some(label) => println!("{score}{doc}\t{label}"),
+            None => println!("{score}{doc}"),
         }
     }
-    if docs.len() > limit {
-        println!("... e mais {}", docs.len() - limit);
+    if total > hits.len() {
+        println!("... e mais {}", total - hits.len());
     }
-    println!("{} resultado(s) em {elapsed:.2?}", docs.len());
+    println!("{total} resultado(s) em {elapsed:.2?}");
     Ok(())
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None)?;
+    let engine = open(db, None, None)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

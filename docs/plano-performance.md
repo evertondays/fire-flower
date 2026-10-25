@@ -30,8 +30,13 @@ a Wikipédia inteira leva mais de uma hora.
 ```bash
 python3 scripts/perf.py tudo --escala 10k     # todas as fases, ~7 min
 python3 scripts/perf.py pr --escala 10k       # checagem rápida contra a linha de base
+python3 scripts/perf.py frases --escala 10k   # só frases e ranking (carga com/sem posições, oráculo, latência)
 python3 scripts/perf.py relatorio --escala 10k
 ```
+
+Ao salvar uma linha de base nova (`tudo`, ou `pr --salvar-baseline`), a
+anterior, de outro commit, fica guardada como
+`bench/baseline-pr-<escala>-<commit>.json`.
 
 Os resultados ficam em `bench/results/` (um JSON por medição, com commit e
 data) e o resumo legível em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
@@ -85,9 +90,10 @@ cada operação:
 | Autocompletar | `suggest` | idem, até `limit` | busca em largura em prefixos curtos |
 | Abrir o banco | `Engine::open` | leitura de 2 contadores | tempo de recuperação do WAL após carga grande |
 
-**Fora do escopo por enquanto** (o motor não tem): busca por frase, OR,
-ranking, remoção e atualização. Quando existirem, ganham um conjunto de
-consultas próprio na Fase 4.
+**Fora do escopo por enquanto** (o motor não tem): OR, remoção e
+atualização. Busca por frase e ranking BM25 já existem (ver
+[plano-frases-e-ranking.md](plano-frases-e-ranking.md)) e têm conjuntos
+próprios (`frase-*`, `rank-*`).
 
 ---
 
@@ -298,6 +304,16 @@ pequeno).
 | `s-*` | os mesmos prefixos no `suggest`, limite 10 | | autocompletar |
 | `titulos` | 1.000 títulos reais | "Revolução Francesa" | mistura realista; também checa revocação |
 | `misto` | 70% `titulos`/`t-medio`, 20% `and-*`, 10% `p-*` | | carga das Fases 4 e 5 |
+| `frase-2` / `frase-3` | trechos reais de 2 e 3 palavras sem stopword | `"revolução francesa"` | conferência de posições |
+| `frase-stop` | 3 palavras com stopword no meio | `"copa do mundo"` | o buraco da stopword |
+| `frase-freq` | 2 palavras entre os 500 termos de maior df | `"sao paulo"` | muitos candidatos para conferir |
+| `frase-miss` | `frase-2`/`frase-3` com a ordem trocada | `"francesa revolução"` | conferir sem achar |
+| `rank-freq` | os termos de `t-freq`, top 10 | | custo do BM25 numa lista grande |
+| `rank-and` | 2–3 termos (df ≥ 100) do mesmo artigo, top 10 | | BM25 depois do E |
+| `rank-titulos` | os títulos de `titulos`, top 10 | | o caso real da CLI e do TUI |
+
+Conjuntos `rank-*` são medidos com `search_ranked(q, 10)`; os demais com
+`search` (todos os IDs), e os `s-*` com `suggest`.
 
 ---
 

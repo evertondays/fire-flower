@@ -9,6 +9,7 @@
     python3 scripts/perf.py latencia          # Fase 4: latência por conjunto, merge pendente vs. compactado
     python3 scripts/perf.py concorrencia      # Fase 5: escala com threads e leitura durante escrita
     python3 scripts/perf.py pr                # Fase 8: checagem rápida; falha se o p50 piorar >10%
+    python3 scripts/perf.py frases            # frases e ranking: carga com/sem posições, oráculo, latência
     python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
     python3 scripts/perf.py comparar A.json B.json
 
@@ -58,6 +59,11 @@ REPETIR_ATE_DOCS = 10_000
 REPETICOES = 3  # --repeticoes
 # Quantas rodadas recentes (do mesmo commit e rótulo) entram na mediana.
 MEDIANA_DE = 5
+
+# Conjuntos do `pr` (comparados com a linha de base) e das frases/ranking.
+PR_SETS = ["t-medio", "t-freq", "p-2", "rank-freq", "frase-2"]
+FRASE_SETS = ["t-freq", "rank-freq", "and-2", "rank-and", "titulos", "rank-titulos",
+              "frase-2", "frase-3", "frase-stop", "frase-freq", "frase-miss"]
 
 ORANGE, BOLD, DIM, RED, GREEN, RESET = "\x1b[38;5;208m", "\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[32m", "\x1b[0m"
 
@@ -139,11 +145,22 @@ def load_rounds(path, slice_name, label, *extra):
         wiki("load", "--db", path, "--corpus", corpus(slice_name), *extra, "--label", label)
 
 
-def ensure_loaded(slice_name):
-    """Banco da fatia; carrega se ainda não existir."""
-    path = db(f"ptwiki-{slice_name}")
+def usable(path):
+    """O banco existe e este binário consegue abri-lo (um banco de um formato
+    antigo é recusado sem ser alterado)."""
     if not os.path.exists(path):
-        step(f"carga {slice_name} (banco não existia)")
+        return False
+    r = subprocess.run([FF, "search", path, "xyzzyinexistente"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"{DIM}{path}: {r.stderr.strip()}; recarregando{RESET}")
+    return r.returncode == 0
+
+
+def ensure_loaded(slice_name):
+    """Banco da fatia; carrega se não existir ou se for de um formato antigo."""
+    path = db(f"ptwiki-{slice_name}")
+    if not usable(path):
+        step(f"carga {slice_name} (banco não existia ou era de outro formato)")
         fresh(path)
         wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", 1000, "--label", f"ptwiki-{slice_name}")
     return path
@@ -188,9 +205,16 @@ def latest(results, kind, label=None):
     return found[-1] if found else None
 
 
-def median_load(results, label):
+def formato(r):
+    """Formato do banco de um resultado de carga: 1 antes de tf e posições."""
+    return r.get("formato", 1)
+
+
+def median_load(results, label, fmt=None):
     """Carga mediana (por docs/s) entre as últimas MEDIANA_DE rodadas com o
-    rótulo, todas do mesmo commit da mais recente. Ganha `_rodadas`, `_min` e `_max`."""
+    rótulo, todas do mesmo commit da mais recente. `fmt` restringe ao formato
+    do banco (1 ou 2). Ganha `_rodadas`, `_min` e `_max`."""
+    results = [r for r in results if fmt is None or r.get("tipo") != "load" or formato(r) == fmt]
     last = latest(results, "load", label)
     if not last:
         return None
@@ -235,17 +259,45 @@ def fase_experimentos(scale):
     runs += [("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
              ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
              ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024]),
-             ("sem-cache-de-nos", ["--batch", 1000, "--cache-nos", 0])]
+             ("sem-cache-de-nos", ["--batch", 1000, "--cache-nos", 0]),
+             ("sem-posicoes", ["--batch", 1000, "--sem-posicoes"])]
     for label, extra in runs:
         step(f"experimento {s}: {label}")
         load_rounds(tmp, s, f"exp-{s}-{label}", *extra)
-        if label == "ids-remapeados":
-            wiki("sizes", "--db", tmp)
+        if label in ("ids-remapeados", "sem-posicoes"):
+            sizes_of(tmp, f"exp-{s}-{label}")
+        if label == "sem-posicoes":
+            compact_and_save(tmp, f"{s}-sem-posicoes")
     stream = smaller(s, "10k") if s != "10k" else "1k"
     step(f"experimento: streaming (1 commit por documento, {stream})")
     fresh(tmp)
     wiki("load", "--db", tmp, "--corpus", corpus(stream), "--streaming", "--label", f"exp-{s}-streaming-{stream}")
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def compact_and_save(path, label):
+    """Compacta e grava o tamanho antes e depois: o tamanho logo após a carga
+    depende de quanto do WAL já virou SST, o compactado é estável."""
+    before = dir_size(path)
+    t = time.time()
+    run([FF, "compact", path])
+    save_result("compact", label, {"segundos": time.time() - t, "banco_antes": before, "banco_depois": dir_size(path)})
+
+
+def sizes_of(path, label):
+    """`wiki sizes` de um banco temporário, gravado com um rótulo próprio (o
+    padrão é o nome da pasta, que se repete entre experimentos)."""
+    named = os.path.join(os.path.dirname(path), label)
+    if os.path.abspath(named) == os.path.abspath(path):
+        wiki("sizes", "--db", path)
+        return
+    if os.path.exists(named):
+        shutil.rmtree(named)
+    os.rename(path, named)
+    try:
+        wiki("sizes", "--db", named)
+    finally:
+        os.rename(named, path)
 
 
 def fase_corretude(scale):
@@ -314,9 +366,10 @@ def fase_consultas(scale):
 
 def bench(path, scale, sets, label, threads=1, extra=()):
     qdir = queries_dir(scale)
-    if not os.path.isdir(qdir):
-        fase_consultas(scale)
     files = [os.path.join(qdir, f"{s}.txt") for s in sets] if sets else [qdir]
+    # Conjuntos novos (frases, ranking) aparecem quando o `wiki queries` muda.
+    if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) or not os.path.exists(os.path.join(qdir, "rank-freq.txt")):
+        fase_consultas(scale)
     wiki("bench", "--db", path, "--queries", *files, "--threads", threads, "--label", label, *extra)
 
 
@@ -337,9 +390,9 @@ def fase_latencia(scale):
     fresh(path)
     wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", 1000, "--label", f"ptwiki-{scale}")
 
-    step("merge pendente: t-freq, títulos e and-freq antes da compactação")
+    step("merge pendente: termos, títulos, frases e ranking antes da compactação")
     pre_open = open_time(path)
-    bench(path, scale, ["t-freq", "titulos", "and-freq"], f"{scale}-pre-compactacao")
+    bench(path, scale, ["t-freq", "titulos", "and-freq", "rank-freq", "frase-2", "frase-freq"], f"{scale}-pre-compactacao")
 
     step("compactação")
     size_before = dir_size(path)
@@ -348,7 +401,7 @@ def fase_latencia(scale):
     compact_s = time.time() - t
     save_result("compact", scale, {"segundos": compact_s, "banco_antes": size_before, "banco_depois": dir_size(path),
                                    "abertura_antes": pre_open, "abertura_depois": open_time(path)})
-    wiki("sizes", "--db", path)
+    sizes_of(path, f"ptwiki-{scale}-compactado")
 
     step("latência de todos os conjuntos (cache quente)")
     bench(path, scale, None, f"{scale}-t1")
@@ -374,7 +427,7 @@ def fase_concorrencia(scale):
     n = docs_in(scale)
     base_n = n * 9 // 10
     base = db(f"ptwiki-{scale}-90")
-    if not os.path.exists(base):
+    if not usable(base):
         step(f"carga dos primeiros {base_n} artigos (base da leitura durante escrita)")
         fresh(base)
         wiki("load", "--db", base, "--corpus", corpus(scale), "--take", base_n, "--label", f"ptwiki-{scale}-90")
@@ -400,7 +453,7 @@ def fase_pr(scale, salvar_baseline=False):
     ok = wiki("oracle", "--db", tmp_small, "--corpus", corpus(small), "--label", f"pr-{small}", check=False) == 0
     step(f"pr: carga {scale} + bench")
     load_rounds(tmp_big, scale, f"pr-{scale}")
-    bench(tmp_big, scale, ["t-medio", "t-freq", "p-2"], f"pr-{scale}")
+    bench(tmp_big, scale, PR_SETS, f"pr-{scale}")
     for p in (tmp_small, tmp_big):
         shutil.rmtree(p, ignore_errors=True)
 
@@ -408,6 +461,7 @@ def fase_pr(scale, salvar_baseline=False):
     current = latest(results, "bench", f"pr-{scale}")
     load_now = median_load(results, f"pr-{scale}")
     if salvar_baseline or not os.path.exists(baseline_path):
+        archive_baseline(baseline_path, current)
         with open(baseline_path, "w") as f:
             json.dump({"bench": current, "load": load_now}, f, indent=2, ensure_ascii=False)
         print(f"linha de base salva em {baseline_path}")
@@ -423,6 +477,53 @@ def fase_pr(scale, salvar_baseline=False):
     if worse:
         print(f"{RED}✗ p50 piorou mais de 10% em: {', '.join(worse)}{RESET}")
     return ok and not worse
+
+
+def archive_baseline(path, current):
+    """Antes de trocar a linha de base, guarda a anterior (de outro commit)
+    como baseline-pr-<escala>-<commit>.json, para o relatório comparar."""
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        old = json.load(f)
+    old_commit = (old.get("bench") or {}).get("commit")
+    if old_commit and current and old_commit != current.get("commit"):
+        dst = path[:-len(".json")] + f"-{old_commit}.json"
+        if not os.path.exists(dst):
+            shutil.copy(path, dst)
+            print(f"{DIM}linha de base anterior guardada em {dst}{RESET}")
+
+
+def fase_frases(scale):
+    """Plano de frases e ranking, Fase E: carga com e sem posições, oráculo
+    (tf, posições, frases, BM25 e título → artigo) e latência dos conjuntos
+    novos, antes e depois de compactar."""
+    small = smaller(scale, "10k")
+    path = db(f"ptwiki-{scale}")
+    step(f"carga {scale} com posições")
+    load_rounds(path, scale, f"ptwiki-{scale}", "--batch", 1000)
+    sizes_of(path, f"ptwiki-{scale}")
+    tmp = db("tmp-sem-posicoes")
+    step(f"carga {scale} sem posições")
+    load_rounds(tmp, scale, f"exp-{smaller(scale, '100k')}-sem-posicoes", "--batch", 1000, "--sem-posicoes")
+    sizes_of(tmp, f"exp-{smaller(scale, '100k')}-sem-posicoes")
+    compact_and_save(tmp, f"{smaller(scale, '100k')}-sem-posicoes")
+    shutil.rmtree(tmp, ignore_errors=True)
+    step(f"oráculo {small} (tf, posições, frases, ranking, título → artigo)")
+    ok = wiki("oracle", "--db", ensure_loaded(small), "--corpus", corpus(small), "--label", f"{small}-todos", check=False) == 0
+    step("latência: frases e ranking antes da compactação")
+    bench(path, scale, FRASE_SETS, f"{scale}-pre-compactacao")
+    step("compactação")
+    pre_open = open_time(path)
+    size_before = dir_size(path)
+    t = time.time()
+    run([FF, "compact", path])
+    save_result("compact", scale, {"segundos": time.time() - t, "banco_antes": size_before, "banco_depois": dir_size(path),
+                                   "abertura_antes": pre_open, "abertura_depois": open_time(path)})
+    sizes_of(path, f"ptwiki-{scale}-compactado")
+    step("latência de todos os conjuntos (cache quente)")
+    bench(path, scale, None, f"{scale}-t1")
+    return ok
 
 
 # ------------------------------------------------------------------ comparação
@@ -476,6 +577,10 @@ def dur(s):
         return "—"
     m, sec = divmod(int(round(s)), 60)
     return f"{m}min{sec:02d}s" if m else f"{s:.1f}s"
+
+
+def pct_txt(v):
+    return "—" if v is None else f"{fmt(v * 100, 1)}%"
 
 
 def us(v):
@@ -539,6 +644,10 @@ def cmd_relatorio(scale):
               "| Verificação | Casos | Divergências | Notas |", "|---|---|---|---|"]
         for c in r["verificacoes"]:
             L.append(f"| {c['verificacao']} | {fmt(c['casos'])} | {c['divergencias']} | {'; '.join(c['notas'])} |")
+        rel = r.get("relevancia")
+        if rel:
+            L += ["", f"Relevância (título → artigo, {fmt(rel['consultas'])} consultas): top-1 {pct_txt(rel['top1'])}, "
+                      f"top-10 {pct_txt(rel['top10'])}, MRR {fmt(rel['mrr'], 3)}, fora do top-1000: {rel['fora_do_top1000']}."]
         L.append("")
 
     # Fase 2
@@ -640,6 +749,8 @@ def cmd_relatorio(scale):
                          f"{fmt(r['indexacao']['docs_por_s'])} | {fmt(stall, 1)}s |")
         L.append("")
 
+    L += frases_section(R, scale, post, oracles)
+
     # Metas
     load_scale = median_load(R, f"ptwiki-{scale}")
     t1 = {s["conjunto"]: s for s in (post or {}).get("conjuntos", [])}
@@ -656,11 +767,91 @@ def cmd_relatorio(scale):
           f"| p99 de `t-freq` (quente) | {us(t1.get('t-freq', {}).get('p99_us'))} | |",
           f"| p99 de `misto` com indexação em paralelo | {us(c4['leitura_com_escrita']['p99_us']) if c4 else '—'} | |",
           f"| Abrir o banco + 1 busca (após a carga) | {fmt(comp['abertura_antes']['mediana_s'] * 1000) + ' ms' if comp else '—'} | |",
+          f"| p50 de `rank-freq` ÷ p50 de `t-freq` | {ratio_txt(t1, 'rank-freq', 't-freq')} | **≤ 2×** |",
+          f"| p50 de `frase-2` | {us(t1.get('frase-2', {}).get('p50_us'))} | |",
           ""]
 
     with open(REPORT, "w") as f:
         f.write("\n".join(L))
     print(f"relatório: {REPORT}")
+
+
+def ratio_txt(sets, a, b):
+    """p50 de `a` ÷ p50 de `b`, como "1,8×"."""
+    pa, pb = sets.get(a, {}).get("p50_us"), sets.get(b, {}).get("p50_us")
+    return f"{fmt(pa / pb, 2)}×" if pa and pb else "—"
+
+
+def frases_section(R, scale, post, oracles):
+    """Fase E do plano de frases e ranking: custo do formato v2 e latência."""
+    exp = smaller(scale, "100k")
+    v1 = median_load(R, f"ptwiki-{scale}", fmt=1)
+    v2 = median_load(R, f"ptwiki-{scale}", fmt=2)
+    nopos = median_load(R, f"exp-{exp}-sem-posicoes", fmt=2)
+    if not v2:
+        return []
+    sets = {s["conjunto"]: s for s in (post or {}).get("conjuntos", [])}
+
+    def delta(r):
+        return f" ({pct(r['docs_por_s'], v1['docs_por_s']):+.0f}%)" if r and v1 else ""
+
+    L = ["## Frases e ranking (formato v2)", "",
+         "Plano em [docs/plano-frases-e-ranking.md](../docs/plano-frases-e-ranking.md). A linha de base é a última "
+         "carga no formato v1 (sem tf nem posições) com o mesmo rótulo.", "",
+         "| Métrica | Linha de base (v1) | Agora | Meta |", "|---|---|---|---|",
+         f"| Carga {scale} com posições | {docs_s(v1) + ' docs/s' if v1 else '—'} | {docs_s(v2)} docs/s{delta(v2)} | queda ≤ 30% |"]
+    if nopos and exp == scale:
+        L.append(f"| Carga {scale} sem posições | {docs_s(v1) + ' docs/s' if v1 else '—'} | {docs_s(nopos)} docs/s{delta(nopos)} | queda ≤ 10% |")
+    # Logo após a carga: inclui o WAL ainda não compactado, varia entre rodadas.
+    L += [f"| Banco ÷ texto logo após a carga, com posições | {fmt(v1['banco_por_texto'], 2) if v1 else '—'} | {fmt(v2['banco_por_texto'], 2)} | registrar |"]
+    if nopos and exp == scale:
+        L.append(f"| Banco ÷ texto logo após a carga, sem posições | {fmt(v1['banco_por_texto'], 2) if v1 else '—'} | {fmt(nopos['banco_por_texto'], 2)} | |")
+    comp, comp_nopos = latest(R, "compact", scale), latest(R, "compact", f"{exp}-sem-posicoes")
+    v1_commits = {r.get("commit") for r in R if r.get("tipo") == "load" and formato(r) == 1}
+    comp_v1 = next((r for r in reversed(R) if r.get("tipo") == "compact" and r.get("rotulo") == scale
+                    and r.get("commit") in v1_commits), None)
+    text = v2.get("bytes_corpus") or 1
+    ratio = lambda c: fmt(c["banco_depois"] / text, 2) + f" ({mb(c['banco_depois'])} MB)" if c else "—"
+    L += [f"| Banco compactado ÷ texto, com posições | {ratio(comp_v1)} | {ratio(comp)} | registrar |"]
+    if comp_nopos and exp == scale:
+        L.append(f"| Banco compactado ÷ texto, sem posições | {ratio(comp_v1)} | {ratio(comp_nopos)} | |")
+    L += [f"| Pico de RSS na carga, com posições | {mb(v1['pico_rss']) + ' MB' if v1 else '—'} | {mb(v2['pico_rss'])} MB | |",
+          f"| p50 de `rank-freq` ÷ p50 de `t-freq` | — | {ratio_txt(sets, 'rank-freq', 't-freq')} | ≤ 2× |",
+          f"| p50 de `frase-2` | — | {us(sets.get('frase-2', {}).get('p50_us'))} | registrar |"]
+    rel = next((r.get("relevancia") for r in reversed(list(oracles.values())) if r.get("relevancia")), None)
+    if rel:
+        L.append(f"| Título → artigo (MRR) | — | {fmt(rel['mrr'], 3)} (top-1 {pct_txt(rel['top1'])}, top-10 {pct_txt(rel['top10'])}) | registrar e acompanhar |")
+    L.append("")
+
+    with_pos, without = latest(R, "sizes", f"ptwiki-{scale}"), latest(R, "sizes", f"exp-{exp}-sem-posicoes")
+    if with_pos and with_pos.get("posicoes") is not None:
+        a = {e["espaco"]: e for e in with_pos["espacos"]}
+        b = {e["espaco"]: e for e in (without or {}).get("espacos", [])}
+        L += [f"### Espaço por tipo de chave ({scale}, valores lógicos)", "",
+              "| Espaço | Com posições (MB) | Sem posições (MB) |", "|---|---|---|"]
+        for name in sorted(set(a) | set(b)):
+            size = lambda e: mb(e["bytes_chaves"] + e["bytes_valores"]) if e else "—"
+            L.append(f"| `{name}:` | {size(a.get(name))} | {size(b.get(name))} |")
+        L.append("")
+
+    pairs = [("t-freq", "rank-freq"), ("and-2", "rank-and"), ("titulos", "rank-titulos")]
+    if any(r in sets for _, r in pairs):
+        L += [f"### Ranking: top 10 vs. todos os IDs ({scale}, p50)", "",
+              "| Consulta | Sem ranking | Top 10 (BM25) | Razão |", "|---|---|---|---|"]
+        for plain, ranked in pairs:
+            if ranked in sets:
+                L.append(f"| `{plain}` / `{ranked}` | {us(sets.get(plain, {}).get('p50_us'))} | "
+                         f"{us(sets[ranked]['p50_us'])} | {ratio_txt(sets, ranked, plain)} |")
+        L.append("")
+    frase = [s for s in ("frase-2", "frase-3", "frase-stop", "frase-freq", "frase-miss") if s in sets]
+    if frase:
+        L += [f"### Frases ({scale})", "", "| Conjunto | p50 | p95 | p99 | resultados (média) | Gets/consulta |", "|---|---|---|---|---|---|"]
+        for name in frase:
+            x = sets[name]
+            L.append(f"| `{name}` | {us(x['p50_us'])} | {us(x['p95_us'])} | {us(x['p99_us'])} | "
+                     f"{fmt(x['resultados_media'], 1)} | {fmt(x['gets_por_consulta'], 1)} |")
+        L.append("")
+    return L
 
 
 # ------------------------------------------------------------------------ main
@@ -677,7 +868,8 @@ def main():
     e = sub.add_parser("escada", parents=[common], help="Fase 2")
     e.add_argument("--experimentos", action="store_true")
     for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
-                        ("concorrencia", "Fase 5"), ("relatorio", "gera bench/RESULTADOS.md")):
+                        ("concorrencia", "Fase 5"), ("frases", "frases e ranking (Fase E do plano)"),
+                        ("relatorio", "gera bench/RESULTADOS.md")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
     pr.add_argument("--salvar-baseline", action="store_true")
@@ -711,7 +903,7 @@ def main():
         ok = fase_pr(scale, args.salvar_baseline)
     else:
         result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
-                  "concorrencia": fase_concorrencia}[args.cmd](scale)
+                  "concorrencia": fase_concorrencia, "frases": fase_frases}[args.cmd](scale)
         ok = result is not False
     cmd_relatorio(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

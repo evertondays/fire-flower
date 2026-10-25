@@ -255,9 +255,17 @@ fn diagnostics_walk_terms_and_raw_keys() {
     assert_eq!(engine.postings_of_node(*node).unwrap(), [1, 2]);
     assert_eq!(engine.term_node("Roupa").unwrap(), Some(*node));
 
-    let mut post_keys = 0;
-    engine.for_each_raw(|k, _| post_keys += k.starts_with(b"post:") as usize).unwrap();
+    let (mut post_keys, mut pos_keys, mut norm_keys) = (0, 0, 0);
+    engine
+        .for_each_raw(|k, _| {
+            post_keys += k.starts_with(b"post:") as usize;
+            pos_keys += k.starts_with(b"pos:") as usize;
+            norm_keys += k.starts_with(b"norm:") as usize;
+        })
+        .unwrap();
     assert_eq!(post_keys, terms.len());
+    assert_eq!(pos_keys, terms.len());
+    assert_eq!(norm_keys, 1, "IDs 1 a 4 cabem num bloco");
     assert!(engine.trie_node_count().unwrap() > terms.len() as u64);
     assert!(engine.rocksdb_stats().unwrap().contains("rocksdb.block.cache"));
     assert!(engine.property("rocksdb.estimate-num-keys").is_some());
@@ -357,4 +365,426 @@ fn database_without_stopwords() {
     assert!(engine.languages().is_empty());
     engine.index_document(1, "o que é").unwrap();
     assert_eq!(engine.search("o que").unwrap(), [1]);
+}
+
+// ====================================================================
+// Formato v2: tf, posições, tamanhos e estatísticas.
+
+use fire_flower::{Error, Hit, IndexStats, Posting};
+
+fn p(doc: u64, tf: u32) -> Posting {
+    Posting { doc, tf }
+}
+
+fn positions(engine: &Engine, term: &str) -> Vec<(u64, Vec<u32>)> {
+    engine.positions_of_node(engine.term_node(term).unwrap().unwrap()).unwrap()
+}
+
+#[test]
+fn stores_tf_positions_lengths_and_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    assert!(engine.has_positions(), "posições ligadas por padrão");
+    let mut batch = engine.batch();
+    // Posições contam stopwords: casa@0 de@1 papel@2.
+    batch.add_document(1, "Casa de papel, casa velha").unwrap();
+    batch.add_document(2, "papel").unwrap();
+    batch.commit().unwrap();
+    engine.index_document(3, "o que é").unwrap(); // só stopwords: tamanho 0
+
+    assert_eq!(engine.term_postings("casa").unwrap(), [p(1, 2)]);
+    assert_eq!(engine.term_postings("papel").unwrap(), [p(1, 1), p(2, 1)]);
+    assert_eq!(positions(&engine, "casa"), [(1, vec![0, 3])]);
+    assert_eq!(positions(&engine, "papel"), [(1, vec![2]), (2, vec![0])]);
+    assert_eq!(engine.doc_len(1).unwrap(), Some(4), "stopwords não contam");
+    assert_eq!(engine.doc_len(2).unwrap(), Some(1));
+    assert_eq!(engine.doc_len(3).unwrap(), Some(0));
+    assert_eq!(engine.doc_len(4).unwrap(), None);
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 5 });
+
+    let mut lens = Vec::new();
+    engine.for_each_doc_len(|d, l| lens.push((d, l))).unwrap();
+    assert_eq!(lens, [(1, 4), (2, 1), (3, 0)]);
+
+    // Persistem e seguem certos depois de reabrir e compactar.
+    drop(engine);
+    let engine = open(&dir);
+    engine.index_document(2000, "papel papel").unwrap(); // outro bloco de norm:
+    engine.compact();
+    assert_eq!(engine.term_postings("papel").unwrap(), [p(1, 1), p(2, 1), p(2000, 2)]);
+    assert_eq!(positions(&engine, "papel"), [(1, vec![2]), (2, vec![0]), (2000, vec![0, 1])]);
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7 });
+    assert_eq!(engine.doc_len(2000).unwrap(), Some(2));
+}
+
+/// D6: reindexar o mesmo ID troca tf, posições e tamanho, e não conta o
+/// documento duas vezes, no mesmo lote ou em lotes diferentes.
+#[test]
+fn reindexing_replaces_tf_positions_and_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    engine.index_document(7, "eco eco eco").unwrap();
+    engine.index_document(7, "eco").unwrap();
+    assert_eq!(engine.term_postings("eco").unwrap(), [p(7, 1)]);
+    assert_eq!(positions(&engine, "eco"), [(7, vec![0])]);
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 1, total_len: 1 });
+
+    // No mesmo lote, fora de ordem: a última adição vence.
+    let mut batch = engine.batch();
+    batch.add_document(9, "sol sol").unwrap();
+    batch.add_document(8, "sol lua").unwrap();
+    batch.add_document(9, "lua sol lua").unwrap();
+    batch.commit().unwrap();
+    assert_eq!(engine.term_postings("sol").unwrap(), [p(8, 1), p(9, 1)]);
+    assert_eq!(positions(&engine, "sol"), [(8, vec![0]), (9, vec![1])]);
+    assert_eq!(positions(&engine, "lua"), [(8, vec![1]), (9, vec![0, 2])]);
+    assert_eq!(engine.doc_len(9).unwrap(), Some(3));
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3 });
+
+    // Depois de compactar (merge completo) continua igual.
+    engine.compact();
+    assert_eq!(engine.term_postings("sol").unwrap(), [p(8, 1), p(9, 1)]);
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+    drop(engine);
+    let engine = open(&dir);
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+}
+
+#[test]
+fn database_without_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), Config { positions: Some(false), ..Config::default() }).unwrap();
+        assert!(!engine.has_positions());
+        engine.index_document(1, "casa de papel").unwrap();
+        engine.index_document(2, "papel de casa").unwrap();
+        let mut pos_keys = 0;
+        engine.for_each_raw(|k, _| pos_keys += k.starts_with(b"pos:") as usize).unwrap();
+        assert_eq!(pos_keys, 0);
+    }
+    // Sem pedir nada vale o que está gravado; pedir posições é erro.
+    let engine = open(&dir);
+    assert!(!engine.has_positions());
+    assert_eq!(engine.search("casa papel").unwrap(), [1, 2]);
+    assert_eq!(engine.search_top("casa", 10).unwrap().len(), 2);
+    assert_eq!(engine.term_postings("casa").unwrap(), [p(1, 1), p(2, 1)]);
+    assert!(matches!(engine.search("\"casa de papel\""), Err(Error::Config(_))));
+    assert!(matches!(engine.search_top("\"casa de papel\"", 5), Err(Error::Config(_))));
+    // Uma "frase" de um termo só é termo comum e funciona.
+    assert_eq!(engine.search("\"o papel\"").unwrap(), [1, 2]);
+    drop(engine);
+    let with = Config { positions: Some(true), ..Config::default() };
+    assert!(matches!(Engine::open(dir.path(), with), Err(Error::Config(_))));
+}
+
+#[test]
+fn old_format_is_rejected_with_a_clear_error() {
+    // Banco v1: contadores sem `meta:format`.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+        db.put(b"meta:next_node_id", [5u8]).unwrap();
+        db.put(b"post:4", [1u8, 7]).unwrap();
+    }
+    let err = Engine::open(dir.path(), Config::default()).err().expect("v1 tem que falhar");
+    assert!(matches!(&err, Error::Config(m) if m.contains("formato antigo")), "{err}");
+
+    // v1 com merges pendentes no WAL: a recuperação roda o merge operator.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.set_merge_operator_associative("fire_flower_postings_union", |_, existing, ops| {
+            let mut out = existing.map(<[u8]>::to_vec).unwrap_or_default();
+            for op in ops {
+                out.extend_from_slice(op);
+            }
+            Some(out)
+        });
+        let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+        db.put(b"meta:next_node_id", [5u8]).unwrap();
+        db.merge(b"post:4", [1u8, 7]).unwrap();
+        db.merge(b"post:4", [1u8, 9]).unwrap();
+    }
+    let err = Engine::open(dir.path(), Config::default()).err().expect("v1 tem que falhar");
+    assert!(matches!(&err, Error::Config(m) if m.contains("formato antigo")), "{err}");
+    // E o banco antigo não foi tocado: o WAL com os merges continua lá e o
+    // merge operator antigo ainda lê a lista como era.
+    let mut opts = rocksdb::Options::default();
+    opts.set_merge_operator_associative("fire_flower_postings_union", |_, existing, ops| {
+        let mut out = existing.map(<[u8]>::to_vec).unwrap_or_default();
+        for op in ops {
+            out.extend_from_slice(op);
+        }
+        Some(out)
+    });
+    let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+    assert_eq!(db.get(b"post:4").unwrap().unwrap(), [1u8, 7, 1, 9]);
+}
+
+// ====================================================================
+// BM25
+
+const K1: f64 = 1.2;
+const B: f64 = 0.75;
+
+fn bm25(n: f64, df: f64, tf: f64, len: f64, avg: f64) -> f64 {
+    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / avg))
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+}
+
+fn ranked(engine: &Engine, q: &str) -> Vec<(u64, f64)> {
+    engine.search_top(q, 100).unwrap().into_iter().map(|h| (h.doc, h.score)).collect()
+}
+
+#[test]
+fn bm25_matches_hand_computation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_document(1, "gato gato cachorro").unwrap();
+    batch.add_document(2, "gato").unwrap();
+    batch.add_document(3, "cachorro peixe peixe peixe").unwrap();
+    batch.commit().unwrap();
+    let (n, avg) = (3.0, 8.0 / 3.0);
+
+    // Documento curto com o termo uma vez ganha do longo com duas.
+    let got = ranked(&engine, "gato");
+    let (s1, s2) = (bm25(n, 2.0, 2.0, 3.0, avg), bm25(n, 2.0, 1.0, 1.0, avg));
+    assert!(s2 > s1);
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [2, 1]);
+    assert!(close(got[0].1, s2) && close(got[1].1, s1), "{got:?} vs {s2} {s1}");
+
+    // E de dois termos: soma das notas, só onde os dois aparecem.
+    let got = ranked(&engine, "cachorro gato");
+    assert_eq!(got.len(), 1);
+    assert!(close(got[0].1, bm25(n, 2.0, 1.0, 3.0, avg) + bm25(n, 2.0, 2.0, 3.0, avg)));
+
+    // search_ranked dá o total e search_top com k pequeno corta.
+    let top = engine.search_ranked("gato", 1).unwrap();
+    assert_eq!(top.total, 2);
+    assert_eq!(top.hits.len(), 1);
+    assert_eq!(top.hits[0].doc, 2);
+    assert!(engine.search_top("gato", 0).unwrap().is_empty());
+    assert_eq!(engine.search_ranked("gato", 0).unwrap().total, 2);
+    assert!(engine.search_top("inexistente", 10).unwrap().is_empty());
+    assert!(engine.search_top("", 10).unwrap().is_empty());
+    assert!(engine.search_top("o que", 10).unwrap().is_empty());
+}
+
+#[test]
+fn ties_break_by_id_and_prefix_takes_the_best_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    for id in [30, 10, 20] {
+        batch.add_document(id, "igual").unwrap();
+    }
+    // D8: "carro carroca" tem dois termos do prefixo; vale o melhor, não a soma.
+    batch.add_document(40, "carro carroca").unwrap();
+    batch.add_document(41, "carro xis").unwrap();
+    batch.add_document(42, "carroca xis").unwrap();
+    batch.commit().unwrap();
+
+    let got = ranked(&engine, "igual");
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [10, 20, 30]);
+    assert!(got.windows(2).all(|w| w[0].1 == w[1].1));
+
+    let (n, avg) = (6.0, 9.0 / 6.0);
+    let carro = |tf: f64, len: f64| bm25(n, 2.0, tf, len, avg);
+    let got: std::collections::HashMap<u64, f64> = ranked(&engine, "carr*").into_iter().collect();
+    assert_eq!(got.len(), 3);
+    assert!(close(got[&40], carro(1.0, 2.0)), "máximo, não soma");
+    assert!(close(got[&41], carro(1.0, 2.0)));
+    assert!(close(got[&42], carro(1.0, 2.0)));
+    let got = ranked(&engine, "carr* xis");
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [41, 42]);
+}
+
+/// Os cortes do top-k (limite superior e níveis de tf) não podem mudar o
+/// resultado: com k pequeno tem que dar o começo do ranking completo, inclusive
+/// nos empates (ID menor primeiro), que o termo único visita fora de ordem.
+#[test]
+fn top_k_pruning_is_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    let mut rng = 99u64;
+    let mut next = |n: u64| {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 33) % n
+    };
+    for id in (0..3000u64).rev() {
+        // Muitos empates: só 4 tamanhos e tf de 1 a 5 (alguns com tf > 64).
+        let tf = if id % 97 == 0 { 70 } else { 1 + next(5) as usize };
+        let filler = ["x"; 3][..next(4) as usize].join(" ");
+        batch.add_document(id * 7, &format!("{} {filler} outro", "alvo ".repeat(tf))).unwrap();
+    }
+    for id in 0..40u64 {
+        batch.add_document(100_000 + id, "igual").unwrap();
+    }
+    batch.commit().unwrap();
+    for q in ["alvo", "igual", "alvo outro", "alv*", "x alvo"] {
+        let all = engine.search_ranked(q, usize::MAX).unwrap();
+        assert!(all.hits.windows(2).all(|w| w[0].score > w[1].score || (w[0].score == w[1].score && w[0].doc < w[1].doc)), "{q}");
+        for k in [1, 2, 5, 10, 33, 100, 2999] {
+            let top = engine.search_ranked(q, k).unwrap();
+            assert_eq!(top.total, all.total, "{q} k={k}");
+            assert_eq!(top.hits, all.hits[..k.min(all.hits.len())], "{q} k={k}");
+        }
+    }
+    let ties = engine.search_top("igual", 5).unwrap();
+    assert_eq!(ties.iter().map(|h| h.doc).collect::<Vec<_>>(), [100_000, 100_001, 100_002, 100_003, 100_004]);
+}
+
+/// O ranking devolve exatamente os documentos da busca sem ranking.
+#[test]
+fn ranked_and_unranked_agree_on_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let words = ["sol", "lua", "mar", "rio", "casa", "papel", "de", "a", "monte", "vale"];
+    let mut rng = 12345u64;
+    let mut next = |n: usize| {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 33) as usize % n
+    };
+    for chunk in 0..4u64 {
+        let mut batch = engine.batch();
+        for i in 0..150u64 {
+            let len = 1 + next(12);
+            let text: Vec<&str> = (0..len).map(|_| words[next(words.len())]).collect();
+            batch.add_document(chunk * 1000 + i * 3, &text.join(" ")).unwrap();
+        }
+        batch.commit().unwrap();
+    }
+    for q in ["sol", "sol lua", "m*", "\"casa de papel\"", "\"sol lua\" mar", "ri* \"a casa\"", "vale \"monte vale\"", "inexistente", "\"lua sol\" s*"] {
+        let docs = engine.search(q).unwrap();
+        let top = engine.search_ranked(q, usize::MAX).unwrap();
+        assert_eq!(top.total, docs.len(), "{q}");
+        let mut got: Vec<u64> = top.hits.iter().map(|h| h.doc).collect();
+        assert!(top.hits.windows(2).all(|w| w[0].score > w[1].score || (w[0].score == w[1].score && w[0].doc < w[1].doc)), "{q}");
+        got.sort_unstable();
+        assert_eq!(got, docs, "{q}");
+        let first: Vec<Hit> = engine.search_top(q, 5).unwrap();
+        assert_eq!(first, top.hits[..top.hits.len().min(5)], "{q}");
+    }
+}
+
+// ====================================================================
+// Frases
+
+fn phrase_sample(engine: &Engine) {
+    let mut batch = engine.batch();
+    batch.add_document(1, "A casa de papel pegou fogo").unwrap();
+    batch.add_document(2, "papel de casa e casa da papelaria").unwrap();
+    batch.add_document(3, "uma casa da papel, outra casa de papel").unwrap();
+    batch.add_document(4, "Copa do Mundo de 2014 no Brasil").unwrap();
+    batch.commit().unwrap();
+    engine.index_document(5, "de novo de novo e de novo").unwrap();
+    engine.index_document(6, "casa papel").unwrap();
+}
+
+#[test]
+fn phrase_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    phrase_sample(&engine);
+    assert_eq!(engine.search("\"casa de papel\"").unwrap(), [1, 3]);
+    // Stopword no meio só conta a distância (limitação conhecida).
+    assert_eq!(engine.search("\"casa da papel\"").unwrap(), [1, 3]);
+    // No 3, "papel, outra casa": "outra" também é stopword, então casa.
+    assert_eq!(engine.search("\"papel de casa\"").unwrap(), [2, 3]);
+    assert_eq!(engine.search("\"casa papel\"").unwrap(), [6], "sem buraco: adjacentes");
+    assert_eq!(engine.search("casa papel").unwrap(), [1, 2, 3, 6], "sem aspas: E comum");
+    assert_eq!(engine.search("brasil \"copa do mundo\" 2014").unwrap(), [4]);
+    assert!(engine.search("\"mundo do copa\"").unwrap().is_empty(), "ordem trocada");
+    assert!(engine.search("\"casa de inexistente\"").unwrap().is_empty());
+    assert_eq!(engine.search("\"novo de novo\"").unwrap(), [5], "termo repetido");
+    assert_eq!(engine.search("\"pegou fogo\" cas*").unwrap(), [1]);
+    assert_eq!(engine.search("\"casa de papel\" \"pegou fogo\"").unwrap(), [1]);
+    assert_eq!(engine.search("\"papel\"").unwrap(), [1, 2, 3, 6]);
+    assert!(engine.search("\"de da do\"").unwrap().is_empty(), "só stopwords");
+    // Aspas sem fechamento vão até o fim.
+    assert_eq!(engine.search("\"casa de papel").unwrap(), [1, 3]);
+    // Persistem ao reabrir e depois de compactar.
+    drop(engine);
+    let engine = open(&dir);
+    engine.compact();
+    assert_eq!(engine.search("\"casa de papel\"").unwrap(), [1, 3]);
+}
+
+#[test]
+fn phrase_ranking_counts_occurrences() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    phrase_sample(&engine);
+    let stats = engine.stats().unwrap();
+    let (n, avg) = (stats.doc_count as f64, stats.avg_len());
+    let idf = |df: f64| (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    let len = |d: u64| f64::from(engine.doc_len(d).unwrap().unwrap());
+    let score = |idf: f64, tf: f64, d: u64| idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len(d) / avg));
+
+    // "casa" está em 1, 2, 3, 6 e "papel" em 1, 2, 3, 6; o doc 3 tem a frase 2 vezes.
+    let phrase_idf = idf(4.0) + idf(4.0);
+    let got = ranked(&engine, "\"casa de papel\"");
+    let want = [(1, score(phrase_idf, 1.0, 1)), (3, score(phrase_idf, 2.0, 3))];
+    assert_eq!(got.len(), 2);
+    for (d, s) in want {
+        let g = got.iter().find(|g| g.0 == d).unwrap().1;
+        assert!(close(g, s), "doc {d}: {g} vs {s}");
+    }
+    // Frase + termo somam.
+    let got = ranked(&engine, "fogo \"casa de papel\"");
+    assert_eq!(got.len(), 1);
+    assert!(close(got[0].1, score(idf(1.0), 1.0, 1) + score(phrase_idf, 1.0, 1)));
+}
+
+/// Nenhuma busca ranqueada pode ver um documento sem o tamanho dele, nem um
+/// tamanho de outro momento: o cache de `norm:` respeita os snapshots.
+#[test]
+fn ranking_while_indexing_sees_consistent_lengths() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir));
+    engine.index_document(0, "sempre").unwrap();
+    let writer = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            // Mesmo bloco de norm: (IDs < 1024), e reindexando com outro tamanho.
+            for id in 1..=300u64 {
+                engine.index_document(id, &"sempre ".repeat(1 + (id % 5) as usize)).unwrap();
+                if id % 3 == 0 {
+                    engine.index_document(id / 2, "sempre agora").unwrap();
+                }
+            }
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let mut rounds = 0;
+                loop {
+                    let done = engine.search("sempre").unwrap().len() == 301;
+                    let top = engine.search_ranked("sempre", 5).unwrap();
+                    assert!(top.total >= 1);
+                    assert!(top.hits.iter().all(|h| h.score.is_finite() && h.score > 0.0));
+                    rounds += 1;
+                    if done {
+                        return rounds;
+                    }
+                }
+            })
+        })
+        .collect();
+    writer.join().unwrap();
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+    assert_eq!(engine.stats().unwrap().doc_count, 301);
 }

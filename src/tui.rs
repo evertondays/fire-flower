@@ -1,13 +1,13 @@
-//! Busca interativa no terminal: resultados enquanto você digita,
-//! autocompletar da palavra atual e prévia com os termos destacados.
+//! Busca interativa no terminal: resultados por relevância enquanto você
+//! digita, autocompletar da palavra atual e prévia com os termos destacados.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fire_flower::text::{QueryTerm, normalize_term, parse_query};
-use fire_flower::{DocId, Engine};
+use fire_flower::text::{Clause, QueryTerm, normalize_term, parse_query};
+use fire_flower::{DocId, Engine, Hit};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,6 +25,8 @@ const MAX_SUGGESTIONS: usize = 8;
 const MAX_PREVIEW_BYTES: usize = 2 << 20;
 /// Linhas longas (minificadas, base64) são cortadas antes do destaque.
 const MAX_LINE_CHARS: usize = 400;
+/// Quantos resultados ranqueados a lista mostra (o total aparece no cabeçalho).
+const MAX_RESULTS: usize = 1000;
 
 pub fn run(engine: &Engine, db_path: &str) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -56,12 +58,18 @@ struct App<'a> {
     query: String,
     /// O que de fato foi buscado (a última palavra vira prefixo enquanto se digita).
     effective: String,
+    /// A consulta efetiva já separada em partes (termos e frases).
+    clauses: Vec<Clause>,
+    /// Todos os termos das partes, para o destaque.
     terms: Vec<QueryTerm>,
     /// Última palavra digitada, normalizada. É o que o autocompletar completa.
     current_word: Option<String>,
     suggestions: Vec<String>,
     suggestion: usize,
-    results: Vec<DocId>,
+    /// Os melhores resultados, da maior nota para a menor.
+    results: Vec<Hit>,
+    /// Quantos documentos casaram ao todo.
+    total: usize,
     selected: usize,
     offset: usize,
     elapsed: Duration,
@@ -92,11 +100,13 @@ impl<'a> App<'a> {
             db_path: db_path.to_string(),
             query: String::new(),
             effective: String::new(),
+            clauses: Vec::new(),
             terms: Vec::new(),
             current_word: None,
             suggestions: Vec::new(),
             suggestion: 0,
             results: Vec::new(),
+            total: 0,
             selected: 0,
             offset: 0,
             elapsed: Duration::ZERO,
@@ -116,11 +126,16 @@ impl<'a> App<'a> {
         let last = if typing { self.query.split_whitespace().last() } else { None };
         self.current_word = last.and_then(|w| normalize_term(w.trim_end_matches('*')));
 
+        // Dentro de aspas abertas a palavra não vira prefixo: frase não tem prefixo.
+        let open_quote = self.query.matches('"').count() % 2 == 1;
         self.effective = match last {
-            Some(word) if !word.ends_with('*') => format!("{}*", self.query.trim_end()),
+            Some(word) if !word.ends_with('*') && !word.ends_with('"') && !open_quote => {
+                format!("{}*", self.query.trim_end())
+            }
             _ => self.query.trim().to_string(),
         };
-        self.terms = parse_query(&self.effective, self.engine.stopwords());
+        self.clauses = parse_query(&self.effective, self.engine.stopwords());
+        self.terms = self.clauses.iter().flat_map(Clause::terms).collect();
 
         self.error = None;
         self.suggestions = match &self.current_word {
@@ -136,11 +151,11 @@ impl<'a> App<'a> {
             self.suggestions.iter().position(|s| Some(s) != self.current_word.as_ref()).unwrap_or(0);
 
         let started = Instant::now();
-        self.results = match self.engine.search(&self.effective) {
-            Ok(docs) => docs,
+        (self.results, self.total) = match self.engine.search_ranked(&self.effective, MAX_RESULTS) {
+            Ok(top) => (top.hits, top.total),
             Err(e) => {
                 self.error = Some(e.to_string());
-                Vec::new()
+                (Vec::new(), 0)
             }
         };
         self.elapsed = started.elapsed();
@@ -260,7 +275,7 @@ impl<'a> App<'a> {
     }
 
     fn ensure_preview(&mut self) {
-        let Some(&doc) = self.results.get(self.selected) else {
+        let Some(doc) = self.results.get(self.selected).map(|h| h.doc) else {
             self.preview = None;
             return;
         };
@@ -313,8 +328,8 @@ impl<'a> App<'a> {
             Line::default()
         } else {
             Line::from(vec![
-                Span::styled(format_count(self.results.len()), Style::new().fg(ACCENT).bold()),
-                Span::raw(if self.results.len() == 1 { " resultado" } else { " resultados" }),
+                Span::styled(format_count(self.total), Style::new().fg(ACCENT).bold()),
+                Span::raw(if self.total == 1 { " resultado" } else { " resultados" }),
                 Span::styled(format!("  ·  {:.2?} ", self.elapsed), Style::new().fg(MUTED)),
             ])
         };
@@ -330,7 +345,7 @@ impl<'a> App<'a> {
         let mut spans = vec![Span::styled("› ", Style::new().fg(ACCENT).bold())];
         if self.query.is_empty() {
             spans.push(Span::styled(
-                "digite para buscar…  (palavras com E, termo* para prefixo)",
+                "digite para buscar…  (palavras com E, termo* para prefixo, \"frase exata\")",
                 Style::new().fg(MUTED).italic(),
             ));
         } else {
@@ -357,10 +372,26 @@ impl<'a> App<'a> {
         let line = match &self.error {
             Some(err) => Line::from(Span::styled(format!(" ⚠ {err}"), Style::new().fg(Color::Red))),
             None if self.effective.is_empty() => Line::default(),
-            None => Line::from(vec![
-                Span::styled(" consulta: ", Style::new().fg(MUTED)),
-                Span::styled(self.effective.clone(), Style::new().fg(Color::Gray)),
-            ]),
+            None => {
+                let mut spans = vec![Span::styled(" consulta: ", Style::new().fg(MUTED))];
+                for (i, clause) in self.clauses.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(" E ", Style::new().fg(MUTED)));
+                    }
+                    spans.push(match clause {
+                        Clause::Term(t) => Span::styled(
+                            format!("{}{}", t.text, if t.prefix { "*" } else { "" }),
+                            Style::new().fg(Color::Gray),
+                        ),
+                        // A frase é uma unidade: entre aspas, com `_` nas stopwords.
+                        Clause::Phrase(_) => Span::styled(describe_phrase(clause), Style::new().fg(ACCENT)),
+                    });
+                }
+                if self.clauses.is_empty() {
+                    spans.push(Span::styled("(só stopwords)", Style::new().fg(MUTED).italic()));
+                }
+                Line::from(spans)
+            }
         };
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -415,16 +446,16 @@ impl<'a> App<'a> {
             self.offset = self.selected + 1 - height;
         }
         let end = (self.offset + height).min(self.results.len());
-        let id_width = self.results[end - 1].to_string().len().max(3);
-        let label_width = (area.width as usize).saturating_sub(id_width + 6);
-
-        let visible: Vec<DocId> = self.results[self.offset..end].to_vec();
+        let visible: Vec<Hit> = self.results[self.offset..end].to_vec();
+        let id_width = visible.iter().map(|h| h.doc.to_string().len()).max().unwrap_or(0).max(3);
+        let label_width = (area.width as usize).saturating_sub(id_width + 14);
         let items: Vec<ListItem> = visible
             .into_iter()
-            .map(|doc| {
-                let label = self.label(doc).unwrap_or_else(|| "(sem rótulo)".into());
+            .map(|hit| {
+                let label = self.label(hit.doc).unwrap_or_else(|| "(sem rótulo)".into());
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{doc:>id_width$} "), Style::new().fg(MUTED)),
+                    Span::styled(format!("{:>id_width$} ", hit.doc), Style::new().fg(MUTED)),
+                    Span::styled(format!("{:>6.2} ", hit.score), Style::new().fg(ACCENT)),
                     Span::raw(truncate_left(&label, label_width)),
                 ]))
             })
@@ -458,7 +489,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_reader(&mut self, frame: &mut Frame, area: Rect) {
-        let doc = self.results.get(self.selected).copied();
+        let doc = self.results.get(self.selected).map(|h| h.doc);
         let label = doc.and_then(|d| self.label(d)).unwrap_or_default();
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -500,6 +531,22 @@ impl<'a> App<'a> {
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
+}
+
+/// `"copa _ mundo"`: a frase com um `_` por stopword pulada.
+fn describe_phrase(clause: &Clause) -> String {
+    let Clause::Phrase(parts) = clause else { return String::new() };
+    let mut words = Vec::new();
+    let mut next = 0;
+    for part in parts {
+        while next < part.offset {
+            words.push("_".to_string());
+            next += 1;
+        }
+        words.push(part.text.clone());
+        next = part.offset + 1;
+    }
+    format!("\"{}\"", words.join(" "))
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -609,7 +656,8 @@ mod tests {
 
     #[test]
     fn highlight_marks_normalized_matches() {
-        let terms = parse_query("coracao do bras*", &fire_flower::Stopwords::default());
+        let terms: Vec<QueryTerm> =
+            parse_query("coracao do bras*", &fire_flower::Stopwords::default()).iter().flat_map(Clause::terms).collect();
         let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms);
         assert!(hit);
         let marked: Vec<&str> =
@@ -668,6 +716,40 @@ mod tests {
         app.refresh();
         assert_eq!(app.suggestions[0], "brasil");
         assert_eq!(app.ghost().as_deref(), Some("ia"));
+    }
+
+    #[test]
+    fn phrases_are_one_unit_and_not_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path().join("db"), fire_flower::Config::default()).unwrap();
+        let mut batch = engine.batch();
+        batch.add_labeled("a.txt", "a casa de papel pegou fogo").unwrap();
+        batch.add_labeled("b.txt", "papel de casa, casa de papel").unwrap();
+        batch.add_labeled("c.txt", "papel casa").unwrap();
+        batch.commit().unwrap();
+
+        let mut app = App::new(&engine, "/tmp/db");
+        // Aspas abertas: a palavra sendo digitada não vira prefixo.
+        app.query = "\"casa de pap".into();
+        app.refresh();
+        assert_eq!(app.effective, "\"casa de pap");
+        assert_eq!(app.current_word.as_deref(), Some("pap"));
+        assert_eq!(app.suggestions, ["papel"]);
+        assert_eq!(app.total, 0);
+        app.query = "\"casa de papel\"".into();
+        app.refresh();
+        assert_eq!(app.effective, "\"casa de papel\"", "aspas fechadas: nada de prefixo");
+        assert_eq!(app.total, 2);
+        assert_eq!(describe_phrase(&app.clauses[0]), "\"casa _ papel\"");
+        // O destaque marca as palavras da frase.
+        let (_, hit) = highlight("Casa de Papel", &app.terms);
+        assert!(hit);
+        // Fora das aspas, a última palavra continua sendo prefixo.
+        app.query = "\"casa de papel\" fo".into();
+        app.refresh();
+        assert_eq!(app.effective, "\"casa de papel\" fo*");
+        assert_eq!(app.total, 1);
+        assert!(app.results[0].score > 0.0);
     }
 
     #[test]

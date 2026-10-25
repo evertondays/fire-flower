@@ -12,9 +12,9 @@ use std::io::BufRead;
 use std::path::PathBuf;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use fire_flower::internals::{decode_postings, encode_postings, intersect, union_encoded};
-use fire_flower::text::tokenize;
-use fire_flower::{Config, Engine};
+use fire_flower::internals::{decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_postings};
+use fire_flower::text::{Analyzer, tokenize};
+use fire_flower::{Config, Engine, Posting, Stopwords};
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
@@ -43,17 +43,29 @@ fn open_db() -> Option<Engine> {
         eprintln!("pulando benches de banco: {} não existe (carregue a fatia de 100k)", path.display());
         return None;
     }
-    Some(Engine::open(&path, Config::default()).expect("abrir banco de benchmark"))
+    match Engine::open(&path, Config::default()) {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("pulando benches de banco: {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn bench_tokenize(c: &mut Criterion) {
     let docs = articles();
     let bytes: usize = docs.iter().map(String::len).sum();
+    let stopwords = Stopwords::default();
     let mut g = c.benchmark_group("texto");
     g.throughput(Throughput::Bytes(bytes as u64));
     g.sample_size(20);
     g.bench_function("tokenize_1000_artigos", |b| {
         b.iter(|| docs.iter().map(|d| tokenize(black_box(d)).len()).sum::<usize>())
+    });
+    // O que a indexação faz por documento: tokens, stopwords e posições por termo.
+    g.bench_function("analyzer_1000_artigos", |b| {
+        let mut analyzer = Analyzer::default();
+        b.iter(|| docs.iter().map(|d| analyzer.run(black_box(d), &stopwords) as usize).sum::<usize>())
     });
     g.finish();
 }
@@ -61,24 +73,46 @@ fn bench_tokenize(c: &mut Criterion) {
 fn bench_postings(c: &mut Criterion) {
     let Some(engine) = open_db() else { return };
     // Os termos mais frequentes que não são stopwords ("de" e "em" não são mais indexados).
-    let de = engine.postings("area").unwrap();
+    let area = engine.term_postings("area").unwrap();
     let em = engine.postings("populacao").unwrap();
     let rare = engine.postings("astrofisica").unwrap();
-    let de_bytes = encode_postings(&de);
+    let area_docs: Vec<u64> = area.iter().map(|p| p.doc).collect();
+    let area_bytes = encode_postings(&area);
+    let area_pos = engine.positions_of_node(engine.term_node("area").unwrap().unwrap()).unwrap();
+    let mut area_pos_bytes = Vec::new();
+    {
+        // Mesmo formato do lote: (doc, tf) + posições em sequência.
+        let pairs: Vec<(u64, u32)> = area_pos.iter().map(|(d, ps)| (*d, ps.len() as u32)).collect();
+        let flat: Vec<u32> = area_pos.iter().flat_map(|(_, ps)| ps.iter().copied()).collect();
+        fire_flower::internals::encode_positions_into(&mut area_pos_bytes, &pairs, &flat);
+    }
     // Pedaços pequenos como os que um lote grava via merge.
-    let max = de.last().copied().unwrap_or(0);
-    let pieces: Vec<Vec<u8>> = (1..=8u64).map(|i| encode_postings(&[max + i * 10, max + i * 10 + 1])).collect();
+    let max = area.last().map_or(0, |p| p.doc);
+    let pieces: Vec<Vec<u8>> = (1..=8u64)
+        .map(|i| encode_postings(&[Posting { doc: max + i * 10, tf: 1 }, Posting { doc: max + i * 10 + 1, tf: 2 }]))
+        .collect();
+    // Pedaço que sobrepõe a lista: força o merge lento (ordenação).
+    let overlap = encode_postings(&[Posting { doc: area[area.len() / 2].doc, tf: 3 }]);
 
     let mut g = c.benchmark_group("listas");
-    g.bench_function(format!("decode_area_{}_ids", de.len()), |b| b.iter(|| decode_postings(black_box(&de_bytes)).unwrap()));
+    g.bench_function(format!("decode_area_{}_postings", area.len()), |b| {
+        b.iter(|| decode_postings(black_box(&area_bytes)).unwrap())
+    });
+    g.bench_function(format!("decode_docs_area_{}", area.len()), |b| b.iter(|| decode_docs(black_box(&area_bytes)).unwrap()));
+    g.bench_function(format!("decode_positions_area_{}_bytes", area_pos_bytes.len()), |b| {
+        b.iter(|| decode_positions(black_box(&area_pos_bytes)).unwrap())
+    });
     g.bench_function("merge_area_mais_8_pedacos", |b| {
-        b.iter(|| union_encoded(Some(black_box(&de_bytes)), pieces.iter().map(Vec::as_slice)).unwrap())
+        b.iter(|| merge_postings(std::iter::once(black_box(area_bytes.as_slice())).chain(pieces.iter().map(Vec::as_slice))).unwrap())
     });
-    g.bench_function(format!("intersect_raro{}_x_area{}", rare.len(), de.len()), |b| {
-        b.iter(|| intersect(black_box(&rare), black_box(&de)))
+    g.bench_function("merge_area_sobreposto", |b| {
+        b.iter(|| merge_postings([black_box(area_bytes.as_slice()), overlap.as_slice()].into_iter()).unwrap())
     });
-    g.bench_function(format!("intersect_populacao{}_x_area{}", em.len(), de.len()), |b| {
-        b.iter(|| intersect(black_box(&em), black_box(&de)))
+    g.bench_function(format!("intersect_raro{}_x_area{}", rare.len(), area.len()), |b| {
+        b.iter(|| intersect(black_box(&rare), black_box(&area_docs)))
+    });
+    g.bench_function(format!("intersect_populacao{}_x_area{}", em.len(), area.len()), |b| {
+        b.iter(|| intersect(black_box(&em), black_box(&area_docs)))
     });
     g.finish();
 }
@@ -92,8 +126,12 @@ fn bench_search(c: &mut Criterion) {
         ("frequente", "brasil"),
         ("prefixo", "port*"),
         ("inexistente", "constituicaox"),
+        ("frase", "\"revolução francesa\""),
     ] {
         g.bench_function(name, |b| b.iter(|| engine.search(black_box(q)).unwrap().len()));
+    }
+    for (name, q) in [("top10_frequente", "brasil"), ("top10_titulo", "revolução francesa"), ("top10_prefixo", "port*")] {
+        g.bench_function(name, |b| b.iter(|| engine.search_top(black_box(q), 10).unwrap().len()));
     }
     g.bench_function("suggest_por", |b| b.iter(|| engine.suggest(black_box("por"), 10).unwrap()));
     g.finish();

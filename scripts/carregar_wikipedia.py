@@ -273,6 +273,8 @@ def main():
     parser.add_argument("--sim", action="store_true", help="não pede confirmação para apagar o banco")
     parser.add_argument("--sem-build", action="store_true", help="não roda o cargo build")
     parser.add_argument("--idiomas", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
+    parser.add_argument("--sem-posicoes", action="store_true",
+                        help="cria o banco sem posições: menor e mais rápido, mas sem busca por frase")
     args = parser.parse_args()
 
     corpus = os.path.expanduser(args.corpus)
@@ -296,6 +298,8 @@ def main():
            "--pular", str(args.pular), "--progresso-json"]
     if args.idiomas:
         cmd += ["--idiomas", args.idiomas]
+    if args.sem_posicoes:
+        cmd += ["--sem-posicoes"]
     log = open(log_path, "w")
     # Processo próprio: o Ctrl+C chega só ao script, que encerra o motor com
     # SIGINT e ainda consegue mostrar o resumo.

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Roda o plano de performance (docs/plano-performance.md) e gera o relatório.
 
-    python3 scripts/perf.py tudo            # todas as fases, na ordem (~1h com a carga total)
-    python3 scripts/perf.py escada          # Fase 2: carga 1k → 10k → 100k → 1,1M  [--ate 100k] [--experimentos]
-    python3 scripts/perf.py corretude       # Fase 1: oráculo, idempotência, lotes vs. único, reabrir
-    python3 scripts/perf.py consultas       # Fase 3: vocabulário do corpus inteiro + conjuntos de consulta
-    python3 scripts/perf.py latencia        # Fase 4: latência por conjunto, merge pendente vs. compactado
-    python3 scripts/perf.py concorrencia    # Fase 5: escala com threads e leitura durante escrita
-    python3 scripts/perf.py pr              # Fase 8: checagem rápida (~3 min); falha se o p50 piorar >10%
-    python3 scripts/perf.py relatorio       # escreve bench/RESULTADOS.md com os resultados mais recentes
+    python3 scripts/perf.py tudo              # todas as fases na escala 10k (~5 min)
+    python3 scripts/perf.py tudo --escala 100k
+    python3 scripts/perf.py escada            # Fase 2: carga 1k → … → escala   [--experimentos]
+    python3 scripts/perf.py corretude         # Fase 1: oráculo, idempotência, lotes vs. único, reabrir
+    python3 scripts/perf.py consultas         # Fase 3: vocabulário + conjuntos de consulta
+    python3 scripts/perf.py latencia          # Fase 4: latência por conjunto, merge pendente vs. compactado
+    python3 scripts/perf.py concorrencia      # Fase 5: escala com threads e leitura durante escrita
+    python3 scripts/perf.py pr                # Fase 8: checagem rápida; falha se o p50 piorar >10%
+    python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
     python3 scripts/perf.py comparar A.json B.json
 
+`--escala` (1k, 10k, 100k ou full; padrão 10k) define a maior fatia do corpus
+usada. A Wikipédia inteira (full) leva mais de uma hora; comece pequeno.
+
 Bancos ficam em ~/bench-db/perf/ (FF_PERF_DB para mudar); o corpus em
-~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados em bench/results/.
+~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados em bench/results/, com a escala
+no rótulo, então escalas diferentes não se misturam.
 
 Regras do plano: build release, nada pesado em paralelo durante as medições,
 compare só resultados da mesma máquina. Só usa a biblioteca padrão.
@@ -30,19 +35,17 @@ import time
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = os.path.join(PROJECT, "bench", "results")
-QUERIES = os.path.join(PROJECT, "bench", "queries")
 REPORT = os.path.join(PROJECT, "bench", "RESULTADOS.md")
-BASELINE_PR = os.path.join(PROJECT, "bench", "baseline-pr.json")
 WIKI = os.path.join(PROJECT, "target", "release", "examples", "wiki")
 FF = os.path.join(PROJECT, "target", "release", "fire-flower")
 
 CORPUS_DIR = os.path.expanduser(os.environ.get("FF_CORPUS_DIR", "~/datasets/ptwiki"))
 DB_ROOT = os.path.expanduser(os.environ.get("FF_PERF_DB", "~/bench-db/perf"))
 SLICES = {
-    "1k": "ptwiki-1000.jsonl",
-    "10k": "ptwiki-10000.jsonl",
-    "100k": "ptwiki-100000.jsonl",
-    "full": "ptwiki.jsonl",
+    "1k": ("ptwiki-1000.jsonl", 1000),
+    "10k": ("ptwiki-10000.jsonl", 10000),
+    "100k": ("ptwiki-100000.jsonl", 100000),
+    "full": ("ptwiki.jsonl", 1112246),
 }
 ORDER = list(SLICES)
 
@@ -52,11 +55,24 @@ ORANGE, BOLD, DIM, RED, GREEN, RESET = "\x1b[38;5;208m", "\x1b[1m", "\x1b[2m", "
 # ------------------------------------------------------------------ utilidades
 
 def corpus(slice_name):
-    return os.path.join(CORPUS_DIR, SLICES[slice_name])
+    return os.path.join(CORPUS_DIR, SLICES[slice_name][0])
+
+
+def docs_in(slice_name):
+    return SLICES[slice_name][1]
+
+
+def smaller(a, b):
+    """A menor de duas fatias."""
+    return a if ORDER.index(a) <= ORDER.index(b) else b
 
 
 def db(name):
     return os.path.join(DB_ROOT, name)
+
+
+def queries_dir(scale):
+    return os.path.join(PROJECT, "bench", "queries", scale)
 
 
 def step(title):
@@ -64,10 +80,9 @@ def step(title):
 
 
 def run(cmd, capture=False, check=True):
-    print(f"{DIM}$ {' '.join(cmd)}{RESET}", flush=True)
+    print(f"{DIM}$ {' '.join(map(str, cmd))}{RESET}", flush=True)
     if capture:
-        out = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=check)
-        return out.stdout
+        return subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=check).stdout
     return subprocess.run(cmd, check=check).returncode
 
 
@@ -77,7 +92,7 @@ def wiki(*args, capture=False, check=True):
 
 def build():
     step("compilando (release)")
-    run(["cargo", "build", "--release", "--bin", "fire-flower", "--example", "wiki"], check=True)
+    run(["cargo", "build", "--release", "--bin", "fire-flower", "--example", "wiki"])
 
 
 def fresh(path):
@@ -86,12 +101,27 @@ def fresh(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
+def copy_db(src, dst):
+    fresh(dst)
+    shutil.copytree(src, dst)
+
+
 def dir_size(path):
     return sum(e.stat().st_size for e in os.scandir(path) if e.is_file()) if os.path.isdir(path) else 0
 
 
 def digest(path):
     return json.loads(wiki("digest", "--db", path, capture=True))
+
+
+def ensure_loaded(slice_name):
+    """Banco da fatia; carrega se ainda não existir."""
+    path = db(f"ptwiki-{slice_name}")
+    if not os.path.exists(path):
+        step(f"carga {slice_name} (banco não existia)")
+        fresh(path)
+        wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", 1000, "--label", f"ptwiki-{slice_name}")
+    return path
 
 
 def git_commit():
@@ -138,67 +168,62 @@ def can_drop_caches():
 
 # ---------------------------------------------------------------------- fases
 
-def fase_escada(args):
-    """Fase 2: carga de cada fatia num banco novo, mais tamanhos."""
-    ate = ORDER.index(args.ate) + 1
-    for s in ORDER[:ate]:
+def fase_escada(scale, experimentos=False):
+    """Fase 2: carga de cada fatia, até a escala, num banco novo; mais tamanhos."""
+    for s in ORDER[: ORDER.index(scale) + 1]:
         step(f"escada: carga {s}")
         path = db(f"ptwiki-{s}")
         fresh(path)
         wiki("load", "--db", path, "--corpus", corpus(s), "--batch", 1000, "--label", f"ptwiki-{s}")
         wiki("sizes", "--db", path)
-    if args.experimentos:
-        experimentos_100k()
+    if experimentos:
+        fase_experimentos(scale)
 
 
-def experimentos_100k():
-    """Experimentos da Fase 2 na fatia de 100k, cada um num banco temporário."""
+def fase_experimentos(scale):
+    """Experimentos da Fase 2, cada um num banco temporário (o plano usa 100k)."""
+    s = smaller(scale, "100k")
+    n = docs_in(s)
     tmp = db("tmp-exp")
-    runs = [
-        ("lote-100", ["--batch", 100]),
-        ("lote-10000", ["--batch", 10000]),
-        ("lote-50000", ["--batch", 50000]),
-        ("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
-        ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
-        ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024]),
-    ]
+    runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 5000, 10000, 50000) if b <= n]
+    runs += [("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
+             ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
+             ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024])]
     for label, extra in runs:
-        step(f"experimento 100k: {label}")
+        step(f"experimento {s}: {label}")
         fresh(tmp)
-        wiki("load", "--db", tmp, "--corpus", corpus("100k"), *extra, "--label", f"exp-{label}")
+        wiki("load", "--db", tmp, "--corpus", corpus(s), *extra, "--label", f"exp-{s}-{label}")
         if label == "ids-remapeados":
             wiki("sizes", "--db", tmp)
-    step("experimento: streaming (1 commit por documento, 10k docs)")
+    stream = smaller(s, "10k") if s != "10k" else "1k"
+    step(f"experimento: streaming (1 commit por documento, {stream})")
     fresh(tmp)
-    wiki("load", "--db", tmp, "--corpus", corpus("10k"), "--streaming", "--label", "exp-streaming-10k")
+    wiki("load", "--db", tmp, "--corpus", corpus(stream), "--streaming", "--label", f"exp-{s}-streaming-{stream}")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def fase_corretude(args):
+def fase_corretude(scale):
     """Fase 1: oráculo e checagens de conteúdo lógico."""
     checks = {}
     tmp = db("tmp-corretude")
+    small = smaller(scale, "10k")
 
-    step("oráculo: 10k, todos os termos")
-    path10k = db("ptwiki-10k")
-    if not os.path.exists(path10k):
-        fresh(path10k)
-        wiki("load", "--db", path10k, "--corpus", corpus("10k"), "--label", "ptwiki-10k")
-    checks["oraculo_10k"] = wiki("oracle", "--db", path10k, "--corpus", corpus("10k"), "--label", "10k-todos", check=False) == 0
+    step(f"oráculo: {small}, todos os termos")
+    path_small = ensure_loaded(small)
+    checks[f"oraculo_{small}"] = wiki("oracle", "--db", path_small, "--corpus", corpus(small),
+                                      "--label", f"{small}-todos", check=False) == 0
 
-    step("idempotência: indexar a fatia de 10k duas vezes")
-    fresh(tmp)
-    shutil.copytree(path10k, tmp, dirs_exist_ok=True)
+    step(f"idempotência: indexar a fatia de {small} duas vezes")
+    copy_db(path_small, tmp)
     before = digest(tmp)
     size_before = dir_size(tmp)
-    wiki("load", "--db", tmp, "--corpus", corpus("10k"), "--label", "idempotencia-2a-carga")
+    wiki("load", "--db", tmp, "--corpus", corpus(small), "--label", f"idempotencia-{small}")
     after = digest(tmp)
     size_twice = dir_size(tmp)
     run([FF, "compact", tmp])
-    size_compacted = dir_size(tmp)
     checks["idempotencia"] = before["digest"] == after["digest"]
-    idem = {"digest_1a": before, "digest_2a": after, "banco_1a": size_before,
-            "banco_2a": size_twice, "banco_2a_compactado": size_compacted}
+    idem = {"fatia": small, "digest_1a": before, "digest_2a": after, "banco_1a": size_before,
+            "banco_2a": size_twice, "banco_2a_compactado": dir_size(tmp)}
 
     step("lotes vs. único: 1k com --batch 1 e com --batch 1000")
     a, b = db("tmp-lote-1"), db("tmp-lote-1000")
@@ -210,40 +235,42 @@ def fase_corretude(args):
     for p in (a, b):
         shutil.rmtree(p, ignore_errors=True)
 
-    step("oráculo: 100k, amostra de 50 mil termos")
-    path100k = db("ptwiki-100k")
-    if not os.path.exists(path100k):
-        fresh(path100k)
-        wiki("load", "--db", path100k, "--corpus", corpus("100k"), "--label", "ptwiki-100k")
-    checks["oraculo_100k"] = wiki("oracle", "--db", path100k, "--corpus", corpus("100k"),
-                                  "--sample-terms", 50000, "--label", "100k-amostra", check=False) == 0
+    big = smaller(scale, "100k")
+    if big != small:
+        step(f"oráculo: {big}, amostra de 50 mil termos")
+        checks[f"oraculo_{big}"] = wiki("oracle", "--db", ensure_loaded(big), "--corpus", corpus(big),
+                                        "--sample-terms", 50000, "--label", f"{big}-amostra", check=False) == 0
 
-    step("reabrir: copiar 100k, carregar mais 1k e conferir 101k")
-    fresh(tmp)
-    shutil.copytree(path100k, tmp, dirs_exist_ok=True)
-    wiki("load", "--db", tmp, "--corpus", corpus("full"), "--skip", 100000, "--take", 1000, "--label", "reabrir-mais-1k")
-    checks["reabrir_101k"] = wiki("oracle", "--db", tmp, "--corpus", corpus("full"), "--take", 101000,
-                                  "--sample-terms", 20000, "--titles", 2000, "--label", "101k-reaberto", check=False) == 0
+    n = docs_in(big)
+    extra = max(100, n // 100)
+    step(f"reabrir: copiar {big}, carregar mais {extra} docs e conferir {n + extra}")
+    copy_db(ensure_loaded(big), tmp)
+    wiki("load", "--db", tmp, "--corpus", corpus("full"), "--skip", n, "--take", extra, "--label", f"reabrir-{big}")
+    checks["reabrir"] = wiki("oracle", "--db", tmp, "--corpus", corpus("full"), "--take", n + extra,
+                             "--sample-terms", 20000, "--label", f"{big}-reaberto", check=False) == 0
     shutil.rmtree(tmp, ignore_errors=True)
 
-    save_result("corretude", "fase1", {"ok": all(checks.values()), "checagens": checks,
-                                        "idempotencia": idem, "lotes": {"batch_1": da, "batch_1000": dbb}})
+    save_result("corretude", scale, {"ok": all(checks.values()), "checagens": checks,
+                                      "idempotencia": idem, "lotes": {"batch_1": da, "batch_1000": dbb}})
     for name, ok in checks.items():
         print(f"  {GREEN + '✔' if ok else RED + '✗'}{RESET} {name}")
     return all(checks.values())
 
 
-def fase_consultas(args):
-    """Fase 3: vocabulário do corpus inteiro e conjuntos de consulta."""
-    step("vocabulário do corpus inteiro")
-    vocab = os.path.join(PROJECT, "bench", "data", "vocab-ptwiki.tsv")
-    wiki("vocab", "--corpus", corpus("full"), "--out", vocab)
+def fase_consultas(scale):
+    """Fase 3: vocabulário da fatia e conjuntos de consulta (em bench/queries/<escala>/)."""
+    step(f"vocabulário de {scale}")
+    vocab = os.path.join(PROJECT, "bench", "data", f"vocab-{scale}.tsv")
+    wiki("vocab", "--corpus", corpus(scale), "--out", vocab)
     step("conjuntos de consulta (seed 42)")
-    wiki("queries", "--vocab", vocab, "--corpus", corpus("full"), "--seed", 42, "--out", QUERIES)
+    wiki("queries", "--vocab", vocab, "--corpus", corpus(scale), "--seed", 42, "--out", queries_dir(scale))
 
 
-def bench(path, sets, label, threads=1, extra=()):
-    files = [os.path.join(QUERIES, f"{s}.txt") for s in sets] if sets else [QUERIES]
+def bench(path, scale, sets, label, threads=1, extra=()):
+    qdir = queries_dir(scale)
+    if not os.path.isdir(qdir):
+        fase_consultas(scale)
+    files = [os.path.join(qdir, f"{s}.txt") for s in sets] if sets else [qdir]
     wiki("bench", "--db", path, "--queries", *files, "--threads", threads, "--label", label, *extra)
 
 
@@ -257,92 +284,94 @@ def open_time(path, runs=5):
     return {"mediana_s": statistics.median(times), "min_s": min(times), "max_s": max(times), "execucoes": runs}
 
 
-def fase_latencia(args):
-    """Fase 4: latência no banco de 1,1M."""
-    path = db("ptwiki-full")
-    if not os.path.exists(path):
-        sys.exit(f"{path} não existe: rode `perf.py escada` antes")
-    if not os.path.isdir(QUERIES):
-        sys.exit("bench/queries/ não existe: rode `perf.py consultas` antes")
+def fase_latencia(scale):
+    """Fase 4: latência no banco da escala. Recarrega o banco para medir o merge pendente."""
+    path = db(f"ptwiki-{scale}")
+    step(f"carga {scale} limpa (para medir antes da compactação)")
+    fresh(path)
+    wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", 1000, "--label", f"ptwiki-{scale}")
 
-    step("merge pendente: t-freq e títulos antes da compactação")
+    step("merge pendente: t-freq, títulos e and-freq antes da compactação")
     pre_open = open_time(path)
-    bench(path, ["t-freq", "titulos", "and-freq"], "full-pre-compactacao")
+    bench(path, scale, ["t-freq", "titulos", "and-freq"], f"{scale}-pre-compactacao")
 
     step("compactação")
     size_before = dir_size(path)
     t = time.time()
     run([FF, "compact", path])
     compact_s = time.time() - t
-    size_after = dir_size(path)
-    post_open = open_time(path)
-    save_result("compact", "ptwiki-full", {"segundos": compact_s, "banco_antes": size_before, "banco_depois": size_after,
-                                           "abertura_antes": pre_open, "abertura_depois": post_open})
+    save_result("compact", scale, {"segundos": compact_s, "banco_antes": size_before, "banco_depois": dir_size(path),
+                                   "abertura_antes": pre_open, "abertura_depois": open_time(path)})
     wiki("sizes", "--db", path)
 
     step("latência de todos os conjuntos (cache quente)")
-    bench(path, None, "full-t1")
+    bench(path, scale, None, f"{scale}-t1")
 
     if can_drop_caches():
         step("latência com cache frio")
-        bench(path, ["t-raro", "t-medio", "t-freq", "titulos", "misto"], "full-t1-frio", extra=["--cold"])
+        bench(path, scale, ["t-raro", "t-medio", "t-freq", "titulos", "misto"], f"{scale}-t1-frio", extra=["--cold"])
     else:
         print(f"{DIM}pulando cache frio: precisa de `sudo -n` (rode `sudo -v` antes, se quiser){RESET}")
 
-    for mb in (64, 1024):
-        step(f"block cache de {mb} MB")
-        bench(path, ["t-medio", "titulos", "misto", "p-2"], f"full-cache-{mb}mb", extra=["--cache-mb", mb])
+    for mb_ in (64, 1024):
+        step(f"block cache de {mb_} MB")
+        bench(path, scale, ["t-medio", "titulos", "misto", "p-2"], f"{scale}-cache-{mb_}mb", extra=["--cache-mb", mb_])
 
 
-def fase_concorrencia(args):
-    """Fase 5: escala com threads e leitura durante escrita."""
-    path = db("ptwiki-full")
+def fase_concorrencia(scale):
+    """Fase 5: escala com threads e leitura durante escrita (os últimos 10% da fatia)."""
+    path = ensure_loaded(scale)
     for t in (1, 2, 4, 8, 12):
         step(f"só leitura: misto com {t} thread(s)")
-        bench(path, ["misto"], f"full-misto-t{t}", threads=t)
+        bench(path, scale, ["misto"], f"{scale}-misto-t{t}", threads=t)
 
-    base = db("ptwiki-1m")
+    n = docs_in(scale)
+    base_n = n * 9 // 10
+    base = db(f"ptwiki-{scale}-90")
     if not os.path.exists(base):
-        step("carga dos primeiros 1.000.000 artigos (base da leitura durante escrita)")
+        step(f"carga dos primeiros {base_n} artigos (base da leitura durante escrita)")
         fresh(base)
-        wiki("load", "--db", base, "--corpus", corpus("full"), "--take", 1000000, "--label", "ptwiki-1m")
+        wiki("load", "--db", base, "--corpus", corpus(scale), "--take", base_n, "--label", f"ptwiki-{scale}-90")
     tmp = db("tmp-concorrencia")
+    baseline = 5 if n <= 10000 else 15
     for t in (1, 4, 8):
-        step(f"leitura durante escrita: {t} leitor(es) + carga dos 112k restantes")
-        fresh(tmp)
-        shutil.copytree(base, tmp, dirs_exist_ok=True)
-        wiki("concurrent", "--db", tmp, "--corpus", corpus("full"), "--skip", 1000000,
-             "--queries", os.path.join(QUERIES, "misto.txt"), "--threads", t, "--label", f"misto-t{t}")
+        step(f"leitura durante escrita: {t} leitor(es) + carga dos {n - base_n} restantes")
+        copy_db(base, tmp)
+        wiki("concurrent", "--db", tmp, "--corpus", corpus(scale), "--skip", base_n,
+             "--queries", os.path.join(queries_dir(scale), "misto.txt"), "--threads", t,
+             "--baseline-secs", baseline, "--label", f"{scale}-misto-t{t}")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def fase_pr(args):
-    """Fase 8: oráculo 10k + carga 100k + bench rápido, comparado com a linha de base salva."""
-    tmp10, tmp100 = db("tmp-pr-10k"), db("tmp-pr-100k")
-    step("pr: oráculo 10k")
-    fresh(tmp10)
-    wiki("load", "--db", tmp10, "--corpus", corpus("10k"), "--label", "pr-10k")
-    ok = wiki("oracle", "--db", tmp10, "--corpus", corpus("10k"), "--label", "pr-10k", check=False) == 0
-    step("pr: carga 100k + bench")
-    fresh(tmp100)
-    wiki("load", "--db", tmp100, "--corpus", corpus("100k"), "--label", "pr-100k")
-    bench(tmp100, ["t-medio", "t-freq", "p-2"], "pr-100k")
-    for p in (tmp10, tmp100):
+def fase_pr(scale, salvar_baseline=False):
+    """Fase 8: oráculo + carga + bench rápido, comparado com a linha de base salva."""
+    small = smaller(scale, "10k")
+    baseline_path = os.path.join(PROJECT, "bench", f"baseline-pr-{scale}.json")
+    tmp_small, tmp_big = db("tmp-pr-oraculo"), db("tmp-pr-carga")
+    step(f"pr: oráculo {small}")
+    fresh(tmp_small)
+    wiki("load", "--db", tmp_small, "--corpus", corpus(small), "--label", f"pr-oraculo-{small}")
+    ok = wiki("oracle", "--db", tmp_small, "--corpus", corpus(small), "--label", f"pr-{small}", check=False) == 0
+    step(f"pr: carga {scale} + bench")
+    fresh(tmp_big)
+    wiki("load", "--db", tmp_big, "--corpus", corpus(scale), "--label", f"pr-{scale}")
+    bench(tmp_big, scale, ["t-medio", "t-freq", "p-2"], f"pr-{scale}")
+    for p in (tmp_small, tmp_big):
         shutil.rmtree(p, ignore_errors=True)
 
     results = load_results()
-    current = latest(results, "bench", "pr-100k")
-    load_now = latest(results, "load", "pr-100k")
-    if args.salvar_baseline or not os.path.exists(BASELINE_PR):
-        with open(BASELINE_PR, "w") as f:
+    current = latest(results, "bench", f"pr-{scale}")
+    load_now = latest(results, "load", f"pr-{scale}")
+    if salvar_baseline or not os.path.exists(baseline_path):
+        with open(baseline_path, "w") as f:
             json.dump({"bench": current, "load": load_now}, f, indent=2, ensure_ascii=False)
-        print(f"linha de base salva em {BASELINE_PR}")
+        print(f"linha de base salva em {baseline_path}")
         return ok
-    with open(BASELINE_PR) as f:
+    with open(baseline_path) as f:
         base = json.load(f)
     worse = compare_bench(base["bench"], current)
     docs_base, docs_now = base["load"]["docs_por_s"], load_now["docs_por_s"]
-    print(f"\ncarga 100k: {docs_base:.0f} → {docs_now:.0f} docs/s ({pct(docs_now, docs_base):+.1f}%)")
+    print(f"\ncarga {scale}: {docs_base:.0f} → {docs_now:.0f} docs/s ({pct(docs_now, docs_base):+.1f}%)")
     if not ok:
         print(f"{RED}✗ oráculo divergiu{RESET}")
     if worse:
@@ -380,8 +409,7 @@ def cmd_comparar(args):
         a = json.load(f)
     with open(args.b) as f:
         b = json.load(f)
-    worse = compare_bench(a, b)
-    sys.exit(1 if worse else 0)
+    sys.exit(1 if compare_bench(a, b) else 0)
 
 
 # -------------------------------------------------------------------- relatório
@@ -404,23 +432,6 @@ def dur(s):
     return f"{m}min{sec:02d}s" if m else f"{s:.1f}s"
 
 
-def bench_table(r, sets=None):
-    if not r:
-        return ["_sem resultado_", ""]
-    rows = ["| Conjunto | p50 | p95 | p99 | máx | qps | resultados (média) | Gets/consulta | block reads/consulta |",
-            "|---|---|---|---|---|---|---|---|---|"]
-    for s in r["conjuntos"]:
-        if sets and s["conjunto"] not in sets:
-            continue
-        rows.append(f"| `{s['conjunto']}` | {us(s['p50_us'])} | {us(s['p95_us'])} | {us(s['p99_us'])} | {us(s['max_us'])} | "
-                    f"{fmt(s['qps'])} | {fmt(s['resultados_media'], 1)} | {fmt(s['gets_por_consulta'], 1)} | "
-                    f"{fmt(s['block_reads_por_consulta'], 2)} |")
-    rows.append("")
-    rows.append(f"<sub>{r['_arquivo']}</sub>")
-    rows.append("")
-    return rows
-
-
 def us(v):
     if v is None:
         return "—"
@@ -429,20 +440,31 @@ def us(v):
     return f"{fmt(v)} µs"
 
 
-def cmd_relatorio(args):
+def bench_table(r):
+    if not r:
+        return ["_sem resultado_", ""]
+    rows = ["| Conjunto | p50 | p95 | p99 | máx | qps | resultados (média) | Gets/consulta | block reads/consulta |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for s in r["conjuntos"]:
+        rows.append(f"| `{s['conjunto']}` | {us(s['p50_us'])} | {us(s['p95_us'])} | {us(s['p99_us'])} | {us(s['max_us'])} | "
+                    f"{fmt(s['qps'])} | {fmt(s['resultados_media'], 1)} | {fmt(s['gets_por_consulta'], 1)} | "
+                    f"{fmt(s['block_reads_por_consulta'], 2)} |")
+    return rows + ["", f"<sub>{r['_arquivo']}</sub>", ""]
+
+
+def cmd_relatorio(scale):
     R = load_results()
     if not R:
         sys.exit("nenhum resultado em bench/results/")
-    last = R[-1]
     machine = next((r["maquina"] for r in reversed(R) if "maquina" in r), {})
     L = [
-        "# Resultados de performance",
+        f"# Resultados de performance (escala {scale})",
         "",
-        "Gerado por `python3 scripts/perf.py relatorio` a partir de `bench/results/`. "
+        f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `bench/results/`. "
         "Cada seção mostra o resultado **mais recente** daquele tipo. O plano está em "
         "[docs/plano-performance.md](../docs/plano-performance.md).",
         "",
-        f"- Último resultado: `{last['_arquivo']}`",
+        f"- Último resultado: `{R[-1]['_arquivo']}`",
         f"- Máquina: {machine.get('nucleos', '?')} núcleos, {mb(machine.get('ram_total'))} MB de RAM, "
         f"kernel `{machine.get('kernel', '?')}`",
         "",
@@ -450,24 +472,21 @@ def cmd_relatorio(args):
 
     # Fase 1
     L += ["## Fase 1: corretude", ""]
-    corr = latest(R, "corretude")
+    corr = latest(R, "corretude", scale)
     if corr:
         L += ["| Checagem | Resultado |", "|---|---|"]
-        names = {"oraculo_10k": "Oráculo 10k (todos os termos)", "idempotencia": "Indexar a fatia duas vezes",
-                 "lotes_vs_unico": "`--batch 1` vs. `--batch 1000`", "oraculo_100k": "Oráculo 100k (amostra)",
-                 "reabrir_101k": "Reabrir + 1k docs (oráculo 101k)"}
         for k, ok in corr["checagens"].items():
-            L.append(f"| {names.get(k, k)} | {'✅ ok' if ok else '❌ divergiu'} |")
+            L.append(f"| `{k}` | {'✅ ok' if ok else '❌ divergiu'} |")
         idem = corr.get("idempotencia", {})
         if idem:
-            L += ["", f"Tamanho na idempotência: {mb(idem.get('banco_1a'))} MB após uma carga, "
-                      f"{mb(idem.get('banco_2a'))} MB após duas, {mb(idem.get('banco_2a_compactado'))} MB depois de compactar."]
+            L += ["", f"Idempotência ({idem.get('fatia')}): banco de {mb(idem.get('banco_1a'))} MB após uma carga, "
+                      f"{mb(idem.get('banco_2a'))} MB após duas e {mb(idem.get('banco_2a_compactado'))} MB depois de compactar."]
         L.append("")
-    oracles = [r for r in R if r.get("tipo") == "oracle" and not r.get("rotulo", "").startswith("pr-")]
-    seen = {}
-    for r in oracles:
-        seen[r["rotulo"]] = r
-    for label, r in seen.items():
+    oracles = {}
+    for r in R:
+        if r.get("tipo") == "oracle" and not r.get("rotulo", "").startswith("pr-"):
+            oracles[r["rotulo"]] = r
+    for label, r in oracles.items():
         L += [f"**Oráculo `{label}`** ({fmt(r['docs'])} docs, {fmt(r['termos_oraculo'])} termos): "
               f"{'zero divergências' if r['divergencias'] == 0 else str(r['divergencias']) + ' divergências'}", "",
               "| Verificação | Casos | Divergências | Notas |", "|---|---|---|---|"]
@@ -491,60 +510,64 @@ def cmd_relatorio(args):
                  f"{fmt(r['nos_trie'])} | {fmt(terms)} | {fmt(w.get('write_amp'), 2)} | "
                  f"{fmt((w.get('stall_micros') or 0) / 1e6, 1)}s |")
     L.append("")
-    exps = [r for r in R if r.get("tipo") == "load" and r.get("rotulo", "").startswith("exp-")]
+    exp_slice = smaller(scale, "100k")
+    prefix = f"exp-{exp_slice}-"
+    exps = {}
+    for r in R:
+        if r.get("tipo") == "load" and r.get("rotulo", "").startswith(prefix):
+            exps[r["rotulo"][len(prefix):]] = r
     if exps:
-        by_label = {}
-        for r in exps:
-            by_label[r["rotulo"]] = r
-        base = latest(R, "load", "ptwiki-100k")
-        L += ["### Experimentos (100k)", "", "| Experimento | docs/s | vs. padrão | Pico RSS | Banco |", "|---|---|---|---|---|"]
+        base = latest(R, "load", f"ptwiki-{exp_slice}")
+        L += [f"### Experimentos ({exp_slice})", "", "| Experimento | docs/s | vs. padrão | Pico RSS | Banco |", "|---|---|---|---|---|"]
         if base:
             L.append(f"| padrão (lote 1000) | {fmt(base['docs_por_s'])} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
-        for label, r in by_label.items():
+        for label, r in exps.items():
             vs = f"{pct(r['docs_por_s'], base['docs_por_s']):+.0f}%" if base and "streaming" not in label else "—"
-            L.append(f"| {label[4:]} | {fmt(r['docs_por_s'])} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")
+            L.append(f"| {label} | {fmt(r['docs_por_s'])} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")
         L.append("")
-    sz = latest(R, "sizes", "ptwiki-full") or latest(R, "sizes", "ptwiki-100k")
+    sz = latest(R, "sizes", f"ptwiki-{scale}")
     if sz:
-        L += [f"### Tamanhos (`{sz['rotulo']}`)", "", "| Espaço | Chaves | Chaves (MB) | Valores (MB) |", "|---|---|---|---|"]
+        L += [f"### Tamanhos ({scale})", "", "| Espaço | Chaves | Chaves (MB) | Valores (MB) |", "|---|---|---|---|"]
         for e in sz["espacos"]:
             L.append(f"| `{e['espaco']}:` | {fmt(e['chaves'])} | {mb(e['bytes_chaves'])} | {mb(e['bytes_valores'])} |")
         L += ["", f"Raiz (`node:0`): {fmt(sz['raiz_bytes'])} bytes. "
-              + "Listas: " + ", ".join(f"\"{t}\" {fmt(b / 1024, 0)} KB" for t, b in sz.get("listas", {}).items()), ""]
+              + "Listas: " + ", ".join(f"\"{t}\" {fmt(b / 1024, 1)} KB" for t, b in sz.get("listas", {}).items()), ""]
 
     # Fase 4
-    L += ["## Fase 4: latência de busca (1,1M, cache quente, 1 thread)", ""]
-    L += bench_table(latest(R, "bench", "full-t1"))
-    pre, post = latest(R, "bench", "full-pre-compactacao"), latest(R, "bench", "full-t1")
-    comp = latest(R, "compact", "ptwiki-full")
+    post = latest(R, "bench", f"{scale}-t1")
+    L += [f"## Fase 4: latência de busca ({scale}, cache quente, 1 thread)", ""] + bench_table(post)
+    pre = latest(R, "bench", f"{scale}-pre-compactacao")
     if pre and post:
-        L += ["### Merge pendente vs. compactado", "", "| Conjunto | p50 antes | p50 depois | p99 antes | p99 depois |", "|---|---|---|---|---|"]
         post_sets = {s["conjunto"]: s for s in post["conjuntos"]}
+        L += ["### Merge pendente vs. compactado", "", "| Conjunto | p50 antes | p50 depois | p99 antes | p99 depois | merges/consulta antes |",
+              "|---|---|---|---|---|---|"]
         for s in pre["conjuntos"]:
             o = post_sets.get(s["conjunto"])
             if o:
-                L.append(f"| `{s['conjunto']}` | {us(s['p50_us'])} | {us(o['p50_us'])} | {us(s['p99_us'])} | {us(o['p99_us'])} |")
+                L.append(f"| `{s['conjunto']}` | {us(s['p50_us'])} | {us(o['p50_us'])} | {us(s['p99_us'])} | {us(o['p99_us'])} | "
+                         f"{fmt(s.get('merges_por_consulta'), 1)} |")
         L.append("")
+    comp = latest(R, "compact", scale)
     if comp:
         L += [f"Compactação: {dur(comp['segundos'])}, banco de {mb(comp['banco_antes'])} MB → {mb(comp['banco_depois'])} MB. "
               f"Abrir o banco + 1 busca: {fmt(comp['abertura_antes']['mediana_s'] * 1000)} ms antes, "
               f"{fmt(comp['abertura_depois']['mediana_s'] * 1000)} ms depois (mediana de {comp['abertura_depois']['execucoes']}).", ""]
-    caches = [(mb_, latest(R, "bench", f"full-cache-{mb_}mb")) for mb_ in (64, 1024)]
-    if any(c for _, c in caches) and post:
-        L += ["### Block cache", "", "| Conjunto | 64 MB p50 | 256 MB p50 | 1024 MB p50 |", "|---|---|---|---|"]
+    c64, c1g = latest(R, "bench", f"{scale}-cache-64mb"), latest(R, "bench", f"{scale}-cache-1024mb")
+    if (c64 or c1g) and post:
         post_sets = {s["conjunto"]: s for s in post["conjuntos"]}
-        c64 = {s["conjunto"]: s for s in (caches[0][1] or {}).get("conjuntos", [])}
-        c1g = {s["conjunto"]: s for s in (caches[1][1] or {}).get("conjuntos", [])}
-        for name in c64 or c1g:
-            L.append(f"| `{name}` | {us(c64.get(name, {}).get('p50_us'))} | {us(post_sets.get(name, {}).get('p50_us'))} | "
-                     f"{us(c1g.get(name, {}).get('p50_us'))} |")
+        a = {s["conjunto"]: s for s in (c64 or {}).get("conjuntos", [])}
+        b = {s["conjunto"]: s for s in (c1g or {}).get("conjuntos", [])}
+        L += ["### Block cache (p50)", "", "| Conjunto | 64 MB | 256 MB | 1024 MB |", "|---|---|---|---|"]
+        for name in a or b:
+            L.append(f"| `{name}` | {us(a.get(name, {}).get('p50_us'))} | {us(post_sets.get(name, {}).get('p50_us'))} | "
+                     f"{us(b.get(name, {}).get('p50_us'))} |")
         L.append("")
-    cold = latest(R, "bench", "full-t1-frio")
+    cold = latest(R, "bench", f"{scale}-t1-frio")
     if cold:
         L += ["### Cache frio", ""] + bench_table(cold)
 
     # Fase 5
-    scaling = [(t, latest(R, "bench", f"full-misto-t{t}")) for t in (1, 2, 4, 8, 12)]
+    scaling = [(t, latest(R, "bench", f"{scale}-misto-t{t}")) for t in (1, 2, 4, 8, 12)]
     if any(r for _, r in scaling):
         L += ["## Fase 5: concorrência", "", "### Só leitura (`misto`)", "", "| Threads | qps | ganho vs. 1 | p50 | p99 |", "|---|---|---|---|---|"]
         q1 = next((r["conjuntos"][0]["qps"] for t, r in scaling if t == 1 and r), None)
@@ -553,9 +576,9 @@ def cmd_relatorio(args):
                 s = r["conjuntos"][0]
                 L.append(f"| {t} | {fmt(s['qps'])} | {fmt(s['qps'] / q1, 1) + '×' if q1 else '—'} | {us(s['p50_us'])} | {us(s['p99_us'])} |")
         L.append("")
-    conc = [(t, latest(R, "concurrent", f"misto-t{t}")) for t in (1, 4, 8)]
+    conc = [(t, latest(R, "concurrent", f"{scale}-misto-t{t}")) for t in (1, 4, 8)]
     if any(r for _, r in conc):
-        L += ["### Leitura durante escrita (carga dos 112k restantes sobre 1M)", "",
+        L += ["### Leitura durante escrita (carga dos últimos 10% da fatia)", "",
               "| Leitores | p50 sem escrita | p50 com escrita | p99 sem escrita | p99 com escrita | indexação docs/s | stalls |",
               "|---|---|---|---|---|---|---|"]
         for t, r in conc:
@@ -567,20 +590,20 @@ def cmd_relatorio(args):
         L.append("")
 
     # Metas
-    full = latest(R, "load", "ptwiki-full")
+    load_scale = latest(R, "load", f"ptwiki-{scale}")
     t1 = {s["conjunto"]: s for s in (post or {}).get("conjuntos", [])}
-    c4 = latest(R, "concurrent", "misto-t4")
-    oracle_divs = sum(r["divergencias"] for r in seen.values()) if seen else None
+    c4 = latest(R, "concurrent", f"{scale}-misto-t4")
+    divs = sum(r["divergencias"] for r in oracles.values()) if oracles else None
     swap = machine.get("swap_usado")
-    L += ["## Metas (linha de base)", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
-          f"| Divergências do oráculo | {oracle_divs if oracle_divs is not None else '—'} | **0** |",
-          f"| Carga total sem swap | {'sim' if full and not swap else ('—' if not full else 'não')} | **sim** |",
-          f"| docs/s na carga total | {fmt(full['docs_por_s']) if full else '—'} | |",
-          f"| Banco ÷ texto bruto | {fmt(full['banco_por_texto'], 2) if full else '—'} | |",
+    L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
+          f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
+          f"| Carga sem swap | {'—' if not load_scale else ('sim' if not swap else 'não')} | **sim** |",
+          f"| docs/s na carga de {scale} | {fmt(load_scale['docs_por_s']) if load_scale else '—'} | |",
+          f"| Banco ÷ texto bruto | {fmt(load_scale['banco_por_texto'], 2) if load_scale else '—'} | |",
           f"| p99 de `titulos` (quente) | {us(t1.get('titulos', {}).get('p99_us'))} | |",
           f"| p99 de `t-freq` (quente) | {us(t1.get('t-freq', {}).get('p99_us'))} | |",
           f"| p99 de `misto` com indexação em paralelo | {us(c4['leitura_com_escrita']['p99_us']) if c4 else '—'} | |",
-          f"| Tempo de abertura após a carga total | {fmt(comp['abertura_antes']['mediana_s'] * 1000) + ' ms' if comp else '—'} | |",
+          f"| Abrir o banco + 1 busca (após a carga) | {fmt(comp['abertura_antes']['mediana_s'] * 1000) + ' ms' if comp else '—'} | |",
           ""]
 
     with open(REPORT, "w") as f:
@@ -591,45 +614,50 @@ def cmd_relatorio(args):
 # ------------------------------------------------------------------------ main
 
 def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--escala", choices=ORDER, default="10k",
+                        help="maior fatia do corpus usada (padrão: 10k)")
     p = argparse.ArgumentParser(description="Plano de performance do fire-flower")
     sub = p.add_subparsers(dest="cmd", required=True)
-    e = sub.add_parser("escada", help="Fase 2")
-    e.add_argument("--ate", choices=ORDER, default="full")
+    e = sub.add_parser("escada", parents=[common], help="Fase 2")
     e.add_argument("--experimentos", action="store_true")
-    sub.add_parser("corretude", help="Fase 1")
-    sub.add_parser("consultas", help="Fase 3")
-    sub.add_parser("latencia", help="Fase 4")
-    sub.add_parser("concorrencia", help="Fase 5")
-    pr = sub.add_parser("pr", help="Fase 8")
+    for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
+                        ("concorrencia", "Fase 5"), ("relatorio", "gera bench/RESULTADOS.md")):
+        sub.add_parser(name, parents=[common], help=help_)
+    pr = sub.add_parser("pr", parents=[common], help="Fase 8")
     pr.add_argument("--salvar-baseline", action="store_true")
-    sub.add_parser("relatorio")
-    c = sub.add_parser("comparar")
+    c = sub.add_parser("comparar", help="compara dois resultados de bench")
     c.add_argument("a")
     c.add_argument("b")
-    t = sub.add_parser("tudo", help="todas as fases, na ordem")
-    t.add_argument("--sem-concorrencia", action="store_true", help="pula a Fase 5 (economiza ~20 min)")
+    t = sub.add_parser("tudo", parents=[common], help="todas as fases, na ordem")
+    t.add_argument("--sem-concorrencia", action="store_true", help="pula a Fase 5")
     args = p.parse_args()
 
     if args.cmd == "comparar":
         return cmd_comparar(args)
     if args.cmd == "relatorio":
-        return cmd_relatorio(args)
+        return cmd_relatorio(args.escala)
+    scale = args.escala
     build()
     started = time.time()
     ok = True
     if args.cmd == "tudo":
-        fase_escada(argparse.Namespace(ate="full", experimentos=True))
-        ok &= fase_corretude(args)
-        fase_consultas(args)
-        fase_latencia(args)
+        fase_escada(scale, experimentos=True)
+        ok &= fase_corretude(scale)
+        fase_consultas(scale)
+        fase_latencia(scale)
         if not args.sem_concorrencia:
-            fase_concorrencia(args)
-        ok &= fase_pr(argparse.Namespace(salvar_baseline=True))
+            fase_concorrencia(scale)
+        ok &= fase_pr(scale, salvar_baseline=True)
+    elif args.cmd == "escada":
+        fase_escada(scale, args.experimentos)
+    elif args.cmd == "pr":
+        ok = fase_pr(scale, args.salvar_baseline)
     else:
-        result = {"escada": fase_escada, "corretude": fase_corretude, "consultas": fase_consultas,
-                  "latencia": fase_latencia, "concorrencia": fase_concorrencia, "pr": fase_pr}[args.cmd](args)
+        result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
+                  "concorrencia": fase_concorrencia}[args.cmd](scale)
         ok = result is not False
-    cmd_relatorio(args)
+    cmd_relatorio(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"
     print(f"\n{status} em {dur(time.time() - started)}{RESET}")
     sys.exit(0 if ok else 1)

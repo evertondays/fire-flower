@@ -7,8 +7,10 @@ RocksDB**, um registro por nó. Sem servidor externo — é uma biblioteca Rust
 Suporta:
 
 - busca exata, normalizada (`Ação` = `acao` = `ACAO`);
-- stopwords em português e inglês (`de`, `o`, `the`…) ficam fora do índice e
-  são ignoradas na consulta (`casa de papel` busca `casa` E `papel`);
+- stopwords por idioma (português e inglês por enquanto: `de`, `o`, `the`…)
+  ficam fora do índice e são ignoradas na consulta (`casa de papel` busca
+  `casa` E `papel`). Os idiomas são escolhidos na criação do banco
+  (`--idiomas pt,en`, o padrão) e ficam gravados nele;
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
@@ -178,7 +180,8 @@ python3 scripts/perf.py tudo --escala 10k
 - **Sem stemming** ("casa" e "casas" são termos diferentes).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam
-  valendo (`de*` acha "dezembro"). A lista está em `src/text.rs`.
+  valendo (`de*` acha "dezembro"). As listas estão em `src/stopwords/*.txt`;
+  para usar outro idioma, crie o banco com `--idiomas en` (ou `nenhum`).
 
 ## Compilação
 

@@ -272,6 +272,7 @@ def main():
                         help="compacta o banco no fim (une as listas em pedaços; leva alguns minutos)")
     parser.add_argument("--sim", action="store_true", help="não pede confirmação para apagar o banco")
     parser.add_argument("--sem-build", action="store_true", help="não roda o cargo build")
+    parser.add_argument("--idiomas", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
     args = parser.parse_args()
 
     corpus = os.path.expanduser(args.corpus)
@@ -293,6 +294,8 @@ def main():
 
     cmd = [BINARY, "index-jsonl", banco, corpus, "--lote", str(args.lote),
            "--pular", str(args.pular), "--progresso-json"]
+    if args.idiomas:
+        cmd += ["--idiomas", args.idiomas]
     log = open(log_path, "w")
     # Processo próprio: o Ctrl+C chega só ao script, que encerra o motor com
     # SIGINT e ainda consegue mostrar o resumo.

@@ -4,22 +4,26 @@
 //! - `node:<id>`  -> [`TrieNode`] serializado (`node:0` é a raiz)
 //! - `post:<id>`  -> lista de postagem do termo que termina no nó `<id>`
 //! - `doc:<id>`   -> rótulo opcional do documento (ex.: caminho do arquivo)
-//! - `meta:*`     -> contadores de ID
+//! - `meta:*`     -> contadores de ID e idiomas das stopwords
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use rustc_hash::FxHashMap;
 use rocksdb::{BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 
 use crate::codec::{self, TrieNode};
+use crate::stopwords::{self, Language, Stopwords};
 use crate::text::{index_terms, normalize_term, parse_query};
 use crate::{DocId, Error, Result};
 
 pub const ROOT_ID: u64 = 0;
 const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
+/// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
+const META_LANGUAGES: &[u8] = b"meta:languages";
 
 fn node_key(id: u64) -> String {
     format!("node:{id}")
@@ -49,6 +53,14 @@ pub struct Config {
     /// nós dos termos comuns. Passando do limite, saem primeiro os nós que o
     /// último lote não usou e depois os mais fundos. 0 desliga o cache.
     pub writer_cache_nodes: usize,
+    /// Idiomas das stopwords (palavras comuns que não entram no índice).
+    ///
+    /// Ficam gravados no banco quando ele é criado, porque índice e consulta
+    /// precisam descartar as mesmas palavras. `None` usa o que está no banco,
+    /// ou [`Language::DEFAULT`] (português e inglês) num banco novo. `Some`
+    /// diferente do que está gravado faz o `open` falhar. `Some(vec![])`
+    /// cria um banco sem stopwords.
+    pub languages: Option<Vec<Language>>,
 }
 
 impl Default for Config {
@@ -59,6 +71,7 @@ impl Default for Config {
             max_prefix_terms: 256,
             statistics: false,
             writer_cache_nodes: 1_000_000,
+            languages: None,
         }
     }
 }
@@ -69,6 +82,7 @@ pub struct Engine {
     db: DB,
     writer: Mutex<WriterState>,
     config: Config,
+    stopwords: Stopwords,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -85,7 +99,7 @@ struct WriterState {
 
 #[derive(Default)]
 struct NodeCache {
-    nodes: HashMap<u64, CachedNode>,
+    nodes: FxHashMap<u64, CachedNode>,
     /// Número do último lote gravado. Cada nó guarda o lote que o usou por último.
     generation: u64,
 }
@@ -113,7 +127,9 @@ impl Engine {
         let db = DB::open(&opts, path)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
-        Ok(Self { db, writer: Mutex::new(WriterState { next_node_id, next_doc_id, cache: NodeCache::default() }), config, opts })
+        let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
+        let writer = Mutex::new(WriterState { next_node_id, next_doc_id, cache: NodeCache::default() });
+        Ok(Self { db, writer, config, stopwords, opts })
     }
 
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
@@ -125,6 +141,7 @@ impl Engine {
         let cache = std::mem::take(&mut state.cache);
         IndexBatch {
             db: &self.db,
+            stopwords: &self.stopwords,
             next_node_id: state.next_node_id,
             next_doc_id: state.next_doc_id,
             state,
@@ -132,7 +149,7 @@ impl Engine {
             generation: cache.generation + 1,
             cache_limit: self.config.writer_cache_nodes,
             dirty: Vec::new(),
-            pending: HashMap::new(),
+            pending: FxHashMap::default(),
             labels: Vec::new(),
             documents: 0,
         }
@@ -184,7 +201,17 @@ impl Engine {
     /// O snapshot garante que todas vejam o mesmo momento do índice, mesmo que
     /// um commit aconteça no meio.
     fn view(&self) -> View<'_> {
-        View { snap: self.db.snapshot(), config: &self.config }
+        View { snap: self.db.snapshot(), config: &self.config, stopwords: &self.stopwords }
+    }
+
+    /// Stopwords deste banco (os idiomas gravados nele).
+    pub fn stopwords(&self) -> &Stopwords {
+        &self.stopwords
+    }
+
+    /// Idiomas das stopwords deste banco.
+    pub fn languages(&self) -> &[Language] {
+        self.stopwords.languages()
     }
 }
 
@@ -263,12 +290,13 @@ type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
 struct View<'a> {
     snap: Snapshot<'a>,
     config: &'a Config,
+    stopwords: &'a Stopwords,
 }
 
 impl View<'_> {
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
         let mut lists: Vec<Vec<DocId>> = Vec::new();
-        for term in parse_query(query) {
+        for term in parse_query(query, self.stopwords) {
             let list = if term.prefix { self.prefix_postings(&term.text)? } else { self.postings(&term.text)? };
             if list.is_empty() {
                 return Ok(Vec::new());
@@ -360,19 +388,20 @@ impl View<'_> {
 /// por documento que contém o termo).
 pub struct IndexBatch<'a> {
     db: &'a DB,
+    stopwords: &'a Stopwords,
     state: MutexGuard<'a, WriterState>,
     next_node_id: u64,
     next_doc_id: DocId,
     /// Cache de nós emprestado do `WriterState`, mais os nós lidos ou criados
     /// neste lote. Nós criados aqui ainda não existem no banco, então as
     /// travessias seguintes precisam enxergá-los por este mapa.
-    nodes: HashMap<u64, CachedNode>,
+    nodes: FxHashMap<u64, CachedNode>,
     generation: u64,
     cache_limit: usize,
     /// Nós alterados neste lote, na ordem em que mudaram.
     dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
-    pending: HashMap<String, Vec<DocId>>,
+    pending: FxHashMap<String, Vec<DocId>>,
     labels: Vec<(DocId, String)>,
     documents: usize,
 }
@@ -389,7 +418,7 @@ struct CachedNode {
 impl IndexBatch<'_> {
     /// Indexa `text` sob um ID escolhido por você.
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
-        for term in index_terms(text) {
+        for term in index_terms(text, self.stopwords) {
             match self.pending.get_mut(term.as_str()) {
                 Some(docs) => docs.push(doc_id),
                 None => {
@@ -531,7 +560,7 @@ impl IndexBatch<'_> {
 
 /// Mantém o cache de nós dentro de `limit`: primeiro saem os nós que o lote
 /// `generation` não usou; se ainda passar, saem os mais fundos.
-fn evict(nodes: &mut HashMap<u64, CachedNode>, generation: u64, limit: usize) {
+fn evict(nodes: &mut FxHashMap<u64, CachedNode>, generation: u64, limit: usize) {
     if nodes.len() <= limit {
         return;
     }
@@ -599,6 +628,43 @@ fn load_node(src: &impl Source, id: u64) -> Result<Option<TrieNode>> {
 
 fn missing_node(id: u64) -> Error {
     Error::Corrupt(format!("nó {id} referenciado mas ausente"))
+}
+
+/// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
+/// (ou o padrão). Bancos criados antes da chave existir usam português e
+/// inglês: é o que a indexação fazia, e um banco ainda mais antigo, sem
+/// stopwords, também funciona assim (a consulta só fica mais ampla).
+fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
+    let normalize = |langs: &[Language]| Stopwords::new(langs).languages().to_vec();
+    let stored = match db.get_pinned(META_LANGUAGES)? {
+        Some(v) => Some(parse_languages(&String::from_utf8_lossy(&v))?),
+        None if read_counter(db, META_NEXT_NODE)?.is_some() => Some(normalize(Language::DEFAULT)),
+        None => None,
+    };
+    let languages = match (stored, wanted) {
+        (Some(stored), Some(wanted)) if normalize(wanted) != stored => {
+            return Err(Error::Config(format!(
+                "o banco foi criado com stopwords de [{}], mas a config pede [{}]",
+                stopwords::describe(&stored),
+                stopwords::describe(&normalize(wanted))
+            )));
+        }
+        (Some(stored), _) => stored,
+        (None, wanted) => normalize(wanted.unwrap_or(Language::DEFAULT)),
+    };
+    if db.get_pinned(META_LANGUAGES)?.is_none() {
+        let codes: Vec<&str> = languages.iter().map(|l| l.code()).collect();
+        db.put(META_LANGUAGES, codes.join(","))?;
+    }
+    Ok(languages)
+}
+
+fn parse_languages(codes: &str) -> Result<Vec<Language>> {
+    codes
+        .split(',')
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| Language::from_code(c).ok_or_else(|| Error::Corrupt(format!("idioma desconhecido no banco: {c:?}"))))
+        .collect()
 }
 
 fn read_counter(db: &DB, key: &[u8]) -> Result<Option<u64>> {

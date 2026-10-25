@@ -120,7 +120,7 @@ impl<'a> App<'a> {
             Some(word) if !word.ends_with('*') => format!("{}*", self.query.trim_end()),
             _ => self.query.trim().to_string(),
         };
-        self.terms = parse_query(&self.effective);
+        self.terms = parse_query(&self.effective, self.engine.stopwords());
 
         self.error = None;
         self.suggestions = match &self.current_word {
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn highlight_marks_normalized_matches() {
-        let terms = parse_query("coracao do bras*");
+        let terms = parse_query("coracao do bras*", &fire_flower::Stopwords::default());
         let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms);
         assert!(hit);
         let marked: Vec<&str> =

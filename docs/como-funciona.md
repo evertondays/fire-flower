@@ -383,8 +383,16 @@ A **mesma** função é usada na busca. Se as duas normalizações divergissem, 
 termos buscados nunca bateriam com os indexados.
 
 **Stopwords.** Depois de normalizar, `index_terms` descarta as palavras
-comuns em português e inglês (listas `STOPWORDS_PT` e `STOPWORDS_EN`, baseadas
-no Snowball/NLTK). Elas aparecem em quase todo documento, então só inchariam o
+comuns dos idiomas do banco. As listas ficam em `src/stopwords/pt.txt` e
+`en.txt` (baseadas no Snowball/NLTK), uma palavra por linha e embutidas no
+binário; `src/stopwords.rs` as normaliza num `FxHashSet`, consultado uma vez
+por token.
+
+Os idiomas são escolhidos na criação (`Config::languages`, ou `--idiomas` na
+CLI; o padrão é português e inglês) e gravados em `meta:languages`. Abrir o
+banco depois usa o que está gravado; pedir outros idiomas é erro, porque
+índice e consulta precisam descartar as mesmas palavras. Para um idioma
+novo: um arquivo em `src/stopwords/` e uma variante em `Language`. Elas aparecem em quase todo documento, então só inchariam o
 índice: na Wikipédia, "de" está em 99% dos artigos. Na busca, `parse_query`
 descarta as mesmas palavras quando exatas, senão `casa de papel` exigiria um
 termo que não existe e voltaria vazia. Como prefixo (`de*`) elas continuam
@@ -628,7 +636,8 @@ Detalhes que mantêm a interface rápida:
 | Arquivo | Peças principais |
 |---|---|
 | `src/lib.rs` | API pública: `Engine`, `Config`, `IndexBatch`, `Error`, `DocId` |
-| `src/text.rs` | `tokenize`, `index_terms`, `parse_query`, stopwords, `normalize_term`, `strip_html` |
+| `src/text.rs` | `tokenize`, `index_terms`, `parse_query`, `normalize_term`, `strip_html` |
+| `src/stopwords.rs`, `src/stopwords/*.txt` | idiomas (`Language`) e listas de stopwords |
 | `src/codec.rs` | `TrieNode` (`encode`/`decode`), `encode_postings`/`decode_postings`, varint |
 | `src/engine.rs` | `Engine::open` (opções do RocksDB), `batch`, `search`, `suggest`, `label`; `View` (leituras sobre snapshot); `IndexBatch` (`add_document`, `insert_term`, `node_mut`, `commit`); `merge_postings`, `intersect` |
 | `src/main.rs` | subcomandos `tui`, `index`, `search`, `suggest` |

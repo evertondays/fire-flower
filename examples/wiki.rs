@@ -15,7 +15,10 @@
 //! cargo run --release --example wiki -- concurrent --db D --corpus F --skip K --queries Q [--threads T]
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+// FxHash: os mapas do vocabulário e do oráculo têm centenas de milhares de termos.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use fire_flower::text::index_terms;
+use fire_flower::{Language, Stopwords};
 use fire_flower::{Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
@@ -65,6 +69,10 @@ enum Cmd {
         /// Nós da Trie que o escritor guarda entre lotes (0 desliga o cache)
         #[arg(long)]
         cache_nos: Option<usize>,
+        /// Idiomas das stopwords de um banco novo ("pt,en", "en" ou "nenhum").
+        /// Sem a opção, usa o que está gravado no banco (ou pt,en)
+        #[arg(long)]
+        idiomas: Option<String>,
         #[arg(long)]
         label: Option<String>,
     },
@@ -72,6 +80,9 @@ enum Cmd {
     Vocab {
         #[arg(long)]
         corpus: PathBuf,
+        /// Idiomas das stopwords, como no banco que será medido
+        #[arg(long, default_value = "pt,en")]
+        idiomas: String,
         #[arg(long)]
         take: Option<u64>,
         #[arg(long)]
@@ -83,6 +94,9 @@ enum Cmd {
         vocab: PathBuf,
         #[arg(long)]
         corpus: PathBuf,
+        /// Idiomas das stopwords, como no banco que será medido
+        #[arg(long, default_value = "pt,en")]
+        idiomas: String,
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[arg(long, default_value_t = 1000)]
@@ -172,11 +186,14 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, label } => {
-            load(&db, &corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, label)
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, label } => {
+            let languages = idiomas.as_deref().map(parse_languages).transpose()?;
+            load(&db, &corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, languages, label)
         }
-        Cmd::Vocab { corpus, take, out } => vocab(&corpus, take, out),
-        Cmd::Queries { vocab, corpus, seed, per_set, out } => queries(&vocab, &corpus, seed, per_set, out),
+        Cmd::Vocab { corpus, idiomas, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&idiomas)?), take, out),
+        Cmd::Queries { vocab, corpus, idiomas, seed, per_set, out } => {
+            queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&idiomas)?), seed, per_set, out)
+        }
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, seed, label } => {
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, seed, label })
         }
@@ -268,8 +285,19 @@ impl Iterator for Corpus {
 }
 
 /// Termos únicos de um documento, como o motor os indexa (sem stopwords).
-fn unique_terms(body: &str) -> Vec<String> {
-    index_terms(body)
+fn unique_terms(body: &str, stopwords: &Stopwords) -> Vec<String> {
+    index_terms(body, stopwords)
+}
+
+/// "pt,en", "en" ou "nenhum".
+fn parse_languages(codes: &str) -> AnyResult<Vec<Language>> {
+    if codes.trim().eq_ignore_ascii_case("nenhum") {
+        return Ok(Vec::new());
+    }
+    codes
+        .split(',')
+        .map(|c| Language::from_code(c).ok_or_else(|| format!("idioma desconhecido: {c:?}").into()))
+        .collect()
 }
 
 fn stem(path: &Path) -> String {
@@ -367,6 +395,7 @@ fn config_json(config: &Config) -> Value {
         "max_prefix_terms": config.max_prefix_terms,
         "statistics": config.statistics,
         "writer_cache_nodes": config.writer_cache_nodes,
+        "languages": config.languages.as_ref().map(|l| l.iter().map(|l| l.code()).collect::<Vec<_>>()),
     })
 }
 
@@ -437,9 +466,10 @@ fn load(
     cache_mb: usize,
     streaming: bool,
     cache_nodes: Option<usize>,
+    languages: Option<Vec<Language>>,
     label: Option<String>,
 ) -> AnyResult {
-    let mut config = Config { block_cache_bytes: cache_mb << 20, statistics: true, ..Config::default() };
+    let mut config = Config { block_cache_bytes: cache_mb << 20, statistics: true, languages, ..Config::default() };
     if let Some(n) = cache_nodes {
         config.writer_cache_nodes = n;
     }
@@ -491,6 +521,7 @@ fn load(
     let result = json!({
         "db": db, "corpus": corpus_path, "batch": batch_size, "skip": skip, "take": take,
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
+        "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,
@@ -515,10 +546,10 @@ fn load(
 
 // ================================================================== vocab
 
-fn vocab(corpus_path: &Path, take: Option<u64>, out: Option<PathBuf>) -> AnyResult {
+fn vocab(corpus_path: &Path, stopwords: &Stopwords, take: Option<u64>, out: Option<PathBuf>) -> AnyResult {
     let started = Instant::now();
-    let mut df: HashMap<String, u32> = HashMap::new();
-    let mut ids = HashSet::new();
+    let mut df: HashMap<String, u32> = HashMap::default();
+    let mut ids = HashSet::default();
     let mut duplicates = Vec::new();
     let mut docs = 0u64;
     for doc in Corpus::open(corpus_path, 0, take, false)? {
@@ -526,7 +557,7 @@ fn vocab(corpus_path: &Path, take: Option<u64>, out: Option<PathBuf>) -> AnyResu
         if !ids.insert(doc.id) {
             duplicates.push((doc.id, doc.line));
         }
-        for term in unique_terms(&doc.body) {
+        for term in unique_terms(&doc.body, stopwords) {
             *df.entry(term).or_insert(0) += 1;
         }
         docs += 1;
@@ -605,7 +636,7 @@ impl Rng {
 
 // ================================================================== queries
 
-fn queries(vocab_path: &Path, corpus_path: &Path, seed: u64, per_set: usize, out: Option<PathBuf>) -> AnyResult {
+fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u64, per_set: usize, out: Option<PathBuf>) -> AnyResult {
     let vocab = read_vocab(vocab_path)?;
     let mut rng = Rng(seed);
     let known: HashSet<&str> = vocab.iter().map(|v| v.term.as_str()).collect();
@@ -712,7 +743,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, seed: u64, per_set: usize, out
     for doc in Corpus::open(corpus_path, 0, None, false)? {
         let doc = doc?;
         // Título só de stopwords ("Ela") vira consulta vazia.
-        if index_terms(&doc.title).is_empty() {
+        if index_terms(&doc.title, stopwords).is_empty() {
             continue;
         }
         seen += 1;
@@ -812,16 +843,19 @@ fn trie_order(a: &&str, b: &&str) -> std::cmp::Ordering {
 fn oracle(args: OracleArgs) -> AnyResult {
     let started = Instant::now();
     let mut rng = Rng(args.seed);
+    // Aberto antes: o oráculo descarta as mesmas stopwords que estão gravadas no banco.
+    let engine = Engine::open(&args.db, Config::default())?;
+    let stopwords = engine.stopwords().clone();
 
     // 1. Índice ingênuo em memória.
-    let mut index: HashMap<String, Vec<DocId>> = HashMap::new();
+    let mut index: HashMap<String, Vec<DocId>> = HashMap::default();
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
     let mut titles: Vec<(DocId, String)> = Vec::new();
     let mut docs = 0usize;
     for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
         let doc = doc?;
         docs += 1;
-        let terms = unique_terms(&doc.body);
+        let terms = unique_terms(&doc.body, &stopwords);
         // Reservatórios: documentos para consultas AND e títulos para revocação.
         if sampled_docs.len() < 2000 {
             sampled_docs.push(terms.clone());
@@ -829,7 +863,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
             let j = rng.below(2000);
             sampled_docs[j] = terms.clone();
         }
-        if !index_terms(&doc.title).is_empty() {
+        if !index_terms(&doc.title, &stopwords).is_empty() {
             if titles.len() < args.titles {
                 titles.push((doc.id, doc.title.clone()));
             } else if rng.below(docs) < args.titles {
@@ -852,7 +886,6 @@ fn oracle(args: OracleArgs) -> AnyResult {
     vocab.sort_unstable();
     eprintln!("oráculo pronto: {docs} docs, {} termos ({:.0}s)", vocab.len(), started.elapsed().as_secs_f64());
 
-    let engine = Engine::open(&args.db, Config::default())?;
     let max_prefix = engine.config().max_prefix_terms;
     let mut checks = Vec::new();
 
@@ -1195,7 +1228,7 @@ fn sizes(db: &Path) -> AnyResult {
     }
     let mut spaces: BTreeMap<String, Space> = BTreeMap::new();
     let mut largest: Vec<(usize, String)> = Vec::new();
-    let mut watched_sizes: HashMap<String, usize> = HashMap::new();
+    let mut watched_sizes: HashMap<String, usize> = HashMap::default();
     let mut root_size = 0;
     engine.for_each_raw(|k, v| {
         let key = String::from_utf8_lossy(k);
@@ -1223,7 +1256,7 @@ fn sizes(db: &Path) -> AnyResult {
 
     // Termos dos maiores valores (só nós terminais têm termo).
     let wanted: HashSet<u64> = largest.iter().filter_map(|(_, k)| k.split_once(':').and_then(|(_, id)| id.parse().ok())).collect();
-    let mut names: HashMap<u64, String> = HashMap::new();
+    let mut names: HashMap<u64, String> = HashMap::default();
     engine.for_each_term(|term, node| {
         if wanted.contains(&node) {
             names.insert(node, term.to_string());

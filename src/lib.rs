@@ -22,9 +22,11 @@
 
 mod codec;
 mod engine;
+pub mod stopwords;
 pub mod text;
 
 pub use engine::{Config, Engine, IndexBatch};
+pub use stopwords::{Language, Stopwords};
 
 /// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).
 /// Não fazem parte da API estável.
@@ -42,6 +44,8 @@ pub enum Error {
     Db(rocksdb::Error),
     /// Um valor gravado não pôde ser decodificado, ou a Trie aponta para um nó inexistente.
     Corrupt(String),
+    /// A config não combina com o banco (ex.: idiomas das stopwords diferentes).
+    Config(String),
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +53,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Db(e) => write!(f, "erro do RocksDB: {e}"),
             Error::Corrupt(msg) => write!(f, "índice corrompido: {msg}"),
+            Error::Config(msg) => write!(f, "config incompatível: {msg}"),
         }
     }
 }
@@ -57,7 +62,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Db(e) => Some(e),
-            Error::Corrupt(_) => None,
+            Error::Corrupt(_) | Error::Config(_) => None,
         }
     }
 }

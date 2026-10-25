@@ -326,3 +326,35 @@ fn dropped_batch_after_cached_batches() {
     assert_eq!(engine.suggest("cas", 10).unwrap(), ["casa", "casulo"]);
     assert_eq!(engine.search("casulo").unwrap(), [3]);
 }
+
+#[test]
+fn languages_are_stored_on_creation_and_checked_on_open() {
+    use fire_flower::{Error, Language};
+    let dir = tempfile::tempdir().unwrap();
+    let english = Config { languages: Some(vec![Language::English]), ..Config::default() };
+    {
+        let engine = Engine::open(dir.path(), english.clone()).unwrap();
+        assert_eq!(engine.languages(), [Language::English]);
+        engine.index_document(1, "the house de papel").unwrap();
+    }
+    // Sem pedir nada, vale o que está gravado: "de" é termo, "the" não.
+    let engine = open(&dir);
+    assert_eq!(engine.languages(), [Language::English]);
+    assert_eq!(engine.search("de").unwrap(), [1]);
+    assert!(engine.postings("the").unwrap().is_empty());
+    assert_eq!(engine.search("the house").unwrap(), [1]);
+    drop(engine);
+    // Pedir o mesmo funciona; pedir outro idioma é erro, não uma busca errada.
+    drop(Engine::open(dir.path(), english).unwrap());
+    let pt = Config { languages: Some(vec![Language::Portuguese]), ..Config::default() };
+    assert!(matches!(Engine::open(dir.path(), pt), Err(Error::Config(_))));
+}
+
+#[test]
+fn database_without_stopwords() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), Config { languages: Some(vec![]), ..Config::default() }).unwrap();
+    assert!(engine.languages().is_empty());
+    engine.index_document(1, "o que é").unwrap();
+    assert_eq!(engine.search("o que").unwrap(), [1]);
+}

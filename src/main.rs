@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use fire_flower::{Config, Engine, text};
+use fire_flower::{Config, Engine, Language, stopwords, text};
 
 /// Motor de busca full-text embutido: Trie persistida no RocksDB.
 #[derive(Parser)]
@@ -32,6 +32,8 @@ enum Command {
         /// Arquivos ou pastas
         #[arg(required = true)]
         caminhos: Vec<PathBuf>,
+        #[command(flatten)]
+        idiomas: Idiomas,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
     IndexJsonl {
@@ -48,6 +50,8 @@ enum Command {
         /// Emite o progresso como JSON na saída padrão
         #[arg(long)]
         progresso_json: bool,
+        #[command(flatten)]
+        idiomas: Idiomas,
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos
     Compact {
@@ -71,6 +75,30 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct Idiomas {
+    /// Idiomas das stopwords de um banco novo: códigos separados por vírgula
+    /// (pt, en) ou "nenhum". Padrão: pt,en. Num banco existente, precisa
+    /// combinar com o que foi gravado na criação.
+    #[arg(long, value_parser = parse_idiomas)]
+    idiomas: Option<ListaIdiomas>,
+}
+
+/// Lista de idiomas já validada (o clap precisa de um tipo só para o valor).
+#[derive(Clone)]
+struct ListaIdiomas(Vec<Language>);
+
+fn parse_idiomas(s: &str) -> Result<ListaIdiomas, String> {
+    if s.trim().eq_ignore_ascii_case("nenhum") {
+        return Ok(ListaIdiomas(Vec::new()));
+    }
+    let valid = || Language::ALL.iter().map(|l| l.code()).collect::<Vec<_>>().join(", ");
+    s.split(',')
+        .map(|c| Language::from_code(c).ok_or_else(|| format!("idioma desconhecido {c:?}; use {} ou \"nenhum\"", valid())))
+        .collect::<Result<_, _>>()
+        .map(ListaIdiomas)
+}
+
 /// Documentos por commit. Limita a memória usada pelo lote.
 const DOCS_PER_COMMIT: usize = 1000;
 
@@ -78,15 +106,20 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { banco } => open(&banco).and_then(|engine| {
+        Command::Tui { banco } => open(&banco, None).and_then(|engine| {
             tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
         }),
-        Command::Index { banco, caminhos } => index(&banco, &caminhos),
-        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json } => {
+        Command::Index { banco, caminhos, idiomas } => index(&banco, &caminhos, idiomas.idiomas),
+        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas } => {
             let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
-            open(&banco).and_then(|engine| jsonl::index(&engine, &arquivo, &opts))
+            open(&banco, idiomas.idiomas).and_then(|engine| {
+                if !progresso_json {
+                    eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
+                }
+                jsonl::index(&engine, &arquivo, &opts)
+            })
         }
-        Command::Compact { banco } => open(&banco).map(|engine| {
+        Command::Compact { banco } => open(&banco, None).map(|engine| {
             let started = Instant::now();
             engine.compact();
             println!("compactado em {:.2?}", started.elapsed());
@@ -103,12 +136,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn open(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
-    Ok(Engine::open(db, Config::default())?)
+/// Abre o banco. `idiomas` só importa na criação; `None` usa o que está gravado.
+fn open(db: &Path, idiomas: Option<ListaIdiomas>) -> Result<Engine, Box<dyn std::error::Error>> {
+    let config = Config { languages: idiomas.map(|i| i.0), ..Config::default() };
+    Ok(Engine::open(db, config)?)
 }
 
-fn index(db: &Path, paths: &[PathBuf]) -> AnyResult {
-    let engine = open(db)?;
+fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>) -> AnyResult {
+    let engine = open(db, idiomas)?;
+    eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     let started = Instant::now();
     let mut files = Vec::new();
     for p in paths {
@@ -156,7 +192,7 @@ fn index(db: &Path, paths: &[PathBuf]) -> AnyResult {
 }
 
 fn search(db: &Path, query: &str, limit: usize) -> AnyResult {
-    let engine = open(db)?;
+    let engine = open(db, None)?;
     let started = Instant::now();
     let docs = engine.search(query)?;
     let elapsed = started.elapsed();
@@ -175,7 +211,7 @@ fn search(db: &Path, query: &str, limit: usize) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db)?;
+    let engine = open(db, None)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

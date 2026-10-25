@@ -17,12 +17,36 @@ Suporta:
 ### Linha de comando
 
 ```bash
-cargo build --release
+cargo build --release -j 4
 ```
+
+Indexar arquivos e pastas (recursivo; ignora arquivos ocultos e binários;
+`.html`/`.htm` têm as tags removidas):
 
 ```bash
 ./target/release/fire-flower index /tmp/indice ~/documentos
 ```
+
+Busca interativa, com resultados enquanto você digita:
+
+```bash
+./target/release/fire-flower tui /tmp/indice
+```
+
+| Tecla | Ação |
+|---|---|
+| digitar | busca na hora; a última palavra vale como prefixo até você dar espaço |
+| `Tab` ou `→` | completa a palavra com a sugestão (em cinza depois do cursor) |
+| `Ctrl+N` / `Ctrl+P` | troca a sugestão |
+| `↑` `↓` `PgUp` `PgDn` | escolhe o resultado |
+| `Enter` | abre o documento inteiro (`n`/`N` pulam entre ocorrências) |
+| `Ctrl+W` / `Ctrl+U` | apaga a última palavra / a consulta toda |
+| `Esc` | volta / sai |
+
+A prévia lê o arquivo apontado pelo rótulo do documento. Documentos cujo
+rótulo não é um arquivo (ex.: título de artigo) aparecem sem prévia.
+
+Busca e autocompletar sem interface, para scripts:
 
 ```bash
 ./target/release/fire-flower search /tmp/indice "coração bras*"
@@ -31,9 +55,6 @@ cargo build --release
 ```bash
 ./target/release/fire-flower suggest /tmp/indice prog 10
 ```
-
-`index` aceita arquivos e pastas (recursivo, ignora arquivos ocultos e
-binários). Arquivos `.html`/`.htm` têm as tags removidas antes da indexação.
 
 ### Biblioteca
 
@@ -60,6 +81,7 @@ pela metade.
 
 | Camada | Arquivo | Responsabilidade |
 |---|---|---|
+| Interface | `src/main.rs` + `src/tui.rs` | subcomandos (clap) e busca interativa (ratatui) |
 | Texto | `src/text.rs` | remove HTML, acentos (NFKD), pontuação; minúsculas; tokens > 64 caracteres são descartados |
 | Índice (Trie) | `src/engine.rs` | travessia e criação de nós, busca, prefixo, autocompletar |
 | Armazenamento | `src/engine.rs` + `src/codec.rs` | chaves no RocksDB e serialização binária |

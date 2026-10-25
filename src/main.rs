@@ -1,30 +1,68 @@
+mod tui;
+
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use clap::{Parser, Subcommand};
 use fire_flower::{Config, Engine, text};
 
-const USAGE: &str = "\
-uso:
-  fire-flower index   <banco> <arquivo|pasta>...   indexa arquivos de texto/HTML (pastas recursivamente)
-  fire-flower search  <banco> <consulta>           busca (termos com E; termo* = prefixo)
-  fire-flower suggest <banco> <prefixo> [limite]   autocompletar";
+/// Motor de busca full-text embutido: Trie persistida no RocksDB.
+#[derive(Parser)]
+#[command(name = "fire-flower", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Busca interativa com autocompletar
+    #[command(visible_alias = "ui")]
+    Tui {
+        /// Pasta do banco
+        banco: PathBuf,
+    },
+    /// Indexa arquivos de texto/HTML (pastas recursivamente)
+    Index {
+        /// Pasta do banco (criada se não existir)
+        banco: PathBuf,
+        /// Arquivos ou pastas
+        #[arg(required = true)]
+        caminhos: Vec<PathBuf>,
+    },
+    /// Busca: termos combinados com E; termo* casa por prefixo
+    Search {
+        banco: PathBuf,
+        #[arg(required = true)]
+        consulta: Vec<String>,
+        /// Quantos resultados imprimir
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limite: usize,
+    },
+    /// Autocompletar: palavras indexadas que começam com o prefixo
+    Suggest {
+        banco: PathBuf,
+        prefixo: String,
+        #[arg(default_value_t = 10)]
+        limite: usize,
+    },
+}
 
 /// Documentos por commit. Limita a memória usada pelo lote.
 const DOCS_PER_COMMIT: usize = 1000;
-const MAX_PRINTED_RESULTS: usize = 50;
+
+type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["index", db, paths @ ..] if !paths.is_empty() => index(db, paths),
-        ["search", db, query @ ..] if !query.is_empty() => search(db, &query.join(" ")),
-        ["suggest", db, prefix] => suggest(db, prefix, "10"),
-        ["suggest", db, prefix, limit] => suggest(db, prefix, limit),
-        _ => {
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
+    let result = match Cli::parse().command {
+        Command::Tui { banco } => open(&banco).and_then(|engine| {
+            tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
+        }),
+        Command::Index { banco, caminhos } => index(&banco, &caminhos),
+        Command::Search { banco, consulta, limite } => search(&banco, &consulta.join(" "), limite),
+        Command::Suggest { banco, prefixo, limite } => suggest(&banco, &prefixo, limite),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -35,23 +73,30 @@ fn main() -> ExitCode {
     }
 }
 
-type AnyResult = Result<(), Box<dyn std::error::Error>>;
+fn open(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open(db, Config::default())?)
+}
 
-fn index(db: &str, paths: &[&str]) -> AnyResult {
-    let engine = Engine::open(db, Config::default())?;
+fn index(db: &Path, paths: &[PathBuf]) -> AnyResult {
+    let engine = open(db)?;
     let started = Instant::now();
     let mut files = Vec::new();
     for p in paths {
-        collect_files(Path::new(p), &mut files)?;
+        collect_files(p, &mut files)?;
     }
 
+    let progress = std::io::stderr().is_terminal();
     let (mut indexed, mut skipped) = (0usize, 0usize);
     let mut batch = engine.batch();
-    for path in &files {
+    for (i, path) in files.iter().enumerate() {
+        if progress && (i % 64 == 0 || i + 1 == files.len()) {
+            eprint!("\r\x1b[2Kindexando {}/{} ({}%)", i + 1, files.len(), (i + 1) * 100 / files.len());
+            let _ = std::io::stderr().flush();
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("ignorado {}: {e}", path.display());
+                eprintln!("\r\x1b[2Kignorado {}: {e}", path.display());
                 skipped += 1;
                 continue;
             }
@@ -73,36 +118,34 @@ fn index(db: &str, paths: &[&str]) -> AnyResult {
         }
     }
     batch.commit()?;
-
-    println!(
-        "{indexed} documento(s) indexado(s), {skipped} ignorado(s), em {:.2?}",
-        started.elapsed()
-    );
+    if progress {
+        eprint!("\r\x1b[2K");
+    }
+    println!("{indexed} documento(s) indexado(s), {skipped} ignorado(s), em {:.2?}", started.elapsed());
     Ok(())
 }
 
-fn search(db: &str, query: &str) -> AnyResult {
-    let engine = Engine::open(db, Config::default())?;
+fn search(db: &Path, query: &str, limit: usize) -> AnyResult {
+    let engine = open(db)?;
     let started = Instant::now();
     let docs = engine.search(query)?;
     let elapsed = started.elapsed();
 
-    for &doc in docs.iter().take(MAX_PRINTED_RESULTS) {
+    for &doc in docs.iter().take(limit) {
         match engine.label(doc)? {
             Some(label) => println!("{doc}\t{label}"),
             None => println!("{doc}"),
         }
     }
-    if docs.len() > MAX_PRINTED_RESULTS {
-        println!("... e mais {}", docs.len() - MAX_PRINTED_RESULTS);
+    if docs.len() > limit {
+        println!("... e mais {}", docs.len() - limit);
     }
     println!("{} resultado(s) em {elapsed:.2?}", docs.len());
     Ok(())
 }
 
-fn suggest(db: &str, prefix: &str, limit: &str) -> AnyResult {
-    let limit: usize = limit.parse().map_err(|_| format!("limite inválido: {limit}"))?;
-    let engine = Engine::open(db, Config::default())?;
+fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
+    let engine = open(db)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

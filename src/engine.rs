@@ -7,7 +7,7 @@
 //! - `meta:*`     -> contadores de ID
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -277,7 +277,11 @@ struct CachedNode {
 impl IndexBatch<'_> {
     /// Indexa `text` sob um ID escolhido por você.
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
-        let terms: HashSet<String> = tokenize(text).into_iter().collect();
+        // Ordenar deixa a criação de nós determinística: o mesmo texto gera
+        // sempre os mesmos IDs, o que torna bancos comparáveis entre execuções.
+        let mut terms = tokenize(text);
+        terms.sort_unstable();
+        terms.dedup();
         for term in &terms {
             let node_id = self.insert_term(term)?;
             self.new_postings.entry(node_id).or_default().push(doc_id);

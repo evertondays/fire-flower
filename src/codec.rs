@@ -353,22 +353,30 @@ fn merge_positions_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
 // ------------------------------------------------------------------ norm:
 
 /// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`).
-/// Guarda o deslocamento do ID dentro do bloco, em ordem crescente.
+///
+/// No disco, só os documentos que existem: (deslocamento, tamanho) em ordem.
+/// Em memória o bloco é denso (um `u32` por deslocamento, até o maior), para
+/// o ranking ler o tamanho de um documento com um acesso direto: ele faz isso
+/// milhares de vezes por busca. Ocupa no máximo 4 KB por bloco.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NormBlock {
-    offsets: Vec<u16>,
+    /// Tamanho por deslocamento; [`ABSENT`] onde não há documento.
     lens: Vec<u32>,
+    count: usize,
 }
 
 /// Documentos por bloco de `norm:`.
 pub const NORM_BLOCK_DOCS: u64 = 1024;
 
+/// Marca de "sem documento" no bloco denso. Nenhum documento tem 4 bilhões de tokens.
+const ABSENT: u32 = u32::MAX;
+
 impl NormBlock {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + self.offsets.len() * 3);
-        put_varint(&mut buf, self.offsets.len() as u64);
+        let mut buf = Vec::with_capacity(2 + self.count * 3);
+        put_varint(&mut buf, self.count as u64);
         let mut prev = 0;
-        for (&off, &len) in self.offsets.iter().zip(&self.lens) {
+        for (off, len) in self.iter() {
             put_varint(&mut buf, u64::from(off - prev));
             put_varint(&mut buf, u64::from(len));
             prev = off;
@@ -382,7 +390,7 @@ impl NormBlock {
         if n > NORM_BLOCK_DOCS {
             return Err(corrupt("bloco de tamanhos grande demais"));
         }
-        let mut block = Self { offsets: Vec::with_capacity(n as usize), lens: Vec::with_capacity(n as usize) };
+        let mut block = Self::default();
         let mut off = 0u64;
         for i in 0..n {
             let delta = r.varint()?;
@@ -393,65 +401,52 @@ impl NormBlock {
             if off >= NORM_BLOCK_DOCS {
                 return Err(corrupt("documento fora do bloco de tamanhos"));
             }
-            block.offsets.push(off as u16);
-            block.lens.push(r.u32()?);
+            let len = r.u32()?;
+            if len == ABSENT {
+                return Err(corrupt("tamanho de documento inválido"));
+            }
+            block.set(off as u16, len);
         }
         r.finish()?;
         Ok(block)
     }
 
-    pub fn get(&self, offset: u16) -> Option<u32> {
-        self.offsets.binary_search(&offset).ok().map(|i| self.lens[i])
-    }
-
-    /// Como [`NormBlock::get`], mas começando de `hint` (o índice da última
-    /// consulta): consultas em ordem crescente andam poucos passos, então
-    /// tenta alguns lineares antes da busca binária.
     #[inline]
-    pub fn get_from(&self, offset: u16, hint: &mut usize) -> Option<u32> {
-        let offs = &self.offsets;
-        let mut i = if offs.get(*hint).is_some_and(|&o| o <= offset) { *hint } else { 0 };
-        let linear_end = (i + 8).min(offs.len());
-        while i < linear_end && offs[i] < offset {
-            i += 1;
+    pub fn get(&self, offset: u16) -> Option<u32> {
+        match self.lens.get(usize::from(offset)) {
+            Some(&len) if len != ABSENT => Some(len),
+            _ => None,
         }
-        if i == linear_end && i < offs.len() && offs[i] < offset {
-            i += offs[i..].partition_point(|&o| o < offset);
-        }
-        *hint = i;
-        (offs.get(i) == Some(&offset)).then(|| self.lens[i])
     }
 
     /// Grava o tamanho e devolve o anterior, se o documento já estava no bloco.
     pub fn set(&mut self, offset: u16, len: u32) -> Option<u32> {
         debug_assert!(u64::from(offset) < NORM_BLOCK_DOCS);
-        // Carga com IDs crescentes: quase sempre entra no fim.
-        if self.offsets.last().is_none_or(|&last| last < offset) {
-            self.offsets.push(offset);
-            self.lens.push(len);
-            return None;
+        debug_assert!(len != ABSENT);
+        let i = usize::from(offset);
+        if i >= self.lens.len() {
+            self.lens.resize(i + 1, ABSENT);
         }
-        match self.offsets.binary_search(&offset) {
-            Ok(i) => Some(std::mem::replace(&mut self.lens[i], len)),
-            Err(i) => {
-                self.offsets.insert(i, offset);
-                self.lens.insert(i, len);
-                None
-            }
+        let old = std::mem::replace(&mut self.lens[i], len);
+        if old == ABSENT {
+            self.count += 1;
+            None
+        } else {
+            Some(old)
         }
     }
 
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.count == 0
     }
 
     /// (deslocamento, tamanho) em ordem crescente.
     pub fn iter(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
-        self.offsets.iter().copied().zip(self.lens.iter().copied())
+        self.lens.iter().enumerate().filter(|&(_, &len)| len != ABSENT).map(|(off, &len)| (off as u16, len))
     }
 }
 
@@ -713,13 +708,11 @@ mod tests {
         assert_eq!(decoded, block);
         assert_eq!(decoded.get(5), Some(40));
         assert_eq!(decoded.get(6), None);
-        let mut hint = 0;
-        assert_eq!(decoded.get_from(2, &mut hint), Some(0));
-        assert_eq!(decoded.get_from(5, &mut hint), Some(40));
-        assert_eq!(decoded.get_from(800, &mut hint), None);
-        assert_eq!(decoded.get_from(900, &mut hint), Some(7));
-        assert_eq!(decoded.get_from(2, &mut hint), Some(0), "voltar atrás também funciona");
-        assert_eq!(decoded.get_from(1023, &mut hint), None);
+        assert_eq!(decoded.get(2), Some(0), "tamanho 0 existe");
+        assert_eq!(decoded.get(800), None);
+        assert_eq!(decoded.get(900), Some(7));
+        assert_eq!(decoded.get(1023), None, "depois do último deslocamento");
+        assert_eq!(decoded.len(), 3);
         assert!(NormBlock::decode(&NormBlock::default().encode()).unwrap().is_empty());
     }
 }

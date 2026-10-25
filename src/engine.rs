@@ -858,57 +858,78 @@ impl View<'_> {
     }
 
     /// Um termo só: a nota depende só do tf e do tamanho, e o limite só do tf.
-    /// Visita os documentos por nível de tf, do maior para o menor (ordenação
-    /// por contagem, em ordem de ID dentro do nível). Quando nem o limite do
-    /// nível alcança o pior guardado, os níveis abaixo também não alcançam e a
-    /// busca para. Num termo frequente, a maior parte da lista (tf baixo) não
-    /// passa pela leitura do tamanho nem pela nota exata.
+    ///
+    /// Os documentos são agrupados em níveis de tf (nível 0 = tf ≥ `CAP`,
+    /// nível `CAP − tf` para o resto), e o limite de um nível vale para todos
+    /// os níveis abaixo dele. A lista não é reordenada: cada faixa de níveis é
+    /// uma passada sequencial em ordem de ID, o que mantém a leitura dos
+    /// tamanhos em ordem de bloco.
+    ///
+    /// 1. Uma passada conta os documentos de cada nível.
+    /// 2. A primeira faixa vai do maior tf até juntar `k` documentos, que
+    ///    enchem o top-k e dão um pior resultado de referência.
+    /// 3. A faixa seguinte vai até o primeiro nível cujo limite não alcança
+    ///    esse pior; ali a busca para, porque os níveis abaixo também não
+    ///    alcançam. Dentro da faixa, quem nem pelo limite passa do pior atual
+    ///    não lê o tamanho.
+    ///
+    /// Num termo frequente, a maior parte da lista (tf baixo) fica de fora sem
+    /// leitura de tamanho nem nota exata.
     fn top_single_term(&self, list: &[Posting], weight: f64, bound: &Bound, bm25: &Bm25, k: usize) -> Result<Vec<Hit>> {
         if k == 0 || list.is_empty() {
             return Ok(Vec::new());
         }
-        // Nível 0 = tf ≥ CAP (juntos), nível CAP − tf para o resto.
         const CAP: usize = 64;
         let level = |tf: u32| CAP - (tf as usize).min(CAP);
-        let mut starts = [0usize; CAP + 1];
+        // Menor tf de um nível: o limite do nível inteiro.
+        let level_tf = |l: usize| (CAP - l) as u32;
+        let mut count = [0usize; CAP + 1];
         for p in list {
-            starts[level(p.tf)] += 1;
-        }
-        let mut acc = 0;
-        for s in starts.iter_mut() {
-            let n = *s;
-            *s = acc;
-            acc += n;
-        }
-        let mut next = starts;
-        let mut order = vec![0u32; list.len()];
-        for (i, p) in list.iter().enumerate() {
-            let l = level(p.tf);
-            order[next[l]] = i as u32;
-            next[l] += 1;
+            count[level(p.tf)] += 1;
         }
 
         let mut top = TopK::new(k);
         let mut norms = NormCursor::new(self);
-        // Fora de ordem de ID: no empate, o ID menor ainda entra.
+        // Fora de ordem de nota: no empate, o ID menor ainda entra.
         let loses = |top: &TopK, b: f64, doc: DocId| top.worst().is_some_and(|w| b < w.score || (b == w.score && doc > w.doc));
-        for l in 0..=CAP {
-            let bucket = &order[starts[l]..next[l]];
-            if bucket.is_empty() {
-                continue;
+        let mut lo = 0;
+        loop {
+            // Níveis vazios no começo da faixa renderiam uma passada à toa.
+            while lo <= CAP && count[lo] == 0 {
+                lo += 1;
             }
-            if l > 0 && loses(&top, bound.get((CAP - l) as u32), 0) {
+            if lo > CAP {
                 break;
             }
-            norms.block_id = u64::MAX; // o nível recomeça do menor ID
-            for &i in bucket {
-                let p = list[i as usize];
-                if loses(&top, bound.get(p.tf), p.doc) {
+            // Fim da faixa: até juntar k documentos (top-k ainda não cheio) ou
+            // até o primeiro nível que não alcança o pior guardado.
+            let mut hi = lo;
+            let mut gathered = 0;
+            while hi <= CAP {
+                if count[hi] > 0 {
+                    if top.worst().is_some() {
+                        if hi > 0 && loses(&top, bound.get(level_tf(hi)), 0) {
+                            break;
+                        }
+                    } else if gathered >= k {
+                        break;
+                    }
+                    gathered += count[hi];
+                }
+                hi += 1;
+            }
+            if hi == lo {
+                break; // o nível `lo` já não alcança o pior
+            }
+            for p in list {
+                let l = level(p.tf);
+                if l < lo || l >= hi || loses(&top, bound.get(p.tf), p.doc) {
                     continue;
                 }
                 let factor = bm25.doc_factor(norms.len(p.doc)?);
                 top.push(Hit { doc: p.doc, score: Bm25::score(weight, p.tf, factor) });
             }
+            lo = hi;
         }
         Ok(top.into_sorted())
     }
@@ -1132,15 +1153,15 @@ struct NormCursor<'v, 'a> {
     view: &'v View<'a>,
     block_id: u64,
     block: Option<Arc<NormBlock>>,
-    hint: usize,
     seen: FxHashMap<u64, Option<Arc<NormBlock>>>,
 }
 
 impl<'v, 'a> NormCursor<'v, 'a> {
     fn new(view: &'v View<'a>) -> Self {
-        Self { view, block_id: u64::MAX, block: None, hint: 0, seen: FxHashMap::default() }
+        Self { view, block_id: u64::MAX, block: None, seen: FxHashMap::default() }
     }
 
+    #[inline]
     fn len(&mut self, doc: DocId) -> Result<u32> {
         let block_id = doc / NORM_BLOCK_DOCS;
         if block_id != self.block_id {
@@ -1153,12 +1174,11 @@ impl<'v, 'a> NormCursor<'v, 'a> {
                 }
             };
             self.block_id = block_id;
-            self.hint = 0;
         }
         let offset = (doc % NORM_BLOCK_DOCS) as u16;
         self.block
             .as_ref()
-            .and_then(|b| b.get_from(offset, &mut self.hint))
+            .and_then(|b| b.get(offset))
             .ok_or_else(|| Error::Corrupt(format!("documento {doc} sem tamanho em norm:")))
     }
 }

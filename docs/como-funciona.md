@@ -568,7 +568,15 @@ sequenceDiagram
     DB-->>V: [1, 2] (pulando os tf)
 ```
 
-Custo: **1 `get` por caractere + 2** (raiz e lista). Se algum caractere não
+Custo: **1 `get` por caractere + 2** (raiz e lista), menos os níveis que já
+estão no **cache de nós das buscas**: a raiz e os nós até a profundidade 2
+(`Config::reader_cache_depth`) ficam decodificados em memória, compartilhados
+por todas as buscas (seção 7). A raiz tem um filho por caractere inicial e
+cresce com o índice: 13 KB com 100 mil artigos da Wikipédia. Sem o cache, toda
+busca a decodificava inteira, e isso era quase todo o tempo de uma busca
+simples (116 µs de 120 µs num termo inexistente; com o cache, 5 µs).
+
+Se algum caractere não
 existir nos filhos, a busca termina ali com zero resultados. Se o caminho
 existir mas o nó final não for fim de palavra (`cas`), também dá zero:
 prefixo de palavra não é palavra.
@@ -671,15 +679,22 @@ Para não pagar a nota de todo documento:
   sem ler o tamanho. O corte é exato: ponto flutuante arredonda de forma
   monótona, então o limite nunca fica abaixo da nota de verdade.
 - **Termo único** (o caso mais comum): a nota só depende do tf e do tamanho.
-  Os documentos são visitados por nível de tf, do maior para o menor, e a
-  busca para no primeiro nível cujo limite não alcança o pior guardado. Num
-  termo frequente, a maior parte da lista (tf = 1) nem é olhada.
+  Os documentos são agrupados em níveis de tf, e o limite de um nível vale
+  para todos os abaixo dele. Uma passada conta os documentos de cada nível;
+  a primeira faixa (do maior tf até juntar *k* documentos) enche o top; a
+  segunda vai até o primeiro nível cujo limite não alcança o pior guardado, e
+  ali a busca para. Cada faixa é uma passada sequencial em ordem de ID, sem
+  reordenar a lista. Num termo frequente da Wikipédia de 100k (~25 mil
+  documentos), só ~11% recebem nota; o resto (tf baixo) nem lê o tamanho.
 - **Tamanhos em cache.** Os blocos de `norm:` decodificados ficam num cache do
-  `Engine`, compartilhado pelas buscas (seção 7). Sem ele, ranquear uma lista
-  grande faria um `Get` e uma decodificação por bloco.
+  `Engine`, compartilhado pelas buscas (seção 7). Em memória o bloco é denso
+  (um número por ID, até 4 KB), então ler o tamanho de um documento é um
+  acesso direto.
 
-Na Wikipédia de 10k, o top 10 de um termo frequente custa cerca de 1,8× a
-busca que devolve todos os IDs; um E de dois termos, ~1,3×.
+Na Wikipédia de 100k (cache quente, 1 thread), o top 10 de um termo frequente
+leva ~200 µs, e devolver todos os IDs do mesmo termo, ~45 µs. A maior parte
+da diferença é decodificar a lista com tf e passar por ela de novo: para ir
+além, é preciso não decodificar a lista inteira (ver "Possíveis evoluções").
 
 ---
 
@@ -711,10 +726,11 @@ flowchart LR
 - **Por que um nó nunca aponta para o vazio:** nós só ganham filhos, nunca os
   perdem, e um nó novo é gravado no mesmo `WriteBatch` que o pai que aponta
   para ele.
-- **O cache de tamanhos respeita o snapshot.** O cache de blocos `norm:` é
-  compartilhado, mas uma busca não pode usar um tamanho gravado depois do
-  snapshot dela. Cada commit tem um número (*epoch*). Antes de gravar, o
-  escritor marca os blocos que vai mudar com o número do próximo commit;
+- **Os caches das buscas respeitam o snapshot.** Os blocos `norm:` e os nós
+  rasos da Trie ficam num cache compartilhado (`EpochCache`), mas uma busca
+  não pode usar um valor gravado depois do snapshot dela. Cada commit tem um número (*epoch*). Antes de gravar, o
+  escritor marca os blocos e os nós rasos que vai mudar com o número do
+  próximo commit;
   depois de gravar, publica o número. A busca lê o número **antes** de criar o
   snapshot e só usa um bloco do cache se ele não for mais novo que ela; senão
   lê do próprio snapshot e não guarda nada. Um teste roda buscas ranqueadas
@@ -822,8 +838,8 @@ engine.suggest("cor", 10)?;        // Vec<String>
 
 | Operação | Custo | Observação |
 |---|---|---|
-| Buscar termo de *L* letras | *L* + 2 `get`s | com o cache quente, microssegundos |
-| Termo inexistente | até *L* + 1 `get`s | para no primeiro caractere que falta |
+| Buscar termo de *L* letras | *L* − 2 `get`s (*L* ≥ 3) + 1 da lista | os 3 primeiros níveis da Trie vêm do cache de nós |
+| Termo inexistente | até *L* − 2 `get`s | para no primeiro caractere que falta |
 | AND de *n* termos | *n* buscas + interseções | retorna cedo se algum termo não existe |
 | Prefixo | 1 `get` por nó visitado + 1 por lista | limitado a 256 termos |
 | Frase de *n* termos | as *n* listas `post:` + *n* listas `pos:` | posições só conferidas nos documentos que passaram no E |
@@ -851,7 +867,6 @@ formato v1, sem tf nem tamanhos, tinha ~17 MB).
 
 - um índice ordenado `term:<palavra>` com o iterador do RocksDB faria a busca
   exata em 1 `get` e o prefixo num único scan;
-- manter a raiz decodificada em memória, já que toda busca passa por ela;
 - blocos com índice de saltos nas listas grandes e *block-max WAND* no top-k,
   para não decodificar a lista inteira de um termo frequente;
 - tamanhos em 1 byte (como o Lucene), se `norm:` pesar.

@@ -1,0 +1,15 @@
+[package]
+name = "fire-flower"
+version = "0.1.0"
+edition = "2024"
+description = "Motor de busca full-text embutido: Trie persistida no RocksDB"
+
+[dependencies]
+rocksdb = { version = "0.23", default-features = false, features = ["lz4", "bindgen-runtime"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = false

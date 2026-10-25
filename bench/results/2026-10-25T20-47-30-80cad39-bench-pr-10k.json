@@ -1,0 +1,83 @@
+{
+  "commit": "80cad39",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": false
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 6.277,
+      "cache_hits_por_consulta": 10.492,
+      "conjunto": "t-medio",
+      "consultas": 1000,
+      "gets_por_consulta": 9.367,
+      "max_us": 165.418,
+      "media_us": 63.516733,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 1.999,
+      "modo": "search",
+      "p50_us": 57.939,
+      "p95_us": 91.119,
+      "p99_us": 103.999,
+      "qps": 15153.302552429857,
+      "resultados_media": 415.519,
+      "threads": 1
+    },
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 2.933,
+      "cache_hits_por_consulta": 7.906,
+      "conjunto": "t-freq",
+      "consultas": 1000,
+      "gets_por_consulta": 5.664,
+      "max_us": 169.024,
+      "media_us": 86.883019,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 2.0,
+      "modo": "search",
+      "p50_us": 84.329,
+      "p95_us": 111.029,
+      "p99_us": 132.048,
+      "qps": 11189.66717487524,
+      "resultados_media": 6344.298,
+      "threads": 1
+    },
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 722.143,
+      "cache_hits_por_consulta": 915.304,
+      "conjunto": "p-2",
+      "consultas": 1000,
+      "gets_por_consulta": 844.317,
+      "max_us": 4813.508,
+      "media_us": 1674.5668859999998,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 72.29,
+      "modo": "search",
+      "p50_us": 1870.53,
+      "p95_us": 2485.242,
+      "p99_us": 2849.42,
+      "qps": 595.651054086472,
+      "resultados_media": 4169.093,
+      "threads": 1
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf/tmp-pr-carga",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 4038381568,
+    "ram_total": 8266137600,
+    "swap_usado": 909479936
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-25T20-47-30",
+  "rotulo": "pr-10k",
+  "threads": 1,
+  "tipo": "bench"
+}

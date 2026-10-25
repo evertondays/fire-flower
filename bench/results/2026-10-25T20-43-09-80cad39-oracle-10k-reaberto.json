@@ -1,0 +1,68 @@
+{
+  "commit": "80cad39",
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki.jsonl",
+  "db": "/home/evertondays/bench-db/perf/tmp-corretude",
+  "divergencias": 0,
+  "docs": 10100,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3898916864,
+    "ram_total": 8266137600,
+    "swap_usado": 907120640
+  },
+  "quando": "2026-10-25T20-43-09",
+  "remap_ids": false,
+  "rotulo": "10k-reaberto",
+  "take": 10100,
+  "termos_oraculo": 290087,
+  "tipo": "oracle",
+  "verificacoes": [
+    {
+      "casos": 14689,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "amostra de 14689 termos em 14 faixas de df"
+      ],
+      "verificacao": "listas de postagem"
+    },
+    {
+      "casos": 5000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "AND"
+    },
+    {
+      "casos": 2000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "1005 de 2000 prefixos passaram de 256 termos; 6006168 termos ignorados no total (resultado incompleto por projeto)"
+      ],
+      "verificacao": "prefixo"
+    },
+    {
+      "casos": 2000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "autocompletar"
+    },
+    {
+      "casos": 1000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "título → artigo"
+    },
+    {
+      "casos": 8,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "normalização"
+    }
+  ]
+}

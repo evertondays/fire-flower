@@ -329,7 +329,7 @@ impl View<'_> {
     }
 
     fn load_postings(&self, node_id: u64) -> Result<Vec<DocId>> {
-        match self.snap.get_pinned(post_key(node_id))? {
+        match self.snap.get_bytes(&post_key(node_id))? {
             Some(v) => codec::decode_postings(&v),
             None => Ok(Vec::new()),
         }
@@ -468,6 +468,21 @@ impl IndexBatch<'_> {
     }
 }
 
+thread_local! {
+    /// Leituras (`get`) feitas pelo motor nesta thread. Usado pelo harness
+    /// para medir "Gets por consulta" sem depender do PerfContext do RocksDB.
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Total de `get`s que o motor fez na thread atual (só cresce).
+pub fn reads_on_this_thread() -> u64 {
+    READS.with(|r| r.get())
+}
+
+fn count_read() {
+    READS.with(|r| r.set(r.get() + 1));
+}
+
 /// O banco direto (usado pelo lote, único escritor) ou um snapshot (buscas).
 trait Source {
     fn get_bytes(&self, key: &str) -> Result<Option<rocksdb::DBPinnableSlice<'_>>>;
@@ -475,12 +490,14 @@ trait Source {
 
 impl Source for DB {
     fn get_bytes(&self, key: &str) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+        count_read();
         Ok(self.get_pinned(key)?)
     }
 }
 
 impl Source for Snapshot<'_> {
     fn get_bytes(&self, key: &str) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+        count_read();
         Ok(self.get_pinned(key)?)
     }
 }

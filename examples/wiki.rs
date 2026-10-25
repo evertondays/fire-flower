@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use fire_flower::text::tokenize;
 use fire_flower::{Config, DocId, Engine};
-use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1022,20 +1022,37 @@ struct Sample {
     merge_nanos: u64,
 }
 
+/// Contadores do PerfContext lidos pelo nome. O enum `PerfMetric` do crate
+/// rocksdb 0.23 está desalinhado com o RocksDB 10.4 embutido (lê o contador
+/// errado), então usamos o relatório em texto ("nome = valor, ...").
+fn perf_counters(ctx: &PerfContext) -> HashMap<String, u64> {
+    ctx.report(true)
+        .split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 fn run_query(engine: &Engine, set: &QuerySet, q: &str, ctx: &mut PerfContext) -> AnyResult<Sample> {
     ctx.reset();
+    let reads_before = fire_flower::internals::reads_on_this_thread();
     let t = Instant::now();
     let results = if set.suggest { engine.suggest(q, 10)?.len() } else { engine.search(q)?.len() };
     let nanos = t.elapsed().as_nanos() as u64;
+    let gets = fire_flower::internals::reads_on_this_thread() - reads_before;
+    let c = perf_counters(ctx);
+    let get = |k: &str| c.get(k).copied().unwrap_or(0);
     Ok(Sample {
         nanos,
         results,
-        gets: ctx.metric(PerfMetric::GetFromMemtableCount),
-        cache_hits: ctx.metric(PerfMetric::BlockCacheHitCount),
-        block_reads: ctx.metric(PerfMetric::BlockReadCount),
-        bloom_useful: ctx.metric(PerfMetric::BloomSstMissCount),
-        merges: ctx.metric(PerfMetric::InternalMergeCount),
-        merge_nanos: ctx.metric(PerfMetric::MergeOperatorTimeNanos),
+        gets,
+        cache_hits: get("block_cache_hit_count"),
+        block_reads: get("block_read_count"),
+        bloom_useful: get("bloom_sst_miss_count"),
+        merges: get("internal_merge_point_lookup_count"),
+        merge_nanos: get("merge_operator_time_nanos"),
     })
 }
 
@@ -1107,7 +1124,8 @@ fn drop_os_caches() -> AnyResult {
 fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, cache_mb: usize, label: Option<String>) -> AnyResult {
     let sets = read_query_sets(paths)?;
     let config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
-    let level = if perf_time { PerfStatsLevel::EnableTimeExceptForMutex } else { PerfStatsLevel::EnableCount };
+    // O enum do crate também está deslocado: `EnableTime` corresponde a medir tempos no RocksDB 10.
+    let level = if perf_time { PerfStatsLevel::EnableTime } else { PerfStatsLevel::EnableCount };
     let mut engine = if cold { None } else { Some(Engine::open(db, config.clone())?) };
     let mut results = Vec::new();
 

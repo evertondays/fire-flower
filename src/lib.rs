@@ -31,7 +31,7 @@ pub use engine::{Config, Engine, IndexBatch};
 #[doc(hidden)]
 pub mod internals {
     pub use crate::codec::{TrieNode, decode_postings, encode_postings};
-    pub use crate::engine::{intersect, union_encoded};
+    pub use crate::engine::{intersect, reads_on_this_thread, union_encoded};
 }
 
 pub type DocId = u64;

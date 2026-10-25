@@ -79,6 +79,9 @@ pela metade.
 
 ## Arquitetura
 
+Explicação completa, com o que é o RocksDB, um banco real byte a byte e os
+fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
+
 | Camada | Arquivo | Responsabilidade |
 |---|---|---|
 | Interface | `src/main.rs` + `src/tui.rs` | subcomandos (clap) e busca interativa (ratatui) |

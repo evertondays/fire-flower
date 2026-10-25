@@ -194,3 +194,71 @@ fn explicit_labels_and_compaction() {
     assert_eq!(engine.search("compartilhado").unwrap(), [100, 101, 102]);
     assert_eq!(engine.label(101).unwrap().as_deref(), Some("Artigo 1"));
 }
+
+/// Fase 5 do plano: uma busca nunca vê metade de um lote. Cada lote tem um
+/// marcador próprio; quem lê tem que ver o lote inteiro ou nada dele.
+#[test]
+fn search_never_sees_half_a_batch() {
+    const BATCHES: u64 = 60;
+    const PER_BATCH: u64 = 50;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir));
+
+    let writer = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            for b in 0..BATCHES {
+                let mut batch = engine.batch();
+                for i in 0..PER_BATCH {
+                    batch.add_document(b * PER_BATCH + i, &format!("comum lote{b}")).unwrap();
+                }
+                batch.commit().unwrap();
+            }
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let mut checks = 0;
+                loop {
+                    let done = engine.search("comum").unwrap().len() as u64 == BATCHES * PER_BATCH;
+                    for b in 0..BATCHES {
+                        let n = engine.search(&format!("lote{b} comum")).unwrap().len() as u64;
+                        assert!(n == 0 || n == PER_BATCH, "lote {b} visto pela metade: {n}");
+                        checks += 1;
+                    }
+                    if done {
+                        return checks;
+                    }
+                }
+            })
+        })
+        .collect();
+    writer.join().unwrap();
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+}
+
+#[test]
+fn diagnostics_walk_terms_and_raw_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), Config { statistics: true, ..Config::default() }).unwrap();
+    sample(&engine);
+    let mut terms = Vec::new();
+    engine.for_each_term(|t, node| terms.push((t.to_string(), node))).unwrap();
+    let words: Vec<&str> = terms.iter().map(|(t, _)| t.as_str()).collect();
+    assert!(words.windows(2).all(|w| w[0] < w[1]), "ordem alfabética");
+    assert!(words.contains(&"roupa") && words.contains(&"programacao"));
+    let (_, node) = terms.iter().find(|(t, _)| t == "roupa").unwrap();
+    assert_eq!(engine.postings_of_node(*node).unwrap(), [1, 2]);
+    assert_eq!(engine.term_node("Roupa").unwrap(), Some(*node));
+
+    let mut post_keys = 0;
+    engine.for_each_raw(|k, _| post_keys += k.starts_with(b"post:") as usize).unwrap();
+    assert_eq!(post_keys, terms.len());
+    assert!(engine.trie_node_count().unwrap() > terms.len() as u64);
+    assert!(engine.rocksdb_stats().unwrap().contains("rocksdb.block.cache"));
+    assert!(engine.property("rocksdb.estimate-num-keys").is_some());
+}

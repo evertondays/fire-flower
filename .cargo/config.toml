@@ -1,0 +1,3 @@
+# Compilar o RocksDB (C++) com 12 jobs chega perto de estourar a RAM desta máquina.
+[build]
+jobs = 4

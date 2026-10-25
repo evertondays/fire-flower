@@ -41,11 +41,14 @@ pub struct Config {
     /// Quantos termos uma busca por prefixo (`comp*`) expande no máximo.
     /// Termos além disso são ignorados; prefixos curtos podem casar milhares.
     pub max_prefix_terms: usize,
+    /// Liga as estatísticas internas do RocksDB ([`Engine::rocksdb_stats`]).
+    /// Custa um pouco de CPU; use em medições, não em produção.
+    pub statistics: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { block_cache_bytes: 256 << 20, bloom_bits_per_key: 10.0, max_prefix_terms: 256 }
+        Self { block_cache_bytes: 256 << 20, bloom_bits_per_key: 10.0, max_prefix_terms: 256, statistics: false }
     }
 }
 
@@ -55,6 +58,8 @@ pub struct Engine {
     db: DB,
     writer: Mutex<WriterState>,
     config: Config,
+    /// Guardadas para ler as estatísticas depois do `open`.
+    opts: Options,
 }
 
 struct WriterState {
@@ -77,11 +82,15 @@ impl Engine {
         opts.set_merge_operator_associative("fire_flower_postings_union", merge_postings);
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
+        if config.statistics {
+            opts.enable_statistics();
+            opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptTimers);
+        }
 
         let db = DB::open(&opts, path)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
-        Ok(Self { db, writer: Mutex::new(WriterState { next_node_id, next_doc_id }), config })
+        Ok(Self { db, writer: Mutex::new(WriterState { next_node_id, next_doc_id }), config, opts })
     }
 
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
@@ -149,6 +158,75 @@ impl Engine {
     /// um commit aconteça no meio.
     fn view(&self) -> View<'_> {
         View { snap: self.db.snapshot(), config: &self.config }
+    }
+}
+
+/// Diagnóstico e medição: usados pelo harness de performance (`examples/wiki.rs`).
+impl Engine {
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Estatísticas internas do RocksDB, se `Config::statistics` estiver ligado.
+    pub fn rocksdb_stats(&self) -> Option<String> {
+        self.opts.get_statistics()
+    }
+
+    /// Uma propriedade do RocksDB, como `rocksdb.stats`,
+    /// `rocksdb.estimate-num-keys` ou `rocksdb.total-sst-files-size`.
+    pub fn property(&self, name: &str) -> Option<String> {
+        self.db.property_value(name).ok().flatten()
+    }
+
+    /// Nós da Trie já criados (o próximo ID livre).
+    pub fn trie_node_count(&self) -> Result<u64> {
+        Ok(read_counter(&self.db, META_NEXT_NODE)?.unwrap_or(0))
+    }
+
+    /// ID do nó terminal de `term` (também é o ID da lista em `post:<id>`).
+    pub fn term_node(&self, term: &str) -> Result<Option<u64>> {
+        let Some(term) = normalize_term(term) else { return Ok(None) };
+        Ok(match self.view().find_node(&term)? {
+            Some((id, node)) if node.is_end_of_word => Some(id),
+            _ => None,
+        })
+    }
+
+    /// Lista de postagem pelo ID do nó terminal (ver [`Engine::for_each_term`]).
+    pub fn postings_of_node(&self, node_id: u64) -> Result<Vec<DocId>> {
+        self.view().load_postings(node_id)
+    }
+
+    /// Percorre todos os termos em ordem alfabética (busca em profundidade
+    /// sobre um snapshot). `f` recebe o termo e o ID do nó terminal.
+    pub fn for_each_term(&self, mut f: impl FnMut(&str, u64)) -> Result<()> {
+        let view = self.view();
+        let Some(root) = load_node(&view.snap, ROOT_ID)? else { return Ok(()) };
+        let mut stack: Vec<(String, TrieNode)> = vec![(String::new(), root)];
+        let mut ids = vec![ROOT_ID];
+        while let (Some((word, node)), Some(id)) = (stack.pop(), ids.pop()) {
+            if node.is_end_of_word {
+                f(&word, id);
+            }
+            // Empilha ao contrário para visitar os filhos em ordem alfabética.
+            for (&ch, &child) in node.children.iter().rev() {
+                let mut next = word.clone();
+                next.push(ch);
+                stack.push((next, view.require_node(child)?));
+                ids.push(child);
+            }
+        }
+        Ok(())
+    }
+
+    /// Percorre todas as chaves e valores do banco, em ordem de chave.
+    /// Valores de `post:` já vêm com os merges pendentes aplicados.
+    pub fn for_each_raw(&self, mut f: impl FnMut(&[u8], &[u8])) -> Result<()> {
+        for item in self.db.iterator(rocksdb::IteratorMode::Start) {
+            let (key, value) = item?;
+            f(&key, &value);
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +507,14 @@ fn varint(v: u64) -> Vec<u8> {
 /// É associativo, então o RocksDB pode combinar fragmentos em qualquer ordem.
 /// Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
 fn merge_postings(_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+    union_encoded(existing, operands.iter())
+}
+
+/// União de listas codificadas: o trabalho do merge operator.
+pub fn union_encoded<'a>(
+    existing: Option<&[u8]>,
+    operands: impl Iterator<Item = &'a [u8]>,
+) -> Option<Vec<u8>> {
     let mut all = match existing {
         Some(bytes) => codec::decode_postings(bytes).ok()?,
         None => Vec::new(),
@@ -442,7 +528,7 @@ fn merge_postings(_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands
 }
 
 /// Interseção de duas listas ordenadas.
-fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {

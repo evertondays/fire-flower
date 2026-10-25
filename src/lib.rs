@@ -26,6 +26,14 @@ pub mod text;
 
 pub use engine::{Config, Engine, IndexBatch};
 
+/// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).
+/// Não fazem parte da API estável.
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::codec::{TrieNode, decode_postings, encode_postings};
+    pub use crate::engine::{intersect, union_encoded};
+}
+
 pub type DocId = u64;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

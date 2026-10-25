@@ -1,3 +1,4 @@
+mod jsonl;
 mod tui;
 
 use std::io::{IsTerminal, Write};
@@ -32,6 +33,26 @@ enum Command {
         #[arg(required = true)]
         caminhos: Vec<PathBuf>,
     },
+    /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
+    IndexJsonl {
+        /// Pasta do banco (criada se não existir)
+        banco: PathBuf,
+        /// Arquivo .jsonl
+        arquivo: PathBuf,
+        /// Documentos por commit
+        #[arg(long, default_value_t = 2000)]
+        lote: usize,
+        /// Pula as N primeiras linhas (para retomar uma carga interrompida)
+        #[arg(long, default_value_t = 0)]
+        pular: u64,
+        /// Emite o progresso como JSON na saída padrão
+        #[arg(long)]
+        progresso_json: bool,
+    },
+    /// Compacta o banco: une os pedaços pendentes das listas de documentos
+    Compact {
+        banco: PathBuf,
+    },
     /// Busca: termos combinados com E; termo* casa por prefixo
     Search {
         banco: PathBuf,
@@ -61,6 +82,15 @@ fn main() -> ExitCode {
             tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
         }),
         Command::Index { banco, caminhos } => index(&banco, &caminhos),
+        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json } => {
+            let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
+            open(&banco).and_then(|engine| jsonl::index(&engine, &arquivo, &opts))
+        }
+        Command::Compact { banco } => open(&banco).map(|engine| {
+            let started = Instant::now();
+            engine.compact();
+            println!("compactado em {:.2?}", started.elapsed());
+        }),
         Command::Search { banco, consulta, limite } => search(&banco, &consulta.join(" "), limite),
         Command::Suggest { banco, prefixo, limite } => suggest(&banco, &prefixo, limite),
     };

@@ -46,6 +46,32 @@ Busca interativa, com resultados enquanto você digita:
 A prévia lê o arquivo apontado pelo rótulo do documento. Documentos cujo
 rótulo não é um arquivo (ex.: título de artigo) aparecem sem prévia.
 
+### Wikipédia em português
+
+Carga completa (~1,1 milhão de artigos), com painel de progresso no terminal:
+
+```bash
+python3 scripts/carregar_wikipedia.py
+```
+
+Por padrão lê `~/datasets/ptwiki/ptwiki.jsonl` e grava em
+`~/bench-db/ptwiki-full`, apagando o banco anterior (pede confirmação). O
+painel mostra artigos/s, MB/s, tempo restante, memória e tamanho do banco.
+`Ctrl+C` interrompe e mostra o comando `--pular N` para continuar de onde
+parou. No fim, um resumo vai para `~/bench-db/ptwiki-full.carga.json`. Veja
+`--help` para `--corpus`, `--banco`, `--lote` e `--compactar`.
+
+Por baixo, o script chama:
+
+```bash
+./target/release/fire-flower index-jsonl ~/bench-db/ptwiki-full ~/datasets/ptwiki/ptwiki.jsonl
+```
+
+Cada linha do JSONL é `{"id", "title", "text"}`: indexa `title + texto` sob o
+`id` e guarda o título como rótulo.
+
+### Busca sem interface
+
 Busca e autocompletar sem interface, para scripts:
 
 ```bash

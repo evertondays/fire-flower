@@ -130,7 +130,13 @@ impl Engine {
         Ok(words.into_iter().map(|(word, _)| word).collect())
     }
 
-    /// Rótulo gravado com [`IndexBatch::add_labeled`].
+    /// Compacta o banco inteiro: une os pedaços pendentes das listas de
+    /// postagem e descarta versões antigas. Num índice grande leva minutos.
+    pub fn compact(&self) {
+        self.db.compact_range::<&[u8], &[u8]>(None, None);
+    }
+
+    /// Rótulo gravado com [`IndexBatch::add_labeled`] ou [`IndexBatch::set_label`].
     pub fn label(&self, doc_id: DocId) -> Result<Option<String>> {
         Ok(self
             .db
@@ -298,6 +304,11 @@ impl IndexBatch<'_> {
         self.add_document(doc_id, text)?;
         self.labels.push((doc_id, label.to_string()));
         Ok(doc_id)
+    }
+
+    /// Grava (ou troca) o rótulo de um documento junto com o commit do lote.
+    pub fn set_label(&mut self, doc_id: DocId, label: &str) {
+        self.labels.push((doc_id, label.to_string()));
     }
 
     /// Documentos adicionados desde o início do lote. Use para decidir quando

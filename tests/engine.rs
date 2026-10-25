@@ -177,3 +177,20 @@ fn readers_run_while_indexing() {
     writer.join().unwrap();
     assert_eq!(engine.search("sempre").unwrap().len(), 201);
 }
+
+#[test]
+fn explicit_labels_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    for round in 0..3u64 {
+        let mut batch = engine.batch();
+        batch.add_document(100 + round, "termo compartilhado").unwrap();
+        batch.set_label(100 + round, &format!("Artigo {round}"));
+        batch.commit().unwrap();
+    }
+    // Três pedaços de merge em "compartilhado"; depois da compactação, um só.
+    assert_eq!(engine.search("compartilhado").unwrap(), [100, 101, 102]);
+    engine.compact();
+    assert_eq!(engine.search("compartilhado").unwrap(), [100, 101, 102]);
+    assert_eq!(engine.label(101).unwrap().as_deref(), Some("Artigo 1"));
+}

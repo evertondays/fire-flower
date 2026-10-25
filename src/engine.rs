@@ -93,6 +93,12 @@ pub struct Config {
     /// nós dos termos comuns. Passando do limite, saem primeiro os nós que o
     /// último lote não usou e depois os mais fundos. 0 desliga o cache.
     pub writer_cache_nodes: usize,
+    /// Até que profundidade da Trie as buscas guardam os nós já decodificados,
+    /// compartilhados entre elas (0 = só a raiz). Toda busca começa pela raiz,
+    /// que tem um filho por caractere inicial e cresce com o índice (13 KB com
+    /// 100 mil artigos da Wikipédia): sem o cache, cada busca a decodificava
+    /// inteira. `None` desliga.
+    pub reader_cache_depth: Option<usize>,
     /// Idiomas das stopwords (palavras comuns que não entram no índice).
     ///
     /// Ficam gravados no banco quando ele é criado, porque índice e consulta
@@ -122,6 +128,7 @@ impl Default for Config {
             max_prefix_terms: 256,
             statistics: false,
             writer_cache_nodes: 1_000_000,
+            reader_cache_depth: Some(2),
             languages: None,
             positions: None,
             // Os padrões do Lucene e do Elasticsearch.
@@ -140,7 +147,11 @@ pub struct Engine {
     stopwords: Stopwords,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
-    norms: NormCache,
+    /// Número do último commit gravado (ver [`EpochCache`]).
+    epoch: AtomicU64,
+    norms: EpochCache<NormBlock>,
+    /// Nós rasos da Trie (até `Config::reader_cache_depth`).
+    nodes: EpochCache<TrieNode>,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -163,76 +174,80 @@ struct NodeCache {
     generation: u64,
 }
 
-/// Blocos de `norm:` decodificados, compartilhados pelas buscas.
+/// Valores já decodificados, compartilhados pelas buscas: blocos de `norm:`
+/// (o ranking precisa do tamanho de cada documento) e os nós rasos da Trie
+/// (toda busca passa pela raiz). Sem cache, seria um `Get` e uma decodificação
+/// por valor em toda busca.
 ///
-/// Ranquear uma lista grande precisa do tamanho de cada documento; sem cache
-/// seria um `Get` e uma decodificação por bloco em toda busca. O desafio é o
-/// snapshot: uma busca não pode usar um tamanho gravado depois dela. Por isso
-/// cada commit tem um número (`epoch`) e cada bloco guarda a partir de qual
-/// número o conteúdo em cache vale:
+/// O desafio é o snapshot: uma busca não pode usar um valor gravado depois
+/// dela. Por isso cada commit tem um número (`Engine::epoch`) e cada entrada
+/// guarda a partir de qual número o conteúdo em cache vale:
 ///
-/// 1. antes de gravar, o escritor marca os blocos que vai mudar com o número
-///    do commit (`epoch + 1`) e sem conteúdo;
+/// 1. antes de gravar, o escritor marca as chaves que vai mudar com o número
+///    do commit (`epoch + 1`) e sem conteúdo ([`EpochCache::mark`]);
 /// 2. grava o lote;
 /// 3. publica o novo número.
 ///
-/// A busca lê o número *antes* de criar o snapshot. Um bloco com número maior
-/// que o dela foi (ou está sendo) mudado depois: ela lê do próprio snapshot e
-/// não guarda nada. Um bloco sem entrada nunca mudou desde o `open`.
+/// A busca lê o número *antes* de criar o snapshot. Uma entrada com número
+/// maior que o dela foi (ou está sendo) mudada depois: ela lê do próprio
+/// snapshot e não guarda nada. Uma chave sem entrada nunca mudou desde o
+/// `open`. Por isso o escritor marca **toda** chave que muda e que o cache
+/// poderia guardar, esteja ela no cache ou não.
 ///
-/// O cache não descarta blocos: no máximo guarda o tamanho de todos os
-/// documentos (~6 bytes cada; 1 milhão de documentos ≈ 6 MB).
-#[derive(Default)]
-struct NormCache {
-    epoch: AtomicU64,
-    slots: RwLock<FxHashMap<u64, NormSlot>>,
+/// O cache não descarta entradas. Os blocos de `norm:` ocupam no máximo o
+/// tamanho de todos os documentos (~6 bytes cada; 1 milhão ≈ 6 MB); os nós,
+/// só os rasos.
+struct EpochCache<T> {
+    slots: RwLock<FxHashMap<u64, Slot<T>>>,
 }
 
-struct NormSlot {
-    /// Commit a partir do qual `block` vale.
+struct Slot<T> {
+    /// Commit a partir do qual `value` vale.
     version: u64,
-    block: Option<Arc<NormBlock>>,
+    value: Option<Arc<T>>,
 }
 
-impl NormCache {
-    fn get(&self, block: u64, epoch: u64) -> Option<Arc<NormBlock>> {
+impl<T> Default for EpochCache<T> {
+    fn default() -> Self {
+        Self { slots: RwLock::new(FxHashMap::default()) }
+    }
+}
+
+impl<T> EpochCache<T> {
+    fn get(&self, key: u64, epoch: u64) -> Option<Arc<T>> {
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
-        match slots.get(&block) {
-            Some(slot) if slot.version <= epoch => slot.block.clone(),
+        match slots.get(&key) {
+            Some(slot) if slot.version <= epoch => slot.value.clone(),
             _ => None,
         }
     }
 
-    /// Uma busca leu o bloco do snapshot `epoch`; guarda se ainda for o atual.
-    fn offer(&self, block: u64, epoch: u64, data: &Arc<NormBlock>) {
+    /// Uma busca leu `key` do snapshot `epoch`; guarda se ainda for o atual.
+    fn offer(&self, key: u64, epoch: u64, data: &Arc<T>) {
         let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
-        match slots.entry(block) {
+        match slots.entry(key) {
             Entry::Vacant(e) => {
-                e.insert(NormSlot { version: 0, block: Some(Arc::clone(data)) });
+                e.insert(Slot { version: 0, value: Some(Arc::clone(data)) });
             }
             Entry::Occupied(mut e) => {
                 let slot = e.get_mut();
-                if slot.block.is_none() && slot.version <= epoch {
-                    slot.block = Some(Arc::clone(data));
+                if slot.value.is_none() && slot.version <= epoch {
+                    slot.value = Some(Arc::clone(data));
                 }
             }
         }
     }
 
-    /// Passo 1 do commit. Devolve o número a publicar depois da gravação.
-    fn invalidate(&self, blocks: &[u64]) -> u64 {
-        let next = self.epoch.load(AtomicOrdering::Acquire) + 1;
-        if !blocks.is_empty() {
-            let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
-            for &b in blocks {
-                slots.insert(b, NormSlot { version: next, block: None });
-            }
+    /// Passo 1 do commit: `keys` vão mudar no commit `version`.
+    fn mark(&self, keys: impl IntoIterator<Item = u64>, version: u64) {
+        let mut keys = keys.into_iter().peekable();
+        if keys.peek().is_none() {
+            return;
         }
-        next
-    }
-
-    fn publish(&self, epoch: u64) {
-        self.epoch.store(epoch, AtomicOrdering::Release);
+        let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            slots.insert(key, Slot { version, value: None });
+        }
     }
 }
 
@@ -277,7 +292,17 @@ impl Engine {
         };
         let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
         let writer = Mutex::new(WriterState { next_node_id, next_doc_id, stats, cache: NodeCache::default() });
-        Ok(Self { db, writer, config, stopwords, positions, norms: NormCache::default(), opts })
+        Ok(Self {
+            db,
+            writer,
+            config,
+            stopwords,
+            positions,
+            epoch: AtomicU64::new(0),
+            norms: EpochCache::default(),
+            nodes: EpochCache::default(),
+            opts,
+        })
     }
 
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
@@ -393,8 +418,8 @@ impl Engine {
     /// O snapshot garante que todas vejam o mesmo momento do índice, mesmo que
     /// um commit aconteça no meio.
     fn view(&self) -> View<'_> {
-        // Antes do snapshot: ver `NormCache`.
-        let epoch = self.norms.epoch.load(AtomicOrdering::Acquire);
+        // Antes do snapshot: ver `EpochCache`.
+        let epoch = self.epoch.load(AtomicOrdering::Acquire);
         View { snap: self.db.snapshot(), epoch, engine: self }
     }
 
@@ -476,6 +501,7 @@ impl Engine {
     /// Percorre todos os termos em ordem alfabética (busca em profundidade
     /// sobre um snapshot). `f` recebe o termo e o ID do nó terminal.
     pub fn for_each_term(&self, mut f: impl FnMut(&str, u64)) -> Result<()> {
+        // Lê direto do snapshot: percorrer tudo não deve encher o cache das buscas.
         let view = self.view();
         let Some(root) = load_node(&view.snap, ROOT_ID)? else { return Ok(()) };
         let mut stack: Vec<(String, TrieNode)> = vec![(String::new(), root)];
@@ -488,7 +514,7 @@ impl Engine {
             for (&ch, &child) in node.children.iter().rev() {
                 let mut next = word.clone();
                 next.push(ch);
-                stack.push((next, view.require_node(child)?));
+                stack.push((next, load_node(&view.snap, child)?.ok_or_else(|| missing_node(child))?));
                 ids.push(child);
             }
         }
@@ -930,14 +956,15 @@ impl View<'_> {
     fn words_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         let Some((start, _)) = self.find_node(prefix)? else { return Ok(out) };
-        let mut queue = VecDeque::from([(prefix.to_string(), start)]);
+        let depth = prefix.chars().count();
+        let mut queue = VecDeque::from([(prefix.to_string(), start, depth)]);
         while out.len() < limit {
-            let Some((word, id)) = queue.pop_front() else { break };
-            let node = self.require_node(id)?;
+            let Some((word, id, depth)) = queue.pop_front() else { break };
+            let node = self.require_node(id, depth)?;
             for (&ch, &child) in &node.children {
                 let mut next = word.clone();
                 next.push(ch);
-                queue.push_back((next, child));
+                queue.push_back((next, child, depth + 1));
             }
             if node.is_end_of_word {
                 out.push((word, id));
@@ -946,20 +973,35 @@ impl View<'_> {
         Ok(out)
     }
 
-    /// Percorre a Trie caractere a caractere: um `Get` no RocksDB por nível.
-    fn find_node(&self, term: &str) -> Result<Option<(u64, TrieNode)>> {
-        let Some(mut node) = load_node(&self.snap, ROOT_ID)? else { return Ok(None) };
+    /// Percorre a Trie caractere a caractere: um `Get` no RocksDB por nível,
+    /// menos nos níveis guardados no cache de nós.
+    fn find_node(&self, term: &str) -> Result<Option<(u64, Arc<TrieNode>)>> {
+        let Some(mut node) = self.node(ROOT_ID, 0)? else { return Ok(None) };
         let mut id = ROOT_ID;
-        for ch in term.chars() {
+        for (depth, ch) in term.chars().enumerate() {
             let Some(&child) = node.children.get(&ch) else { return Ok(None) };
             id = child;
-            node = self.require_node(child)?;
+            node = self.require_node(child, depth + 1)?;
         }
         Ok(Some((id, node)))
     }
 
-    fn require_node(&self, id: u64) -> Result<TrieNode> {
-        load_node(&self.snap, id)?.ok_or_else(|| missing_node(id))
+    fn require_node(&self, id: u64, depth: usize) -> Result<Arc<TrieNode>> {
+        self.node(id, depth)?.ok_or_else(|| missing_node(id))
+    }
+
+    /// Nó `id`, a `depth` passos da raiz. Os rasos vêm do cache compartilhado.
+    fn node(&self, id: u64, depth: usize) -> Result<Option<Arc<TrieNode>>> {
+        let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
+        if cached && let Some(node) = self.engine.nodes.get(id, self.epoch) {
+            return Ok(Some(node));
+        }
+        let Some(node) = load_node(&self.snap, id)? else { return Ok(None) };
+        let node = Arc::new(node);
+        if cached {
+            self.engine.nodes.offer(id, self.epoch, &node);
+        }
+        Ok(Some(node))
     }
 
     fn load_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
@@ -1344,10 +1386,16 @@ impl IndexBatch<'_> {
         wb.put(META_DOC_COUNT, varint(stats.doc_count));
         wb.put(META_TOTAL_LEN, varint(stats.total_len));
 
-        let norms = &self.engine.norms;
-        let epoch = norms.invalidate(&blocks);
-        self.engine.db.write(wb)?;
-        norms.publish(epoch);
+        // Ver `EpochCache`: marca, grava, publica.
+        let engine = self.engine;
+        let next = engine.epoch.load(AtomicOrdering::Acquire) + 1;
+        engine.norms.mark(blocks, next);
+        if let Some(max) = engine.config.reader_cache_depth {
+            let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
+            engine.nodes.mark(shallow, next);
+        }
+        engine.db.write(wb)?;
+        engine.epoch.store(next, AtomicOrdering::Release);
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
         for id in std::mem::take(&mut self.dirty) {
@@ -1728,8 +1776,8 @@ mod tests {
     }
 
     #[test]
-    fn norm_cache_respects_snapshots() {
-        let cache = NormCache::default();
+    fn epoch_cache_respects_snapshots() {
+        let cache = EpochCache::<NormBlock>::default();
         let a = Arc::new(NormBlock::default());
         let mut b = NormBlock::default();
         b.set(1, 10);
@@ -1738,14 +1786,16 @@ mod tests {
         cache.offer(7, 0, &a);
         assert!(cache.get(7, 0).is_some());
         // O escritor vai mudar o bloco 7 no commit 1.
-        let next = cache.invalidate(&[7]);
-        assert_eq!(next, 1);
+        cache.mark([7], 1);
         assert!(cache.get(7, 0).is_none(), "busca antiga relê do próprio snapshot");
         cache.offer(7, 0, &a);
         assert!(cache.get(7, 1).is_none(), "busca antiga não guarda o bloco velho");
-        cache.publish(next);
+        // Commit 1 publicado: uma busca nova guarda o que leu.
         cache.offer(7, 1, &b);
         assert_eq!(cache.get(7, 1).unwrap().get(1), Some(10));
         assert!(cache.get(7, 0).is_none());
+        // Uma chave nunca marcada, oferecida por uma busca antiga, vale para todas.
+        cache.offer(8, 0, &a);
+        assert!(cache.get(8, 5).is_some());
     }
 }

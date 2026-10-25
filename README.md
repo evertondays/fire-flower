@@ -215,8 +215,10 @@ python3 scripts/perf.py tudo --escala 10k
 - **Posições custam espaço.** Na fatia de 10k da Wikipédia, o banco
   compactado tem ~51 MB com posições e ~21 MB sem; use `--sem-posicoes` se
   não precisar de frases.
-- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 11 `Get`s.
-  Com o block cache quente isso fica em microssegundos, mas um índice de termos
+- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 9 `Get`s
+  (a raiz e os dois níveis seguintes vêm do cache de nós das buscas,
+  `Config::reader_cache_depth`). Com o block cache quente isso fica em
+  microssegundos, mas um índice de termos
   ordenado (`term:<palavra>` com iterador de prefixo do RocksDB) faria o mesmo
   com 1 leitura, e o autocompletar com um único scan.
 - **Prefixos muito curtos** (`a*`) expandem no máximo

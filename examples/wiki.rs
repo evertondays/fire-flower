@@ -408,6 +408,7 @@ fn config_json(config: &Config) -> Value {
         "max_prefix_terms": config.max_prefix_terms,
         "statistics": config.statistics,
         "writer_cache_nodes": config.writer_cache_nodes,
+        "reader_cache_depth": config.reader_cache_depth,
         "languages": config.languages.as_ref().map(|l| l.iter().map(|l| l.code()).collect::<Vec<_>>()),
         "positions": config.positions,
         "bm25_k1": config.bm25_k1,

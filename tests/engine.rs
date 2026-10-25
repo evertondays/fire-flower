@@ -788,3 +788,76 @@ fn ranking_while_indexing_sees_consistent_lengths() {
     }
     assert_eq!(engine.stats().unwrap().doc_count, 301);
 }
+
+/// O cache de nós rasos das buscas não pode esconder termos de commits
+/// novos: cada commit marca os nós rasos que mudou, e a busca seguinte relê.
+#[test]
+fn reader_node_cache_sees_new_commits() {
+    for depth in [None, Some(0), Some(2), Some(64)] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), Config { reader_cache_depth: depth, ..Config::default() }).unwrap();
+        engine.index_document(1, "abc").unwrap();
+        // Enche o cache com a raiz e os nós de "a", "ab"; "abd", "x" e "ax" ainda não existem.
+        assert_eq!(engine.search("abc").unwrap(), [1]);
+        assert!(engine.search("abd").unwrap().is_empty());
+        assert!(engine.search("x").unwrap().is_empty());
+        assert!(engine.suggest("a", 10).unwrap().contains(&"abc".to_string()));
+
+        // Filho novo na raiz (profundidade 1), em "a" (2) e em "ab" (3).
+        let mut batch = engine.batch();
+        batch.add_document(2, "x ax abd").unwrap();
+        batch.commit().unwrap();
+        for q in ["x", "ax", "abd"] {
+            assert_eq!(engine.search(q).unwrap(), [2], "{q} com cache até {depth:?}");
+        }
+        assert_eq!(engine.search("abc").unwrap(), [1]);
+        assert_eq!(engine.suggest("a", 10).unwrap(), ["ax", "abc", "abd"], "{depth:?}");
+        assert_eq!(engine.search_top("ab*", 10).unwrap().len(), 2);
+
+        // Reaberto: o cache começa vazio e o banco tem tudo.
+        drop(engine);
+        let engine = Engine::open(dir.path(), Config { reader_cache_depth: depth, ..Config::default() }).unwrap();
+        assert_eq!(engine.search("ax").unwrap(), [2]);
+    }
+}
+
+/// Buscas em paralelo com commits que criam nós rasos: um termo, depois de
+/// aparecer para uma thread, não some mais, e no fim todos aparecem.
+#[test]
+fn reader_node_cache_under_concurrent_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir));
+    engine.index_document(1, "base").unwrap();
+    // Termos de duas letras novas: cada um cria nós na raiz e no nível 1.
+    let terms: Vec<String> = (0..200u32)
+        .map(|i| {
+            let a = char::from_u32(0x4e00 + i).unwrap(); // ideogramas: um filho novo na raiz por termo
+            format!("{a}{a}")
+        })
+        .collect();
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            let terms = terms.clone();
+            std::thread::spawn(move || {
+                let mut seen = vec![false; terms.len()];
+                for _ in 0..50 {
+                    for (i, t) in terms.iter().enumerate() {
+                        let found = !engine.search(t).unwrap().is_empty();
+                        assert!(found || !seen[i], "{t} sumiu depois de aparecer");
+                        seen[i] |= found;
+                    }
+                }
+            })
+        })
+        .collect();
+    for (i, t) in terms.iter().enumerate() {
+        engine.index_document(10 + i as u64, t).unwrap();
+    }
+    for r in readers {
+        r.join().unwrap();
+    }
+    for (i, t) in terms.iter().enumerate() {
+        assert_eq!(engine.search(t).unwrap(), [10 + i as u64]);
+    }
+}

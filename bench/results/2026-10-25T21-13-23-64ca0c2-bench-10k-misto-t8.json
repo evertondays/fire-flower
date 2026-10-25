@@ -1,0 +1,46 @@
+{
+  "commit": "64ca0c2",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": false,
+    "writer_cache_nodes": 1000000
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 0.0,
+      "cache_hits_por_consulta": 100.491,
+      "conjunto": "misto",
+      "consultas": 1000,
+      "gets_por_consulta": 33.497,
+      "max_us": 3930.748,
+      "media_us": 214.61475099999998,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 0.0,
+      "modo": "search",
+      "p50_us": 146.538,
+      "p95_us": 460.285,
+      "p99_us": 1826.252,
+      "qps": 23187.429908747028,
+      "resultados_media": 339.448,
+      "threads": 8
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 4122267648,
+    "ram_total": 8266137600,
+    "swap_usado": 902926336
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-25T21-13-23",
+  "rotulo": "10k-misto-t8",
+  "threads": 8,
+  "tipo": "bench"
+}

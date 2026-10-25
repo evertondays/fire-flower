@@ -1,0 +1,21 @@
+{
+  "segundos": 0.44786763191223145,
+  "banco_antes": 18376942,
+  "banco_depois": 17120361,
+  "abertura_antes": {
+    "mediana_s": 0.01932072639465332,
+    "min_s": 0.018923282623291016,
+    "max_s": 0.14872241020202637,
+    "execucoes": 5
+  },
+  "abertura_depois": {
+    "mediana_s": 0.02002573013305664,
+    "min_s": 0.019463062286376953,
+    "max_s": 0.020646333694458008,
+    "execucoes": 5
+  },
+  "tipo": "compact",
+  "rotulo": "10k",
+  "commit": "64ca0c2",
+  "quando": "2026-10-25T21-10-21"
+}

@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "checagens": {
+    "oraculo_10k": true,
+    "idempotencia": true,
+    "lotes_vs_unico": true,
+    "reabrir": true
+  },
+  "idempotencia": {
+    "fatia": "10k",
+    "digest_1a": {
+      "db": "/home/evertondays/bench-db/perf/tmp-corretude",
+      "digest": "3b55fad271b2ec43",
+      "postagens": 4922700,
+      "termos": 288203
+    },
+    "digest_2a": {
+      "db": "/home/evertondays/bench-db/perf/tmp-corretude",
+      "digest": "3b55fad271b2ec43",
+      "postagens": 4922700,
+      "termos": 288203
+    },
+    "banco_1a": 18269619,
+    "banco_2a": 28474660,
+    "banco_2a_compactado": 17099371
+  },
+  "lotes": {
+    "batch_1": {
+      "db": "/home/evertondays/bench-db/perf/tmp-lote-1",
+      "digest": "fe308f5bffdd5f00",
+      "postagens": 942452,
+      "termos": 114201
+    },
+    "batch_1000": {
+      "db": "/home/evertondays/bench-db/perf/tmp-lote-1000",
+      "digest": "fe308f5bffdd5f00",
+      "postagens": 942452,
+      "termos": 114201
+    }
+  },
+  "tipo": "corretude",
+  "rotulo": "10k",
+  "commit": "64ca0c2",
+  "quando": "2026-10-25T21-10-08"
+}

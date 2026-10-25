@@ -153,7 +153,8 @@ def git_commit():
     def git(*a):
         return subprocess.run(["git", "-C", PROJECT, *a], capture_output=True, text=True).stdout.strip()
     h = git("rev-parse", "--short", "HEAD") or "desconhecido"
-    return h + ("-modificado" if git("status", "--porcelain", "--untracked-files=no") else "")
+    # bench/ fica de fora: o próprio perf.py regrava consultas, baseline e relatório no meio da rodada.
+    return h + ("-modificado" if git("status", "--porcelain", "--untracked-files=no", "--", ".", ":!bench") else "")
 
 
 def save_result(kind, label, data):
@@ -542,8 +543,8 @@ def cmd_relatorio(scale):
 
     # Fase 2
     L += ["## Fase 2: escada de indexação", "",
-          "| Fatia | Rodadas | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| Fatia | Commit | Rodadas | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in ORDER:
         r = median_load(R, f"ptwiki-{s}")
         if not r:
@@ -551,7 +552,7 @@ def cmd_relatorio(scale):
         sz = latest(R, "sizes", f"ptwiki-{s}")
         terms = next((e["chaves"] for e in sz["espacos"] if e["espaco"] == "post"), None) if sz else None
         w = r.get("escrita") or {}
-        L.append(f"| {s} | {r['_rodadas']} | {dur(r['segundos'])} | {docs_s(r)} | {fmt(r['mb_por_s'], 1)} | "
+        L.append(f"| {s} | `{r.get('commit', '?')}` | {r['_rodadas']} | {dur(r['segundos'])} | {docs_s(r)} | {fmt(r['mb_por_s'], 1)} | "
                  f"{mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB | {fmt(r['banco_por_texto'], 2)} | "
                  f"{fmt(r['nos_trie'])} | {fmt(terms)} | {fmt(w.get('write_amp'), 2)} | "
                  f"{fmt((w.get('stall_micros') or 0) / 1e6, 1)}s |")

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::tokenize;
+use fire_flower::text::index_terms;
 use fire_flower::{Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
@@ -62,6 +62,9 @@ enum Cmd {
         /// Indexa um documento por commit (`index_document`), para medir o custo fixo do commit
         #[arg(long)]
         streaming: bool,
+        /// Nós da Trie que o escritor guarda entre lotes (0 desliga o cache)
+        #[arg(long)]
+        cache_nos: Option<usize>,
         #[arg(long)]
         label: Option<String>,
     },
@@ -169,8 +172,8 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, label } => {
-            load(&db, &corpus, batch, skip, take, remap_ids, cache_mb, streaming, label)
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, label } => {
+            load(&db, &corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, label)
         }
         Cmd::Vocab { corpus, take, out } => vocab(&corpus, take, out),
         Cmd::Queries { vocab, corpus, seed, per_set, out } => queries(&vocab, &corpus, seed, per_set, out),
@@ -264,12 +267,9 @@ impl Iterator for Corpus {
     }
 }
 
-/// Termos únicos de um documento, como o motor os indexa.
+/// Termos únicos de um documento, como o motor os indexa (sem stopwords).
 fn unique_terms(body: &str) -> Vec<String> {
-    let mut terms = tokenize(body);
-    terms.sort_unstable();
-    terms.dedup();
-    terms
+    index_terms(body)
 }
 
 fn stem(path: &Path) -> String {
@@ -366,6 +366,7 @@ fn config_json(config: &Config) -> Value {
         "bloom_bits_per_key": config.bloom_bits_per_key,
         "max_prefix_terms": config.max_prefix_terms,
         "statistics": config.statistics,
+        "writer_cache_nodes": config.writer_cache_nodes,
     })
 }
 
@@ -435,9 +436,13 @@ fn load(
     remap_ids: bool,
     cache_mb: usize,
     streaming: bool,
+    cache_nodes: Option<usize>,
     label: Option<String>,
 ) -> AnyResult {
-    let config = Config { block_cache_bytes: cache_mb << 20, statistics: true, ..Config::default() };
+    let mut config = Config { block_cache_bytes: cache_mb << 20, statistics: true, ..Config::default() };
+    if let Some(n) = cache_nodes {
+        config.writer_cache_nodes = n;
+    }
     let engine = Engine::open(db, config.clone())?;
     let corpus = Corpus::open(corpus_path, skip, take, remap_ids)?;
     let label = label.unwrap_or_else(|| format!("{}-b{batch_size}", stem(corpus_path)));
@@ -706,7 +711,8 @@ fn queries(vocab_path: &Path, corpus_path: &Path, seed: u64, per_set: usize, out
     let mut seen = 0usize;
     for doc in Corpus::open(corpus_path, 0, None, false)? {
         let doc = doc?;
-        if tokenize(&doc.title).is_empty() {
+        // Título só de stopwords ("Ela") vira consulta vazia.
+        if index_terms(&doc.title).is_empty() {
             continue;
         }
         seen += 1;
@@ -823,7 +829,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
             let j = rng.below(2000);
             sampled_docs[j] = terms.clone();
         }
-        if !tokenize(&doc.title).is_empty() {
+        if !index_terms(&doc.title).is_empty() {
             if titles.len() < args.titles {
                 titles.push((doc.id, doc.title.clone()));
             } else if rng.below(docs) < args.titles {
@@ -1179,7 +1185,7 @@ fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool
 
 fn sizes(db: &Path) -> AnyResult {
     let engine = Engine::open(db, Config::default())?;
-    let watched: Vec<(&str, Option<u64>)> = ["de", "a", "o", "e", "em"].iter().map(|t| Ok((*t, engine.term_node(t)?))).collect::<AnyResult<_>>()?;
+    let watched: Vec<(&str, Option<u64>)> = ["area", "populacao", "historia", "anos", "parte"].iter().map(|t| Ok((*t, engine.term_node(t)?))).collect::<AnyResult<_>>()?;
 
     #[derive(Default)]
     struct Space {

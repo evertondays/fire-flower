@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 use rocksdb::{BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 
 use crate::codec::{self, TrieNode};
-use crate::text::{normalize_term, tokenize};
+use crate::text::{index_terms, normalize_term, parse_query};
 use crate::{DocId, Error, Result};
 
 pub const ROOT_ID: u64 = 0;
@@ -44,11 +44,22 @@ pub struct Config {
     /// Liga as estatísticas internas do RocksDB ([`Engine::rocksdb_stats`]).
     /// Custa um pouco de CPU; use em medições, não em produção.
     pub statistics: bool,
+    /// Quantos nós da Trie o escritor mantém em memória entre um lote e
+    /// outro (~200 bytes cada). Sem isso, todo lote relê do banco a raiz e os
+    /// nós dos termos comuns. Passando do limite, saem primeiro os nós que o
+    /// último lote não usou e depois os mais fundos. 0 desliga o cache.
+    pub writer_cache_nodes: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { block_cache_bytes: 256 << 20, bloom_bits_per_key: 10.0, max_prefix_terms: 256, statistics: false }
+        Self {
+            block_cache_bytes: 256 << 20,
+            bloom_bits_per_key: 10.0,
+            max_prefix_terms: 256,
+            statistics: false,
+            writer_cache_nodes: 1_000_000,
+        }
     }
 }
 
@@ -65,6 +76,18 @@ pub struct Engine {
 struct WriterState {
     next_node_id: u64,
     next_doc_id: DocId,
+    /// Nós da Trie dos lotes anteriores. Só o escritor altera a Trie, então
+    /// depois de um commit o cache é igual ao banco. O lote o pega emprestado
+    /// e só o devolve no commit: um lote descartado leva o cache junto, e
+    /// nada que não foi gravado sobrevive.
+    cache: NodeCache,
+}
+
+#[derive(Default)]
+struct NodeCache {
+    nodes: HashMap<u64, CachedNode>,
+    /// Número do último lote gravado. Cada nó guarda o lote que o usou por último.
+    generation: u64,
 }
 
 impl Engine {
@@ -90,7 +113,7 @@ impl Engine {
         let db = DB::open(&opts, path)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
-        Ok(Self { db, writer: Mutex::new(WriterState { next_node_id, next_doc_id }), config, opts })
+        Ok(Self { db, writer: Mutex::new(WriterState { next_node_id, next_doc_id, cache: NodeCache::default() }), config, opts })
     }
 
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
@@ -98,14 +121,18 @@ impl Engine {
     pub fn batch(&self) -> IndexBatch<'_> {
         // Os contadores só mudam após um commit bem-sucedido, então o estado
         // continua válido mesmo se outra thread entrou em pânico com o lock.
-        let state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = std::mem::take(&mut state.cache);
         IndexBatch {
             db: &self.db,
             next_node_id: state.next_node_id,
             next_doc_id: state.next_doc_id,
             state,
-            nodes: HashMap::new(),
-            new_postings: HashMap::new(),
+            nodes: cache.nodes,
+            generation: cache.generation + 1,
+            cache_limit: self.config.writer_cache_nodes,
+            dirty: Vec::new(),
+            pending: HashMap::new(),
             labels: Vec::new(),
             documents: 0,
         }
@@ -241,24 +268,12 @@ struct View<'a> {
 impl View<'_> {
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
         let mut lists: Vec<Vec<DocId>> = Vec::new();
-        for raw in query.split_whitespace() {
-            let (raw, is_prefix) = match raw.strip_suffix('*') {
-                Some(stem) => (stem, true),
-                None => (raw, false),
-            };
-            // "e-mail" vira ["e", "mail"], exatamente como na indexação.
-            let terms = tokenize(raw);
-            for (i, term) in terms.iter().enumerate() {
-                let list = if is_prefix && i == terms.len() - 1 {
-                    self.prefix_postings(term)?
-                } else {
-                    self.postings(term)?
-                };
-                if list.is_empty() {
-                    return Ok(Vec::new());
-                }
-                lists.push(list);
+        for term in parse_query(query) {
+            let list = if term.prefix { self.prefix_postings(&term.text)? } else { self.postings(&term.text)? };
+            if list.is_empty() {
+                return Ok(Vec::new());
             }
+            lists.push(list);
         }
 
         // Interseção começando pela lista menor: o resultado só encolhe.
@@ -339,16 +354,25 @@ impl View<'_> {
 /// Lote de indexação. Acumula as mudanças em memória e grava tudo de uma vez,
 /// atomicamente, em [`IndexBatch::commit`]. Se for descartado sem commit,
 /// nada é gravado. Buscas concorrentes nunca veem um lote pela metade.
+///
+/// O lote é invertido: `add_document` só junta termo → documentos, e a Trie é
+/// percorrida no commit, uma vez por termo distinto do lote (e não uma vez
+/// por documento que contém o termo).
 pub struct IndexBatch<'a> {
     db: &'a DB,
     state: MutexGuard<'a, WriterState>,
     next_node_id: u64,
     next_doc_id: DocId,
-    /// Nós lidos ou criados neste lote. Nós criados aqui ainda não existem no
-    /// banco, então as travessias seguintes precisam enxergá-los por este mapa.
+    /// Cache de nós emprestado do `WriterState`, mais os nós lidos ou criados
+    /// neste lote. Nós criados aqui ainda não existem no banco, então as
+    /// travessias seguintes precisam enxergá-los por este mapa.
     nodes: HashMap<u64, CachedNode>,
-    /// Nó terminal -> documentos novos para a lista de postagem.
-    new_postings: HashMap<u64, Vec<DocId>>,
+    generation: u64,
+    cache_limit: usize,
+    /// Nós alterados neste lote, na ordem em que mudaram.
+    dirty: Vec<u64>,
+    /// Termo -> documentos deste lote que o contêm.
+    pending: HashMap<String, Vec<DocId>>,
     labels: Vec<(DocId, String)>,
     documents: usize,
 }
@@ -356,19 +380,22 @@ pub struct IndexBatch<'a> {
 struct CachedNode {
     node: TrieNode,
     dirty: bool,
+    /// Lote que usou o nó por último.
+    used: u64,
+    /// Distância até a raiz. Os nós rasos são os mais compartilhados.
+    depth: u8,
 }
 
 impl IndexBatch<'_> {
     /// Indexa `text` sob um ID escolhido por você.
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
-        // Ordenar deixa a criação de nós determinística: o mesmo texto gera
-        // sempre os mesmos IDs, o que torna bancos comparáveis entre execuções.
-        let mut terms = tokenize(text);
-        terms.sort_unstable();
-        terms.dedup();
-        for term in &terms {
-            let node_id = self.insert_term(term)?;
-            self.new_postings.entry(node_id).or_default().push(doc_id);
+        for term in index_terms(text) {
+            match self.pending.get_mut(term.as_str()) {
+                Some(docs) => docs.push(doc_id),
+                None => {
+                    self.pending.insert(term, vec![doc_id]);
+                }
+            }
         }
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
@@ -390,7 +417,7 @@ impl IndexBatch<'_> {
     }
 
     /// Documentos adicionados desde o início do lote. Use para decidir quando
-    /// fazer commit: o lote guarda em memória cada nó que tocou.
+    /// fazer commit: o lote guarda em memória os termos de todos eles.
     pub fn len(&self) -> usize {
         self.documents
     }
@@ -401,18 +428,22 @@ impl IndexBatch<'_> {
 
     /// Grava o lote num único `WriteBatch` atômico.
     pub fn commit(mut self) -> Result<()> {
+        // Termos em ordem: a criação de nós fica determinística (o mesmo
+        // corpus com o mesmo tamanho de lote gera sempre os mesmos IDs).
+        let mut terms: Vec<(String, Vec<DocId>)> = std::mem::take(&mut self.pending).into_iter().collect();
+        terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
         let mut wb = WriteBatch::default();
-        for (id, cached) in &self.nodes {
-            if cached.dirty {
-                wb.put(node_key(*id), cached.node.encode());
-            }
-        }
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_postings`).
-        for (id, mut docs) in self.new_postings.drain() {
+        for (term, mut docs) in terms {
+            let id = self.insert_term(&term)?;
             docs.sort_unstable();
             docs.dedup();
             wb.merge(post_key(id), codec::encode_postings(&docs));
+        }
+        for id in &self.dirty {
+            wb.put(node_key(*id), self.nodes[id].node.encode());
         }
         for (doc_id, label) in &self.labels {
             wb.put(doc_key(*doc_id), label.as_bytes());
@@ -421,6 +452,16 @@ impl IndexBatch<'_> {
         wb.put(META_NEXT_DOC, varint(self.next_doc_id));
 
         self.db.write(wb)?;
+
+        // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
+        for id in std::mem::take(&mut self.dirty) {
+            if let Some(cached) = self.nodes.get_mut(&id) {
+                cached.dirty = false;
+            }
+        }
+        let mut nodes = std::mem::take(&mut self.nodes);
+        evict(&mut nodes, self.generation, self.cache_limit);
+        self.state.cache = NodeCache { nodes, generation: self.generation };
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
         Ok(())
@@ -429,42 +470,92 @@ impl IndexBatch<'_> {
     /// Cria (se preciso) o caminho de `term` na Trie e devolve o nó terminal.
     fn insert_term(&mut self, term: &str) -> Result<u64> {
         let mut id = ROOT_ID;
+        let mut depth = 0u8;
         for ch in term.chars() {
             let next_free = self.next_node_id;
-            let parent = self.node_mut(id)?;
+            let generation = self.generation;
+            let parent = self.node_mut(id, depth)?;
             id = match parent.node.children.get(&ch) {
                 Some(&child) => child,
                 None => {
                     parent.node.children.insert(ch, next_free);
-                    parent.dirty = true;
+                    if !parent.dirty {
+                        parent.dirty = true;
+                        self.dirty.push(id);
+                    }
                     self.next_node_id += 1;
-                    self.nodes.insert(next_free, CachedNode { node: TrieNode::default(), dirty: true });
+                    self.dirty.push(next_free);
+                    let node = CachedNode { node: TrieNode::default(), dirty: true, used: generation, depth: depth + 1 };
+                    self.nodes.insert(next_free, node);
                     next_free
                 }
             };
+            // Termos têm no máximo MAX_TOKEN_CHARS (64) caracteres.
+            depth = depth.saturating_add(1);
         }
-        let leaf = self.node_mut(id)?;
+        let leaf = self.node_mut(id, depth)?;
         if !leaf.node.is_end_of_word {
             leaf.node.is_end_of_word = true;
-            leaf.dirty = true;
+            if !leaf.dirty {
+                leaf.dirty = true;
+                self.dirty.push(id);
+            }
         }
         Ok(id)
     }
 
-    /// Nó do cache do lote, lendo do banco na primeira vez.
-    fn node_mut(&mut self, id: u64) -> Result<&mut CachedNode> {
+    /// Nó do cache, lendo do banco na primeira vez.
+    fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
+        let generation = self.generation;
         match self.nodes.entry(id) {
-            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Occupied(e) => {
+                let cached = e.into_mut();
+                cached.used = generation;
+                Ok(cached)
+            }
             Entry::Vacant(e) => {
-                let cached = match load_node(self.db, id)? {
-                    Some(node) => CachedNode { node, dirty: false },
+                let (node, dirty) = match load_node(self.db, id)? {
+                    Some(node) => (node, false),
                     // Banco novo: a raiz nasce no primeiro commit.
-                    None if id == ROOT_ID => CachedNode { node: TrieNode::default(), dirty: true },
+                    None if id == ROOT_ID => (TrieNode::default(), true),
                     None => return Err(missing_node(id)),
                 };
-                Ok(e.insert(cached))
+                if dirty {
+                    self.dirty.push(id);
+                }
+                Ok(e.insert(CachedNode { node, dirty, used: generation, depth }))
             }
         }
+    }
+}
+
+/// Mantém o cache de nós dentro de `limit`: primeiro saem os nós que o lote
+/// `generation` não usou; se ainda passar, saem os mais fundos.
+fn evict(nodes: &mut HashMap<u64, CachedNode>, generation: u64, limit: usize) {
+    if nodes.len() <= limit {
+        return;
+    }
+    nodes.retain(|_, c| c.used == generation);
+    if nodes.len() <= limit {
+        return;
+    }
+    let mut per_depth = [0usize; 256];
+    for c in nodes.values() {
+        per_depth[c.depth as usize] += 1;
+    }
+    // Maior profundidade que ainda cabe inteira no limite.
+    let mut total = 0;
+    let mut max_depth = None;
+    for (depth, &n) in per_depth.iter().enumerate() {
+        total += n;
+        if total > limit {
+            break;
+        }
+        max_depth = Some(depth);
+    }
+    match max_depth {
+        Some(d) => nodes.retain(|_, c| c.depth as usize <= d),
+        None => nodes.clear(),
     }
 }
 

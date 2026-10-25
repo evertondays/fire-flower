@@ -6,7 +6,7 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fire_flower::text::{normalize_term, tokenize};
+use fire_flower::text::{QueryTerm, normalize_term, parse_query};
 use fire_flower::{DocId, Engine};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -48,12 +48,6 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Um termo da consulta efetiva, já normalizado.
-struct QueryTerm {
-    text: String,
-    prefix: bool,
 }
 
 struct App<'a> {
@@ -126,7 +120,7 @@ impl<'a> App<'a> {
             Some(word) if !word.ends_with('*') => format!("{}*", self.query.trim_end()),
             _ => self.query.trim().to_string(),
         };
-        self.terms = parse_terms(&self.effective);
+        self.terms = parse_query(&self.effective);
 
         self.error = None;
         self.suggestions = match &self.current_word {
@@ -515,23 +509,6 @@ fn panel(title: &str) -> Block<'_> {
         .title(Span::styled(title, Style::new().fg(Color::Gray).bold()))
 }
 
-/// Separa a consulta em termos normalizados, com a mesma regra da busca.
-fn parse_terms(query: &str) -> Vec<QueryTerm> {
-    let mut terms = Vec::new();
-    for piece in query.split_whitespace() {
-        let (piece, prefix) = match piece.strip_suffix('*') {
-            Some(stem) => (stem, true),
-            None => (piece, false),
-        };
-        let tokens = tokenize(piece);
-        let last = tokens.len().saturating_sub(1);
-        for (i, text) in tokens.into_iter().enumerate() {
-            terms.push(QueryTerm { text, prefix: prefix && i == last });
-        }
-    }
-    terms
-}
-
 fn matches_term(word: &str, terms: &[QueryTerm]) -> bool {
     terms.iter().any(|t| if t.prefix { word.starts_with(&t.text) } else { word == t.text })
 }
@@ -632,7 +609,7 @@ mod tests {
 
     #[test]
     fn highlight_marks_normalized_matches() {
-        let terms = parse_terms("coracao bras*");
+        let terms = parse_query("coracao do bras*");
         let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms);
         assert!(hit);
         let marked: Vec<&str> =

@@ -60,8 +60,9 @@ fn bench_tokenize(c: &mut Criterion) {
 
 fn bench_postings(c: &mut Criterion) {
     let Some(engine) = open_db() else { return };
-    let de = engine.postings("de").unwrap();
-    let em = engine.postings("em").unwrap();
+    // Os termos mais frequentes que não são stopwords ("de" e "em" não são mais indexados).
+    let de = engine.postings("area").unwrap();
+    let em = engine.postings("populacao").unwrap();
     let rare = engine.postings("astrofisica").unwrap();
     let de_bytes = encode_postings(&de);
     // Pedaços pequenos como os que um lote grava via merge.
@@ -69,14 +70,14 @@ fn bench_postings(c: &mut Criterion) {
     let pieces: Vec<Vec<u8>> = (1..=8u64).map(|i| encode_postings(&[max + i * 10, max + i * 10 + 1])).collect();
 
     let mut g = c.benchmark_group("listas");
-    g.bench_function(format!("decode_de_{}_ids", de.len()), |b| b.iter(|| decode_postings(black_box(&de_bytes)).unwrap()));
-    g.bench_function("merge_de_mais_8_pedacos", |b| {
+    g.bench_function(format!("decode_area_{}_ids", de.len()), |b| b.iter(|| decode_postings(black_box(&de_bytes)).unwrap()));
+    g.bench_function("merge_area_mais_8_pedacos", |b| {
         b.iter(|| union_encoded(Some(black_box(&de_bytes)), pieces.iter().map(Vec::as_slice)).unwrap())
     });
-    g.bench_function(format!("intersect_raro{}_x_de{}", rare.len(), de.len()), |b| {
+    g.bench_function(format!("intersect_raro{}_x_area{}", rare.len(), de.len()), |b| {
         b.iter(|| intersect(black_box(&rare), black_box(&de)))
     });
-    g.bench_function(format!("intersect_em{}_x_de{}", em.len(), de.len()), |b| {
+    g.bench_function(format!("intersect_populacao{}_x_area{}", em.len(), de.len()), |b| {
         b.iter(|| intersect(black_box(&em), black_box(&de)))
     });
     g.finish();
@@ -88,7 +89,7 @@ fn bench_search(c: &mut Criterion) {
     for (name, q) in [
         ("raro", "astrofisica"),
         ("titulo", "revolução francesa"),
-        ("frequente", "de"),
+        ("frequente", "brasil"),
         ("prefixo", "port*"),
         ("inexistente", "constituicaox"),
     ] {

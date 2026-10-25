@@ -262,3 +262,67 @@ fn diagnostics_walk_terms_and_raw_keys() {
     assert!(engine.rocksdb_stats().unwrap().contains("rocksdb.block.cache"));
     assert!(engine.property("rocksdb.estimate-num-keys").is_some());
 }
+
+#[test]
+fn stopwords_are_not_indexed_nor_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    sample(&engine);
+    engine.index_document(5, "The Lord of the Rings, em dezembro").unwrap();
+    // Stopword sozinha não acha nada: ela não está no índice.
+    assert!(engine.search("do").unwrap().is_empty());
+    assert!(engine.postings("the").unwrap().is_empty());
+    assert!(engine.search("o que é").unwrap().is_empty());
+    // No meio da consulta, é ignorada em vez de zerar o resultado.
+    assert_eq!(engine.search("roupa do rei").unwrap(), [1]);
+    assert_eq!(engine.search("the lord of the rings").unwrap(), [5]);
+    // Como prefixo continua valendo.
+    assert_eq!(engine.search("de*").unwrap(), [5]);
+    assert_eq!(engine.suggest("d", 10).unwrap(), ["dezembro"]);
+}
+
+/// Mesmo conteúdo com o cache de nós desligado, minúsculo e padrão.
+#[test]
+fn node_cache_limit_does_not_change_results() {
+    let digests: Vec<Vec<(String, Vec<u64>)>> = [0usize, 3, 1_000_000]
+        .into_iter()
+        .map(|limit| {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(dir.path(), Config { writer_cache_nodes: limit, ..Config::default() }).unwrap();
+            for chunk in 0..6u64 {
+                let mut batch = engine.batch();
+                for i in 0..50u64 {
+                    let id = chunk * 50 + i;
+                    batch.add_document(id, &format!("comum termo{id} prefixo{} lote{chunk}", id % 7)).unwrap();
+                }
+                batch.commit().unwrap();
+            }
+            let mut terms = Vec::new();
+            engine.for_each_term(|t, node| terms.push((t.to_string(), node))).unwrap();
+            terms.into_iter().map(|(t, node)| (t, engine.postings_of_node(node).unwrap())).collect()
+        })
+        .collect();
+    assert_eq!(digests[0].len(), 300 + 7 + 6 + 1);
+    assert_eq!(digests[0], digests[1]);
+    assert_eq!(digests[0], digests[2]);
+}
+
+/// Um lote descartado não pode deixar nós que não foram gravados no cache.
+#[test]
+fn dropped_batch_after_cached_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    engine.index_document(1, "casa").unwrap();
+    {
+        let mut batch = engine.batch();
+        batch.add_document(2, "casamento casarao").unwrap();
+        // Sem commit: com o lote invertido a Trie nem foi tocada, mas o
+        // cache emprestado também tem que ser descartado.
+    }
+    engine.index_document(3, "casulo").unwrap();
+    assert_eq!(engine.suggest("cas", 10).unwrap(), ["casa", "casulo"]);
+    drop(engine);
+    let engine = open(&dir);
+    assert_eq!(engine.suggest("cas", 10).unwrap(), ["casa", "casulo"]);
+    assert_eq!(engine.search("casulo").unwrap(), [3]);
+}

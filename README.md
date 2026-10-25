@@ -7,6 +7,8 @@ RocksDB**, um registro por nó. Sem servidor externo — é uma biblioteca Rust
 Suporta:
 
 - busca exata, normalizada (`Ação` = `acao` = `ACAO`);
+- stopwords em português e inglês (`de`, `o`, `the`…) ficam fora do índice e
+  são ignoradas na consulta (`casa de papel` busca `casa` E `papel`);
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
@@ -153,9 +155,11 @@ python3 scripts/perf.py tudo --escala 10k
    nó terminal>`; não é preciso um segundo contador nem guardar o ID no nó.
 3. **Filhos guardam IDs numéricos** (`BTreeMap<char, u64>`), não strings
    `"node:124"`. O `BTreeMap` deixa o autocompletar em ordem alfabética.
-4. **Nós criados no meio de um lote.** Como nada vai para o banco antes do
-   commit, o lote mantém em memória os nós que leu ou criou; senão a segunda
-   palavra com o mesmo prefixo não enxergaria os nós criados pela primeira.
+4. **Lote invertido, com cache de nós.** O lote junta termo → documentos e só
+   percorre a Trie no commit, uma vez por termo distinto (e não uma vez por
+   documento). Os nós lidos ou criados ficam num cache do escritor que passa de
+   um lote para o outro (`Config::writer_cache_nodes`, 1 milhão de nós por
+   padrão), então a raiz e os termos comuns não são relidos a cada commit.
 5. **Serialização binária própria** em vez de Gob/JSON (menor e sem
    dependências).
 
@@ -171,7 +175,10 @@ python3 scripts/perf.py tudo --escala 10k
   com 1 leitura, e o autocompletar com um único scan.
 - **Prefixos muito curtos** (`a*`) expandem no máximo
   `Config::max_prefix_terms` termos (256); os demais são ignorados.
-- **Sem stopwords nem stemming** ("casa" e "casas" são termos diferentes).
+- **Sem stemming** ("casa" e "casas" são termos diferentes).
+- **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
+  stopword em inglês, então a consulta fica vazia. Como prefixo continuam
+  valendo (`de*` acha "dezembro"). A lista está em `src/text.rs`.
 
 ## Compilação
 

@@ -339,16 +339,16 @@ sequenceDiagram
     loop cada arquivo
         CLI->>T: strip_html (se .html)
         CLI->>B: add_labeled(caminho, texto)
-        B->>T: tokenize(texto)
-        T-->>B: termos normalizados
-        loop cada termo único
-            B->>DB: get node:ID (só se o nó não estiver no lote)
-            B->>B: cria nós que faltam, marca fim de palavra
-            B->>B: anota doc_id para post:ID do nó final
-        end
+        B->>T: index_terms(texto)
+        T-->>B: termos normalizados, sem stopwords
+        B->>B: anota doc_id em pending[termo]
         alt 1000 documentos no lote
+            loop cada termo distinto do lote, em ordem
+                B->>DB: get node:ID (só se o nó não estiver no cache)
+                B->>B: cria nós que faltam, marca fim de palavra
+            end
             B->>DB: commit: um WriteBatch
-            CLI->>B: engine.batch() de novo
+            CLI->>B: engine.batch() de novo (o cache de nós continua)
         end
     end
     B->>DB: commit final
@@ -382,29 +382,53 @@ inteiros e decodifica entidades comuns (`&amp;`, `&nbsp;`…).
 A **mesma** função é usada na busca. Se as duas normalizações divergissem, os
 termos buscados nunca bateriam com os indexados.
 
-### 5.2 Termos únicos por documento
+**Stopwords.** Depois de normalizar, `index_terms` descarta as palavras
+comuns em português e inglês (listas `STOPWORDS_PT` e `STOPWORDS_EN`, baseadas
+no Snowball/NLTK). Elas aparecem em quase todo documento, então só inchariam o
+índice: na Wikipédia, "de" está em 99% dos artigos. Na busca, `parse_query`
+descarta as mesmas palavras quando exatas, senão `casa de papel` exigiria um
+termo que não existe e voltaria vazia. Como prefixo (`de*`) elas continuam
+valendo. "são" e "era" ficam fora da lista de propósito: são também nomes
+(São Paulo, Era Vargas).
 
-`add_document` ordena os termos e remove os repetidos. Um documento que diz
-"café" dez vezes entra uma vez só na lista de `cafe`. A ordenação também deixa
-a criação de nós determinística: o mesmo texto gera sempre os mesmos IDs.
+### 5.2 Lote invertido
+
+`add_document` não toca na Trie. Ele tira os termos repetidos do documento (um
+documento que diz "café" dez vezes entra uma vez só na lista de `cafe`) e
+anota o `doc_id` em `pending[termo]`. No commit, cada termo distinto do lote
+é inserido **uma vez**, em ordem alfabética. Num lote de 1.000 artigos, "brasil"
+aparece em centenas deles, mas a Trie é percorrida uma vez só para ele.
+
+A ordem alfabética deixa a criação de nós determinística: o mesmo corpus com
+o mesmo tamanho de lote gera sempre os mesmos IDs. Com outro tamanho de lote
+os IDs mudam, mas o conteúdo (termo → documentos) é o mesmo.
 
 ### 5.3 Inserção na Trie (`IndexBatch::insert_term`)
 
 Para o termo `carro`, começando em `node:0`:
 
-1. Pega o nó atual com `node_mut`. Se ele já está no lote (lido ou criado
-   antes), usa a cópia em memória; senão, lê do RocksDB e decodifica.
+1. Pega o nó atual com `node_mut`. Se ele já está no cache (lido ou criado
+   antes, neste lote ou num anterior), usa a cópia em memória; senão, lê do
+   RocksDB e decodifica.
 2. Procura o próximo caractere nos filhos.
    - **Existe:** desce para o filho.
    - **Não existe:** reserva o próximo ID (`next_node_id`), cria um nó vazio,
      registra o filho no pai e marca os dois como modificados (*dirty*).
 3. No último caractere, marca `is_end_of_word = true`.
-4. Anota `doc_id` em `new_postings[id do nó final]`.
+4. Grava a lista de documentos do termo em `post:<id do nó final>`.
 
 **Por que o lote guarda nós em memória?** Nada é gravado antes do commit. Se o
-documento tem `carro` e `carta`, a inserção de `carta` precisa enxergar os nós
+lote tem `carro` e `carta`, a inserção de `carta` precisa enxergar os nós
 `c`, `ca`, `car` que `carro` acabou de criar, e eles ainda não existem no
 banco. O mapa `nodes` do lote é essa visão "banco + mudanças pendentes".
+
+**Cache entre lotes.** Depois do commit, os nós em memória são iguais aos do
+banco, e só o escritor altera a Trie. Então o mapa volta para o `WriterState`
+e o próximo lote começa com ele: a raiz e os nós dos termos comuns não são
+relidos a cada commit. Um lote descartado (ou com commit que falhou) leva o
+cache junto, e o próximo começa do banco. O cache tem um teto
+(`Config::writer_cache_nodes`, 1 milhão de nós, ~200 MB): passando dele, saem
+primeiro os nós que o último lote não usou e depois os mais fundos.
 
 ### 5.4 Commit (`IndexBatch::commit`)
 
@@ -422,7 +446,7 @@ O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 falhar, nada muda: nem o banco, nem os contadores.
 
 A CLI faz commit a cada 1.000 documentos para limitar a memória: o lote guarda
-cada nó que tocou.
+os termos de todos os documentos até o commit.
 
 ### 5.5 O que o RocksDB faz depois
 
@@ -604,7 +628,7 @@ Detalhes que mantêm a interface rápida:
 | Arquivo | Peças principais |
 |---|---|
 | `src/lib.rs` | API pública: `Engine`, `Config`, `IndexBatch`, `Error`, `DocId` |
-| `src/text.rs` | `tokenize`, `normalize_term`, `strip_html` |
+| `src/text.rs` | `tokenize`, `index_terms`, `parse_query`, stopwords, `normalize_term`, `strip_html` |
 | `src/codec.rs` | `TrieNode` (`encode`/`decode`), `encode_postings`/`decode_postings`, varint |
 | `src/engine.rs` | `Engine::open` (opções do RocksDB), `batch`, `search`, `suggest`, `label`; `View` (leituras sobre snapshot); `IndexBatch` (`add_document`, `insert_term`, `node_mut`, `commit`); `merge_postings`, `intersect` |
 | `src/main.rs` | subcomandos `tui`, `index`, `search`, `suggest` |
@@ -636,7 +660,7 @@ engine.suggest("cor", 10)?;        // Vec<String>
 | Termo inexistente | até *L* + 1 `get`s | para no primeiro caractere que falta |
 | AND de *n* termos | *n* buscas + interseções | retorna cedo se algum termo não existe |
 | Prefixo | 1 `get` por nó visitado + 1 por lista | limitado a 256 termos |
-| Indexar um documento | tokenizar + 1 caminho na Trie por termo único | nós já no lote não são relidos |
+| Indexar um lote | tokenizar + 1 caminho na Trie por termo distinto do lote | nós no cache do escritor não são relidos |
 | Commit | 1 `WriteBatch` | escrita sequencial no WAL |
 
 **Ainda não existe:**

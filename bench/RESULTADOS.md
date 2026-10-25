@@ -2,7 +2,7 @@
 
 Gerado por `python3 scripts/perf.py relatorio --escala 10k` a partir de `bench/results/`. Cada seção mostra o resultado **mais recente** daquele tipo; as cargas mostram a **mediana** das últimas rodadas do mesmo commit (até 5), com a faixa mín–máx entre parênteses. O plano está em [docs/plano-performance.md](../docs/plano-performance.md).
 
-- Último resultado: `2026-10-25T21-14-38-64ca0c2-bench-pr-10k.json`
+- Último resultado: `2026-10-25T21-23-23-c3e98df-oracle-10k-todos.json`
 - Máquina: 12 núcleos, 7.883,2 MB de RAM, kernel `6.6.87.2-microsoft-standard-WSL2`
 
 ## Fase 1: corretude
@@ -42,30 +42,30 @@ Idempotência (10k): banco de 17,4 MB após uma carga, 27,2 MB após duas e 16,3
 
 | Fatia | Commit | Rodadas | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1k | `64ca0c2` | 4 | 1.3s | 759 (727–766) | 15,3 | 109,3 MB | 8,3 MB | 0,41 | 294.199 | 114.201 | 0,00 | 0,0s |
-| 10k | `64ca0c2` | 4 | 6.7s | 1.497 (1.460–1.614) | 13,9 | 247,6 MB | 21,6 MB | 0,23 | 728.495 | 288.203 | 0,53 | 0,0s |
+| 1k | `c3e98df` | 3 | 1.2s | 869 (828–871) | 17,6 | 109,2 MB | 8,3 MB | 0,41 | 294.199 | 114.201 | 0,00 | 0,0s |
+| 10k | `c3e98df` | 3 | 6.3s | 1.586 (1.451–1.707) | 14,7 | 247,5 MB | 21,6 MB | 0,23 | 728.495 | 288.203 | 0,53 | 0,0s |
 | 100k | `d314be1` | 1 | 1min23s | 1.206 | 5,7 | 264,7 MB | 86,8 MB | 0,18 | 2.118.335 | 871.185 | 0,80 | 0,0s |
 
 ### Experimentos (10k)
 
 | Experimento | docs/s | vs. padrão | Pico RSS | Banco |
 |---|---|---|---|---|
-| padrão (lote 1000) | 1.497 (1.460–1.614) | — | 247,6 MB | 21,6 MB |
-| lote-100 | 1.181 (1.166–1.211) | -21% | 218,5 MB | 35,7 MB |
-| lote-5000 | 1.855 (1.704–1.885) | +24% | 236,5 MB | 27,0 MB |
-| lote-10000 | 1.917 (1.860–1.923) | +28% | 238,7 MB | 24,3 MB |
-| ids-remapeados | 1.592 (1.515–1.604) | +6% | 245,2 MB | 21,0 MB |
-| cache-64mb | 1.578 (1.564–1.591) | +5% | 247,4 MB | 21,6 MB |
-| cache-1024mb | 1.315 (1.145–1.379) | -12% | 247,8 MB | 21,6 MB |
+| padrão (lote 1000) | 1.586 (1.451–1.707) | — | 247,5 MB | 21,6 MB |
+| lote-100 | 1.181 (1.166–1.211) | -26% | 218,5 MB | 35,7 MB |
+| lote-5000 | 1.855 (1.704–1.885) | +17% | 236,5 MB | 27,0 MB |
+| lote-10000 | 1.917 (1.860–1.923) | +21% | 238,7 MB | 24,3 MB |
+| ids-remapeados | 1.592 (1.515–1.604) | +0% | 245,2 MB | 21,0 MB |
+| cache-64mb | 1.578 (1.564–1.591) | -0% | 247,4 MB | 21,6 MB |
+| cache-1024mb | 1.315 (1.145–1.379) | -17% | 247,8 MB | 21,6 MB |
 | streaming-1k | 266 | — | 127,8 MB | 22,2 MB |
-| sem-cache-de-nos | 1.415 (1.321–1.472) | -5% | 156,0 MB | 21,6 MB |
+| sem-cache-de-nos | 1.415 (1.321–1.472) | -11% | 156,0 MB | 21,6 MB |
 
 ### Tamanhos (10k)
 
 | Espaço | Chaves | Chaves (MB) | Valores (MB) |
 |---|---|---|---|
 | `doc:` | 10.000 | 0,1 | 0,1 |
-| `meta:` | 2 | 0,0 | 0,0 |
+| `meta:` | 3 | 0,0 | 0,0 |
 | `node:` | 728.495 | 7,5 | 4,2 |
 | `post:` | 288.203 | 3,0 | 6,4 |
 
@@ -147,7 +147,7 @@ O cache LRU se divide em 64 partes. Um bloco maior que uma parte (cache ÷ 64) n
 |---|---|---|
 | Divergências do oráculo | 0 | **0** |
 | Carga sem swap (aumento < 64 MB) | sim | **sim** |
-| docs/s na carga de 10k | 1.497 | |
+| docs/s na carga de 10k | 1.586 | |
 | Banco ÷ texto bruto | 0,23 | |
 | p99 de `titulos` (quente) | 275 µs | |
 | p99 de `t-freq` (quente) | 92 µs | |

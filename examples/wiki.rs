@@ -321,7 +321,8 @@ fn git_commit() -> String {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     let hash = run(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "desconhecido".into());
-    let dirty = run(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    // bench/ fica de fora: o perf.py regrava consultas, baseline e relatório no meio da rodada.
+    let dirty = run(&["status", "--porcelain", "--untracked-files=no", "--", ".", ":!bench"]).is_some_and(|s| !s.is_empty());
     if dirty { format!("{hash}-modificado") } else { hash }
 }
 

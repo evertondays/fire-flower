@@ -1,6 +1,6 @@
-# Plano de Validação de Performance — vsfts (Rust + RocksDB)
+# Plano de Validação de Performance — fire-flower (Rust + RocksDB)
 
-Plano incremental para medir, validar e otimizar o **vsfts** usando a
+Plano incremental para medir, validar e otimizar o **fire-flower** usando a
 **Wikipédia em português** (1,1 milhão de artigos, já baixada) como carga
 principal.
 
@@ -20,6 +20,54 @@ principal.
 - Foram considerados os limites da máquina: WSL2, 7,7 GB de RAM e 12 núcleos.
 
 ---
+
+## Como rodar
+
+Tudo está implementado em `examples/wiki.rs` (o harness) e orquestrado por
+`scripts/perf.py`. A escala define a maior fatia usada; comece pequeno, porque
+a Wikipédia inteira leva mais de uma hora.
+
+```bash
+python3 scripts/perf.py tudo --escala 10k     # todas as fases, ~7 min
+python3 scripts/perf.py pr --escala 10k       # checagem rápida contra a linha de base
+python3 scripts/perf.py relatorio --escala 10k
+```
+
+Os resultados ficam em `bench/results/` (um JSON por medição, com commit e
+data) e o resumo legível em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
+
+## Achados da primeira linha de base (escala 10k, 25/10/2026)
+
+Números em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
+
+1. **Corretude:** zero divergências do oráculo em todos os 288 mil termos, 5
+   mil consultas AND, 2 mil prefixos e autocompletares e mil títulos.
+   Idempotência, lotes vs. único e reabrir também batem.
+2. **Prefixo incompleto é a regra, não a exceção:** cerca de metade dos
+   prefixos sorteados casa mais de 256 termos, e o resultado de `pre*` fica
+   incompleto. Já com 10k documentos.
+3. **Custo por caractere confirmado:** Gets por consulta = comprimento + 2
+   (`t-len-3` → 5, `t-len-8` → 10, `t-len-15` → 17). Prefixos curtos fazem de
+   640 a 840 Gets e levam ~2 ms. É o argumento medido para o índice ordenado
+   `term:<palavra>`.
+4. **Merge pendente pesa:** antes da compactação, `t-freq` tem p50 de 85 µs;
+   depois, 60 µs (−30%). Reindexar a fatia dobra o banco (17,6 → 27,6 MB) até
+   compactar (16,3 MB).
+5. **Risco para a escala 1,1M, o block cache:** com 64 MB, toda leitura vai ao
+   disco (~1 block read por Get, p50 15× pior), mesmo com o banco de 16 MB
+   cabendo no cache. O cache LRU se divide em 64 partes, e o filtro de Bloom
+   do SST (~1,3 MB num bloco só) não cabe numa parte de 1 MB. Com 256 MB as
+   partes têm 4 MB e cabe. Na Wikipédia inteira os SSTs são maiores e o filtro
+   pode passar de 4 MB. Candidatos: filtros particionados
+   (`set_partition_filters`), menos partes no cache, ou filtros fora do cache.
+6. **Lotes maiores indexam mais rápido:** lote de 10.000 dá +26% docs/s, mas
+   o pico de RSS vai de 160 para 300 MB.
+7. **Leitura escala:** `misto` vai de 4,9 mil qps (1 thread) a 30,6 mil qps
+   (12 threads), 6,3×. Indexar ao mesmo tempo não mexeu no p99 nesta escala,
+   mas o volume escrito foi pequeno (1.000 docs).
+8. **Ruído:** docs/s variou ~10% entre execuções iguais (953 vs. 860). O
+   limite de 10% do `pr` pode dar falso alarme na carga; o p50 das buscas foi
+   mais estável.
 
 ## 1. O que estamos testando
 
@@ -153,13 +201,13 @@ Um único binário com subcomandos, todos lendo o JSONL:
 | Subcomando | O que faz | Saída |
 |---|---|---|
 | `load --db D --corpus F [--batch N] [--skip K] [--take N] [--remap-ids]` | indexa e imprime progresso a cada 10k docs (docs/s, MB/s, RSS, tamanho do banco) | `results/load-*.json` |
-| `vocab --corpus F` | tokeniza com `vsfts::text::tokenize` e conta df (em quantos docs) e comprimento de cada termo; confere IDs únicos | `vocab.tsv` |
+| `vocab --corpus F` | tokeniza com `fire_flower::text::tokenize` e conta df (em quantos docs) e comprimento de cada termo; confere IDs únicos | `vocab.tsv` |
 | `queries --vocab V --corpus F --seed 42` | gera os conjuntos da Fase 4 | `bench/queries/*.txt` |
 | `oracle --db D --corpus F` | compara o motor com um índice ingênuo em memória (Fase 1) | divergências |
 | `bench --db D --queries Q [--threads T] [--cold]` | roda as consultas e mede latência e PerfContext | `results/bench-*.json` |
 | `sizes --db D` | percorre o banco somando chaves e valores por espaço (`node:`, `post:`, `meta:`) e lista os 20 maiores valores | tabela |
 
-Usar `vsfts::text::tokenize` no `vocab` e no `oracle` garante que o oráculo
+Usar `fire_flower::text::tokenize` no `vocab` e no `oracle` garante que o oráculo
 normaliza exatamente como o motor.
 
 ---
@@ -221,7 +269,7 @@ compactação. Aí a Fase 6 entra direto na fatia em que a queda começou.
 
 ### Depois da carga total
 
-- **Tempo de abertura:** `hyperfine 'target/release/vsfts search ~/bench-db/ptwiki-full xyz'`,
+- **Tempo de abertura:** `hyperfine 'target/release/fire-flower search ~/bench-db/ptwiki-full xyz'`,
   medindo logo depois da carga e depois de um `compact()`.
 - **`wiki sizes`:** quanto ocupa `node:` vs. `post:`, o tamanho de `node:0`
   e quanto ocupam as listas de "de", "a", "o".
@@ -387,7 +435,7 @@ código à volta dele.
 ```
 
 - Compare o `readrandom` com o tempo por `Get` medido na Fase 4. A diferença é
-  o overhead do vsfts.
+  o overhead do fire-flower.
 
 ---
 
@@ -424,18 +472,20 @@ Definidas depois do primeiro baseline. A estrutura:
 ## 14. Checklist
 
 - [x] Baixar e converter a Wikipédia PT (1,1M artigos + fatias)
-- [ ] `.cargo/config.toml` com `jobs = 4`
-- [ ] Ganchos no `Engine`: estatísticas, propriedades, `compact()`
-- [ ] `examples/wiki.rs`: `load`, `vocab`, `queries`, `oracle`, `bench`, `sizes`
-- [ ] `vocab` sobre o corpus inteiro + confirmar IDs únicos
-- [ ] Gerar e versionar `bench/queries/`
-- [ ] **Fase 1:** oráculo com zero divergências
-- [ ] **Fase 2:** escada 1k → 1,1M preenchida
-- [ ] **Fase 4:** latência por conjunto + merge pendente vs. compactado
-- [ ] **Fase 6:** flamegraph de carga e busca, top 3 de cada
-- [ ] **Fase 5:** leitura durante escrita
-- [ ] Preencher as metas e salvar o baseline
+- [x] `.cargo/config.toml` com `jobs = 4`
+- [x] Ganchos no `Engine`: estatísticas, propriedades, `compact()`
+- [x] `examples/wiki.rs`: `load`, `vocab`, `queries`, `oracle`, `bench`, `sizes` (+ `digest` e `concurrent`)
+- [x] `scripts/perf.py`: fases, `pr`, `comparar` e `relatorio`, com `--escala`
+- [ ] `vocab` sobre o corpus inteiro + confirmar IDs únicos (feito na escala 10k: 0 IDs repetidos)
+- [x] Gerar e versionar `bench/queries/` (escala 10k)
+- [x] **Fase 1:** oráculo com zero divergências (10k, todos os termos)
+- [ ] **Fase 2:** escada 1k → 1,1M preenchida (1k, 10k e 100k feitos; falta 1,1M)
+- [x] **Fase 4:** latência por conjunto + merge pendente vs. compactado (10k)
+- [ ] **Fase 6:** flamegraph de carga e busca, top 3 de cada (precisa instalar o `samply`)
+- [x] **Fase 5:** leitura durante escrita (10k)
+- [x] Preencher as metas e salvar o baseline (10k: `bench/baseline-pr-10k.json`)
 - [ ] (Opcional) **Fase 7:** `db_bench`
+- [ ] Repetir na escala 100k e depois na 1,1M
 
 **Ordem sugerida:** ganchos + `wiki load` + `oracle` primeiro. A corretude na
 fatia de 10k sai no mesmo dia, e a escada de carga roda sozinha enquanto o

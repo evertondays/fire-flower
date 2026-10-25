@@ -557,7 +557,11 @@ def cmd_relatorio(scale):
         post_sets = {s["conjunto"]: s for s in post["conjuntos"]}
         a = {s["conjunto"]: s for s in (c64 or {}).get("conjuntos", [])}
         b = {s["conjunto"]: s for s in (c1g or {}).get("conjuntos", [])}
-        L += ["### Block cache (p50)", "", "| Conjunto | 64 MB | 256 MB | 1024 MB |", "|---|---|---|---|"]
+        L += ["### Block cache (p50)", "",
+              "O cache LRU se divide em 64 partes. Um bloco maior que uma parte (cache ÷ 64) não fica no cache: "
+              "se o filtro de Bloom de um SST passar desse tamanho, ele é relido a cada `get` (veja block reads "
+              "por consulta no JSON).", "",
+              "| Conjunto | 64 MB | 256 MB | 1024 MB |", "|---|---|---|---|"]
         for name in a or b:
             L.append(f"| `{name}` | {us(a.get(name, {}).get('p50_us'))} | {us(post_sets.get(name, {}).get('p50_us'))} | "
                      f"{us(b.get(name, {}).get('p50_us'))} |")
@@ -594,10 +598,11 @@ def cmd_relatorio(scale):
     t1 = {s["conjunto"]: s for s in (post or {}).get("conjuntos", [])}
     c4 = latest(R, "concurrent", f"{scale}-misto-t4")
     divs = sum(r["divergencias"] for r in oracles.values()) if oracles else None
-    swap = machine.get("swap_usado")
+    swap_growth = (load_scale or {}).get("swap_aumento")
+    swap_txt = "—" if swap_growth is None else ("sim" if swap_growth < 64 << 20 else f"não (+{mb(swap_growth)} MB)")
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
-          f"| Carga sem swap | {'—' if not load_scale else ('sim' if not swap else 'não')} | **sim** |",
+          f"| Carga sem swap (aumento < 64 MB) | {swap_txt} | **sim** |",
           f"| docs/s na carga de {scale} | {fmt(load_scale['docs_por_s']) if load_scale else '—'} | |",
           f"| Banco ÷ texto bruto | {fmt(load_scale['banco_por_texto'], 2) if load_scale else '—'} | |",
           f"| p99 de `titulos` (quente) | {us(t1.get('titulos', {}).get('p99_us'))} | |",

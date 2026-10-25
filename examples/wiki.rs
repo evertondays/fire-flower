@@ -355,6 +355,11 @@ fn machine() -> Value {
     })
 }
 
+/// Swap em uso no sistema inteiro, em bytes.
+fn swap_used() -> u64 {
+    machine()["swap_usado"].as_u64().unwrap_or(0)
+}
+
 fn config_json(config: &Config) -> Value {
     json!({
         "block_cache_bytes": config.block_cache_bytes,
@@ -436,6 +441,8 @@ fn load(
     let engine = Engine::open(db, config.clone())?;
     let corpus = Corpus::open(corpus_path, skip, take, remap_ids)?;
     let label = label.unwrap_or_else(|| format!("{}-b{batch_size}", stem(corpus_path)));
+    // O sistema pode já ter swap em uso; o que conta é o aumento durante a carga.
+    let swap_before = swap_used();
     let started = Instant::now();
     let (mut docs, mut bytes) = (0u64, 0u64);
     let mut window = (Instant::now(), 0u64, 0u64);
@@ -487,6 +494,7 @@ fn load(
         "chaves_estimadas": engine.property("rocksdb.estimate-num-keys").and_then(|v| v.parse::<u64>().ok()),
         "arquivos_l0": engine.property("rocksdb.num-files-at-level0").and_then(|v| v.parse::<u64>().ok()),
         "escrita": write_metrics(&engine),
+        "swap_aumento": swap_used().saturating_sub(swap_before),
     });
     println!(
         "{docs} docs em {secs:.1}s: {:.0} docs/s, {:.1} MB/s, pico RSS {:.0} MB, banco {:.0} MB ({:.2}× o texto)",

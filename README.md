@@ -134,6 +134,15 @@ consecutivos, então documentos com IDs próximos custam ~1 byte cada.
   filtros dentro do cache e os do nível 0 fixados nele;
 - compressão LZ4.
 
+## Performance
+
+O plano de medição está em [docs/plano-performance.md](docs/plano-performance.md)
+e os resultados mais recentes em [bench/RESULTADOS.md](bench/RESULTADOS.md).
+
+```bash
+python3 scripts/perf.py tudo --escala 10k
+```
+
 ## Diferenças em relação ao documento de design original
 
 1. **Listas de postagem com merge operator.** O documento faz ler → alterar →

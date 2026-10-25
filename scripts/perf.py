@@ -15,6 +15,10 @@
 `--escala` (1k, 10k, 100k ou full; padrão 10k) define a maior fatia do corpus
 usada. A Wikipédia inteira (full) leva mais de uma hora; comece pequeno.
 
+Cargas de até 10k docs rodam `--repeticoes` vezes (padrão 3) e o relatório usa
+a mediana: uma carga de 10k varia ±10% entre rodadas, e uma rodada só não
+separa uma melhoria pequena de sorte. Fatias maiores rodam uma vez.
+
 Bancos ficam em ~/bench-db/perf/ (FF_PERF_DB para mudar); o corpus em
 ~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados em bench/results/, com a escala
 no rótulo, então escalas diferentes não se misturam.
@@ -48,6 +52,12 @@ SLICES = {
     "full": ("ptwiki.jsonl", 1112246),
 }
 ORDER = list(SLICES)
+
+# Cargas de até este tamanho são repetidas; as maiores demoram demais.
+REPETIR_ATE_DOCS = 10_000
+REPETICOES = 3  # --repeticoes
+# Quantas rodadas recentes (do mesmo commit e rótulo) entram na mediana.
+MEDIANA_DE = 5
 
 ORANGE, BOLD, DIM, RED, GREEN, RESET = "\x1b[38;5;208m", "\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[32m", "\x1b[0m"
 
@@ -114,6 +124,21 @@ def digest(path):
     return json.loads(wiki("digest", "--db", path, capture=True))
 
 
+def reps(slice_name):
+    return REPETICOES if docs_in(slice_name) <= REPETIR_ATE_DOCS else 1
+
+
+def load_rounds(path, slice_name, label, *extra):
+    """Carrega a fatia `reps` vezes, cada uma num banco novo, com o mesmo rótulo.
+    O último banco fica em `path`."""
+    n = reps(slice_name)
+    for i in range(n):
+        if n > 1:
+            print(f"{DIM}rodada {i + 1} de {n}{RESET}")
+        fresh(path)
+        wiki("load", "--db", path, "--corpus", corpus(slice_name), *extra, "--label", label)
+
+
 def ensure_loaded(slice_name):
     """Banco da fatia; carrega se ainda não existir."""
     path = db(f"ptwiki-{slice_name}")
@@ -162,6 +187,27 @@ def latest(results, kind, label=None):
     return found[-1] if found else None
 
 
+def median_load(results, label):
+    """Carga mediana (por docs/s) entre as últimas MEDIANA_DE rodadas com o
+    rótulo, todas do mesmo commit da mais recente. Ganha `_rodadas`, `_min` e `_max`."""
+    last = latest(results, "load", label)
+    if not last:
+        return None
+    runs = [r for r in results if r.get("tipo") == "load" and r.get("rotulo") == label
+            and r.get("commit") == last.get("commit")][-MEDIANA_DE:]
+    runs.sort(key=lambda r: r["docs_por_s"])
+    mid = dict(runs[(len(runs) - 1) // 2])
+    mid.update(_rodadas=len(runs), _min=runs[0]["docs_por_s"], _max=runs[-1]["docs_por_s"])
+    return mid
+
+
+def docs_s(r):
+    """docs/s com a faixa entre rodadas, quando houver mais de uma."""
+    if r.get("_rodadas", 1) > 1:
+        return f"{fmt(r['docs_por_s'])} ({fmt(r['_min'])}–{fmt(r['_max'])})"
+    return fmt(r["docs_por_s"])
+
+
 def can_drop_caches():
     return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
 
@@ -173,8 +219,7 @@ def fase_escada(scale, experimentos=False):
     for s in ORDER[: ORDER.index(scale) + 1]:
         step(f"escada: carga {s}")
         path = db(f"ptwiki-{s}")
-        fresh(path)
-        wiki("load", "--db", path, "--corpus", corpus(s), "--batch", 1000, "--label", f"ptwiki-{s}")
+        load_rounds(path, s, f"ptwiki-{s}", "--batch", 1000)
         wiki("sizes", "--db", path)
     if experimentos:
         fase_experimentos(scale)
@@ -188,11 +233,11 @@ def fase_experimentos(scale):
     runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 5000, 10000, 50000) if b <= n]
     runs += [("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
              ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
-             ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024])]
+             ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024]),
+             ("sem-cache-de-nos", ["--batch", 1000, "--cache-nos", 0])]
     for label, extra in runs:
         step(f"experimento {s}: {label}")
-        fresh(tmp)
-        wiki("load", "--db", tmp, "--corpus", corpus(s), *extra, "--label", f"exp-{s}-{label}")
+        load_rounds(tmp, s, f"exp-{s}-{label}", *extra)
         if label == "ids-remapeados":
             wiki("sizes", "--db", tmp)
     stream = smaller(s, "10k") if s != "10k" else "1k"
@@ -353,15 +398,14 @@ def fase_pr(scale, salvar_baseline=False):
     wiki("load", "--db", tmp_small, "--corpus", corpus(small), "--label", f"pr-oraculo-{small}")
     ok = wiki("oracle", "--db", tmp_small, "--corpus", corpus(small), "--label", f"pr-{small}", check=False) == 0
     step(f"pr: carga {scale} + bench")
-    fresh(tmp_big)
-    wiki("load", "--db", tmp_big, "--corpus", corpus(scale), "--label", f"pr-{scale}")
+    load_rounds(tmp_big, scale, f"pr-{scale}")
     bench(tmp_big, scale, ["t-medio", "t-freq", "p-2"], f"pr-{scale}")
     for p in (tmp_small, tmp_big):
         shutil.rmtree(p, ignore_errors=True)
 
     results = load_results()
     current = latest(results, "bench", f"pr-{scale}")
-    load_now = latest(results, "load", f"pr-{scale}")
+    load_now = median_load(results, f"pr-{scale}")
     if salvar_baseline or not os.path.exists(baseline_path):
         with open(baseline_path, "w") as f:
             json.dump({"bench": current, "load": load_now}, f, indent=2, ensure_ascii=False)
@@ -371,7 +415,8 @@ def fase_pr(scale, salvar_baseline=False):
         base = json.load(f)
     worse = compare_bench(base["bench"], current)
     docs_base, docs_now = base["load"]["docs_por_s"], load_now["docs_por_s"]
-    print(f"\ncarga {scale}: {docs_base:.0f} → {docs_now:.0f} docs/s ({pct(docs_now, docs_base):+.1f}%)")
+    print(f"\ncarga {scale}: {docs_base:.0f} → {docs_now:.0f} docs/s ({pct(docs_now, docs_base):+.1f}%, "
+          f"mediana de {load_now.get('_rodadas', 1)})")
     if not ok:
         print(f"{RED}✗ oráculo divergiu{RESET}")
     if worse:
@@ -461,7 +506,8 @@ def cmd_relatorio(scale):
         f"# Resultados de performance (escala {scale})",
         "",
         f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `bench/results/`. "
-        "Cada seção mostra o resultado **mais recente** daquele tipo. O plano está em "
+        "Cada seção mostra o resultado **mais recente** daquele tipo; as cargas mostram a **mediana** das "
+        f"últimas rodadas do mesmo commit (até {MEDIANA_DE}), com a faixa mín–máx entre parênteses. O plano está em "
         "[docs/plano-performance.md](../docs/plano-performance.md).",
         "",
         f"- Último resultado: `{R[-1]['_arquivo']}`",
@@ -496,16 +542,16 @@ def cmd_relatorio(scale):
 
     # Fase 2
     L += ["## Fase 2: escada de indexação", "",
-          "| Fatia | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |",
-          "|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| Fatia | Rodadas | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in ORDER:
-        r = latest(R, "load", f"ptwiki-{s}")
+        r = median_load(R, f"ptwiki-{s}")
         if not r:
             continue
         sz = latest(R, "sizes", f"ptwiki-{s}")
         terms = next((e["chaves"] for e in sz["espacos"] if e["espaco"] == "post"), None) if sz else None
         w = r.get("escrita") or {}
-        L.append(f"| {s} | {dur(r['segundos'])} | {fmt(r['docs_por_s'])} | {fmt(r['mb_por_s'], 1)} | "
+        L.append(f"| {s} | {r['_rodadas']} | {dur(r['segundos'])} | {docs_s(r)} | {fmt(r['mb_por_s'], 1)} | "
                  f"{mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB | {fmt(r['banco_por_texto'], 2)} | "
                  f"{fmt(r['nos_trie'])} | {fmt(terms)} | {fmt(w.get('write_amp'), 2)} | "
                  f"{fmt((w.get('stall_micros') or 0) / 1e6, 1)}s |")
@@ -515,15 +561,15 @@ def cmd_relatorio(scale):
     exps = {}
     for r in R:
         if r.get("tipo") == "load" and r.get("rotulo", "").startswith(prefix):
-            exps[r["rotulo"][len(prefix):]] = r
+            exps[r["rotulo"][len(prefix):]] = median_load(R, r["rotulo"])
     if exps:
-        base = latest(R, "load", f"ptwiki-{exp_slice}")
+        base = median_load(R, f"ptwiki-{exp_slice}")
         L += [f"### Experimentos ({exp_slice})", "", "| Experimento | docs/s | vs. padrão | Pico RSS | Banco |", "|---|---|---|---|---|"]
         if base:
-            L.append(f"| padrão (lote 1000) | {fmt(base['docs_por_s'])} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
+            L.append(f"| padrão (lote 1000) | {docs_s(base)} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
         for label, r in exps.items():
             vs = f"{pct(r['docs_por_s'], base['docs_por_s']):+.0f}%" if base and "streaming" not in label else "—"
-            L.append(f"| {label} | {fmt(r['docs_por_s'])} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")
+            L.append(f"| {label} | {docs_s(r)} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")
         L.append("")
     sz = latest(R, "sizes", f"ptwiki-{scale}")
     if sz:
@@ -594,7 +640,7 @@ def cmd_relatorio(scale):
         L.append("")
 
     # Metas
-    load_scale = latest(R, "load", f"ptwiki-{scale}")
+    load_scale = median_load(R, f"ptwiki-{scale}")
     t1 = {s["conjunto"]: s for s in (post or {}).get("conjuntos", [])}
     c4 = latest(R, "concurrent", f"{scale}-misto-t4")
     divs = sum(r["divergencias"] for r in oracles.values()) if oracles else None
@@ -619,9 +665,12 @@ def cmd_relatorio(scale):
 # ------------------------------------------------------------------------ main
 
 def main():
+    global REPETICOES
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--escala", choices=ORDER, default="10k",
                         help="maior fatia do corpus usada (padrão: 10k)")
+    common.add_argument("--repeticoes", type=int, default=REPETICOES,
+                        help=f"rodadas de cada carga de até {REPETIR_ATE_DOCS} docs (padrão: {REPETICOES})")
     p = argparse.ArgumentParser(description="Plano de performance do fire-flower")
     sub = p.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("escada", parents=[common], help="Fase 2")
@@ -642,6 +691,7 @@ def main():
         return cmd_comparar(args)
     if args.cmd == "relatorio":
         return cmd_relatorio(args.escala)
+    REPETICOES = max(1, args.repeticoes)
     scale = args.escala
     build()
     started = time.time()

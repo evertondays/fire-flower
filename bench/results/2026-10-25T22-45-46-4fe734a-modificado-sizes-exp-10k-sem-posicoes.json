@@ -1,0 +1,159 @@
+{
+  "commit": "4fe734a-modificado",
+  "db": "/home/evertondays/bench-db/perf/exp-10k-sem-posicoes",
+  "espacos": [
+    {
+      "bytes_chaves": 84626,
+      "bytes_valores": 146629,
+      "chaves": 10000,
+      "espaco": "doc"
+    },
+    {
+      "bytes_chaves": 100,
+      "bytes_valores": 19,
+      "chaves": 7,
+      "espaco": "meta"
+    },
+    {
+      "bytes_chaves": 7902335,
+      "bytes_valores": 4367493,
+      "chaves": 728495,
+      "espaco": "node"
+    },
+    {
+      "bytes_chaves": 123,
+      "bytes_valores": 26901,
+      "chaves": 19,
+      "espaco": "norm"
+    },
+    {
+      "bytes_chaves": 3117336,
+      "bytes_valores": 11598814,
+      "chaves": 288203,
+      "espaco": "post"
+    }
+  ],
+  "listas": {
+    "anos": 8453,
+    "area": 10265,
+    "historia": 8813,
+    "parte": 8489,
+    "populacao": 10071
+  },
+  "listas_pos": {},
+  "maiores": [
+    {
+      "bytes": 13563,
+      "chave": "post:243831",
+      "termo": "sao"
+    },
+    {
+      "bytes": 10265,
+      "chave": "post:24499",
+      "termo": "area"
+    },
+    {
+      "bytes": 10071,
+      "chave": "post:215917",
+      "termo": "populacao"
+    },
+    {
+      "bytes": 9720,
+      "chave": "post:100348",
+      "termo": "era"
+    },
+    {
+      "bytes": 9512,
+      "chave": "post:248721",
+      "termo": "ser"
+    },
+    {
+      "bytes": 9065,
+      "chave": "post:216480",
+      "termo": "portuguesa"
+    },
+    {
+      "bytes": 8929,
+      "chave": "post:130217",
+      "termo": "habitantes"
+    },
+    {
+      "bytes": 8813,
+      "chave": "post:135640",
+      "termo": "historia"
+    },
+    {
+      "bytes": 8489,
+      "chave": "post:204830",
+      "termo": "parte"
+    },
+    {
+      "bytes": 8453,
+      "chave": "post:19394",
+      "termo": "anos"
+    },
+    {
+      "bytes": 8351,
+      "chave": "post:164946",
+      "termo": "ligacoes"
+    },
+    {
+      "bytes": 8343,
+      "chave": "post:127284",
+      "termo": "grande"
+    },
+    {
+      "bytes": 8313,
+      "chave": "post:248100",
+      "termo": "sendo"
+    },
+    {
+      "bytes": 8279,
+      "chave": "post:109480",
+      "termo": "externas"
+    },
+    {
+      "bytes": 8233,
+      "chave": "post:394",
+      "termo": "1"
+    },
+    {
+      "bytes": 8207,
+      "chave": "post:200978",
+      "termo": "outros"
+    },
+    {
+      "bytes": 7887,
+      "chave": "post:1879",
+      "termo": "2"
+    },
+    {
+      "bytes": 7864,
+      "chave": "post:246396",
+      "termo": "seculo"
+    },
+    {
+      "bytes": 7764,
+      "chave": "post:118447",
+      "termo": "freguesia"
+    },
+    {
+      "bytes": 7695,
+      "chave": "post:158292",
+      "termo": "km2"
+    }
+  ],
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3803721728,
+    "ram_total": 8266137600,
+    "swap_usado": 1074614272
+  },
+  "nos_trie": 728495,
+  "posicoes": false,
+  "quando": "2026-10-25T22-45-46",
+  "raiz_bytes": 4991,
+  "rotulo": "exp-10k-sem-posicoes",
+  "tipo": "sizes"
+}

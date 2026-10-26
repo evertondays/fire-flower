@@ -76,6 +76,10 @@ enum Cmd {
         /// Cria o banco sem posições (sem busca por frase)
         #[arg(long)]
         sem_posicoes: bool,
+        /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
+        /// colapso da carga quando o filtro passa de uma parte do block cache
+        #[arg(long)]
+        filtro_inteiro: bool,
         #[arg(long)]
         label: Option<String>,
     },
@@ -197,10 +201,18 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, filtro_inteiro, label } => {
             let languages = idiomas.as_deref().map(parse_languages).transpose()?;
-            let positions = sem_posicoes.then_some(false);
-            load(&db, &corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, languages, positions, label)
+            let config = Config {
+                block_cache_bytes: cache_mb << 20,
+                writer_cache_nodes: cache_nos.unwrap_or(Config::default().writer_cache_nodes),
+                languages,
+                positions: sem_posicoes.then_some(false),
+                partition_filters: !filtro_inteiro,
+                statistics: true,
+                ..Config::default()
+            };
+            load(&db, &corpus, batch, skip, take, remap_ids, streaming, config, label)
         }
         Cmd::Vocab { corpus, idiomas, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&idiomas)?), take, out),
         Cmd::Queries { vocab, corpus, idiomas, seed, per_set, out } => {
@@ -411,6 +423,7 @@ fn config_json(config: &Config) -> Value {
         "reader_cache_depth": config.reader_cache_depth,
         "languages": config.languages.as_ref().map(|l| l.iter().map(|l| l.code()).collect::<Vec<_>>()),
         "positions": config.positions,
+        "partition_filters": config.partition_filters,
         "bm25_k1": config.bm25_k1,
         "bm25_b": config.bm25_b,
     })
@@ -480,18 +493,10 @@ fn load(
     skip: u64,
     take: Option<u64>,
     remap_ids: bool,
-    cache_mb: usize,
     streaming: bool,
-    cache_nodes: Option<usize>,
-    languages: Option<Vec<Language>>,
-    positions: Option<bool>,
+    config: Config,
     label: Option<String>,
 ) -> AnyResult {
-    let mut config =
-        Config { block_cache_bytes: cache_mb << 20, statistics: true, languages, positions, ..Config::default() };
-    if let Some(n) = cache_nodes {
-        config.writer_cache_nodes = n;
-    }
     let engine = Engine::open(db, config.clone())?;
     let corpus = Corpus::open(corpus_path, skip, take, remap_ids)?;
     let label = label.unwrap_or_else(|| format!("{}-b{batch_size}", stem(corpus_path)));
@@ -499,7 +504,7 @@ fn load(
     let swap_before = swap_used();
     let started = Instant::now();
     let (mut docs, mut bytes) = (0u64, 0u64);
-    let mut window = (Instant::now(), 0u64, 0u64);
+    let mut monitor = LoadMonitor::new(&engine);
     let mut batch = (!streaming).then(|| engine.batch());
 
     for doc in corpus {
@@ -509,7 +514,9 @@ fn load(
                 b.add_document(doc.id, &doc.body)?;
                 b.set_label(doc.id, &doc.title);
                 if b.len() >= batch_size {
+                    let t = Instant::now();
                     batch.take().unwrap().commit()?;
+                    monitor.commit_secs += t.elapsed().as_secs_f64();
                     batch = Some(engine.batch());
                 }
             }
@@ -517,23 +524,14 @@ fn load(
         }
         docs += 1;
         bytes += doc.bytes as u64;
-        if docs.is_multiple_of(10_000) {
-            let dt = window.0.elapsed().as_secs_f64();
-            let (cur, _) = rss();
-            eprintln!(
-                "{docs:>9} docs  {:>7.0} docs/s  {:>6.1} MB/s  RSS {:>6.0} MB  banco {:>7.0} MB  ({:.0}s)",
-                (docs - window.1) as f64 / dt,
-                mb(bytes - window.2) / dt,
-                mb(cur),
-                mb(dir_size(db)),
-                started.elapsed().as_secs_f64()
-            );
-            window = (Instant::now(), docs, bytes);
+        if docs.is_multiple_of(LOAD_WINDOW) {
+            monitor.window(&engine, db, docs, bytes, started);
         }
     }
     if let Some(b) = batch {
         b.commit()?;
     }
+    let collapse = monitor.collapse();
     let secs = started.elapsed().as_secs_f64();
     let (_, peak) = rss();
     let db_bytes = dir_size(db);
@@ -551,6 +549,7 @@ fn load(
         "arquivos_l0": engine.property("rocksdb.num-files-at-level0").and_then(|v| v.parse::<u64>().ok()),
         "escrita": write_metrics(&engine),
         "swap_aumento": swap_used().saturating_sub(swap_before),
+        "janelas": monitor.windows, "colapso": collapse,
     });
     println!(
         "{docs} docs em {secs:.1}s: {:.0} docs/s, {:.1} MB/s, pico RSS {:.0} MB, banco {:.0} MB ({:.2}× o texto)",
@@ -562,6 +561,92 @@ fn load(
     );
     save_result("load", &label, result)?;
     Ok(())
+}
+
+/// Documentos por janela do monitor da carga.
+const LOAD_WINDOW: u64 = 10_000;
+
+/// Acompanha a carga janela a janela: velocidade e os sinais que explicam uma
+/// queda (leituras do escritor, filtros relidos, travamento de escrita do
+/// RocksDB, nível 0, memória). Foi assim que se achou o colapso da carga
+/// inteira: filtros de Bloom maiores que uma parte do block cache.
+struct LoadMonitor {
+    at: Instant,
+    docs: u64,
+    bytes: u64,
+    reads: u64,
+    /// Segundos dentro de `commit` desde o começo da janela.
+    commit_secs: f64,
+    tickers: HashMap<String, u64>,
+    windows: Vec<Value>,
+}
+
+impl LoadMonitor {
+    fn new(engine: &Engine) -> Self {
+        Self {
+            at: Instant::now(),
+            docs: 0,
+            bytes: 0,
+            reads: fire_flower::internals::reads_on_this_thread(),
+            commit_secs: 0.0,
+            tickers: engine.rocksdb_stats().map(|s| tickers(&s)).unwrap_or_default(),
+            windows: Vec::new(),
+        }
+    }
+
+    fn window(&mut self, engine: &Engine, db: &Path, docs: u64, bytes: u64, started: Instant) {
+        let dt = self.at.elapsed().as_secs_f64().max(1e-9);
+        let now = engine.rocksdb_stats().map(|s| tickers(&s)).unwrap_or_default();
+        let delta = |k: &str| now.get(k).copied().unwrap_or(0).saturating_sub(self.tickers.get(k).copied().unwrap_or(0));
+        let reads = fire_flower::internals::reads_on_this_thread();
+        let prop = |name: &str| engine.property(name).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let n = (docs - self.docs).max(1) as f64;
+        let (cur, _) = rss();
+        let w = json!({
+            "docs": docs, "segundos": started.elapsed().as_secs_f64(),
+            "docs_por_s": (docs - self.docs) as f64 / dt, "mb_por_s": mb(bytes - self.bytes) / dt,
+            "commit_fracao": self.commit_secs / dt,
+            "gets_por_doc": (reads - self.reads) as f64 / n,
+            "filtro_mb": mb(delta("rocksdb.block.cache.filter.bytes.insert")),
+            "filtro_miss": delta("rocksdb.block.cache.filter.miss"),
+            "dados_miss": delta("rocksdb.block.cache.data.miss"),
+            "stall_s": delta("rocksdb.stall.micros") as f64 / 1e6,
+            "l0": prop("rocksdb.num-files-at-level0"),
+            "compactacao_pendente_mb": mb(prop("rocksdb.estimate-pending-compaction-bytes")),
+            "rss_mb": mb(cur), "ram_livre_mb": mb(machine()["ram_livre"].as_u64().unwrap_or(0)),
+            "swap_mb": mb(swap_used()), "banco_mb": mb(dir_size(db)),
+        });
+        let f = |k: &str| w[k].as_f64().unwrap_or(0.0);
+        eprintln!(
+            "{docs:>9} docs {:>6.0} docs/s {:>5.1} MB/s | commit {:>3.0}% Gets/doc {:>5.0} filtro {:>8.0} MB stall {:>4.1}s L0 {:>2} | RSS {:>5.0} MB livre {:>5.0} MB banco {:>6.0} MB ({:.0}s)",
+            f("docs_por_s"), f("mb_por_s"), f("commit_fracao") * 100.0, f("gets_por_doc"), f("filtro_mb"),
+            f("stall_s"), f("l0"), f("rss_mb"), f("ram_livre_mb"), f("banco_mb"), f("segundos")
+        );
+        self.windows.push(w);
+        *self = Self { at: Instant::now(), docs, bytes, reads, commit_secs: 0.0, tickers: now, windows: std::mem::take(&mut self.windows) };
+    }
+
+    /// A primeira janela com MB/s abaixo de 20% da mediana das 10 anteriores
+    /// (MB/s e não docs/s: o tamanho dos artigos varia muito ao longo do corpus).
+    fn collapse(&self) -> Value {
+        let speed = |w: &Value| w["mb_por_s"].as_f64().unwrap_or(0.0);
+        for i in 3..self.windows.len() {
+            let mut before: Vec<f64> = self.windows[i.saturating_sub(10)..i].iter().map(speed).collect();
+            before.sort_by(f64::total_cmp);
+            let median = before[before.len() / 2];
+            let w = &self.windows[i];
+            if speed(w) < 0.2 * median {
+                eprintln!(
+                    "\n⚠ colapso em {} docs: {:.1} → {:.1} MB/s; filtro relido {:.0} MB, Gets/doc {:.0}, stall {:.1}s, L0 {}, RAM livre {:.0} MB",
+                    w["docs"], median, speed(w), w["filtro_mb"].as_f64().unwrap_or(0.0),
+                    w["gets_por_doc"].as_f64().unwrap_or(0.0), w["stall_s"].as_f64().unwrap_or(0.0), w["l0"],
+                    w["ram_livre_mb"].as_f64().unwrap_or(0.0)
+                );
+                return json!({ "docs": w["docs"], "mb_por_s_antes": median, "janela": w });
+            }
+        }
+        Value::Null
+    }
 }
 
 // ================================================================== vocab

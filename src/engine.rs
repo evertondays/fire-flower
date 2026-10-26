@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use rocksdb::{BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
+use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
 use crate::codec::{self, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, TrieNode};
@@ -114,6 +114,11 @@ pub struct Config {
     /// faz o `open` falhar. Sem posições o banco fica menor e a carga mais
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
+    /// Filtros de Bloom e índices dos SSTs em partições de 4 KB (ligado por
+    /// padrão). Desligar volta ao filtro inteiro, que num banco grande passa
+    /// do tamanho de uma parte do block cache e é relido a cada `Get`; existe
+    /// só para medir esse efeito (`wiki load --filtro-inteiro`).
+    pub partition_filters: bool,
     /// Parâmetro `k1` do BM25: quanto a nota cresce com a frequência do termo.
     pub bm25_k1: f64,
     /// Parâmetro `b` do BM25: quanto o tamanho do documento pesa (0 a 1).
@@ -131,6 +136,7 @@ impl Default for Config {
             reader_cache_depth: Some(2),
             languages: None,
             positions: None,
+            partition_filters: true,
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,
             bm25_b: 0.75,
@@ -259,6 +265,18 @@ impl Engine {
         table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
         table.set_cache_index_and_filter_blocks(true);
         table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // Filtro e índice em partições de 4 KB, com um índice de topo fixo no
+        // cache. O cache LRU se divide em até 64 partes (4 MB com 256 MB), e um
+        // bloco maior que uma parte não fica nele. Com filtro inteiro, um SST de
+        // chaves `node:` gerado pela compactação passa de 6 MB de filtro na
+        // Wikipédia inteira: cada `Get` relia o filtro todo e a carga caía de
+        // ~5.000 para ~200 artigos/s (teste `bloom_filters_larger_than_...`).
+        if config.partition_filters {
+            table.set_partition_filters(true);
+            table.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+            table.set_metadata_block_size(4096);
+            table.set_pin_top_level_index_and_filter(true);
+        }
 
         let mut opts = Options::default();
         opts.create_if_missing(true);

@@ -139,6 +139,21 @@ Duas peças tornam esse caminho rápido, e as duas estão ligadas no nosso
   os primeiros níveis da Trie são lidos por *toda* busca, então ficam sempre
   no cache e custam microssegundos.
 
+Os filtros e os índices dos SSTs também moram no block cache, e aqui há uma
+armadilha: o cache LRU se divide em até 64 partes (de pelo menos 512 KB), e um
+bloco maior que uma parte **não fica no cache**. Por padrão o filtro de um SST
+é um bloco só, do tamanho de 10 bits por chave. Na Wikipédia inteira, a
+compactação gera SSTs de 64 MB só com chaves `node:` (pequenas e muitas), com
+filtro de ~6 MB, maior que as partes de 4 MB de um cache de 256 MB. A partir
+do momento em que o primeiro desses arquivos aparece, toda leitura que passa
+por ele relê e redecodifica os 6 MB do filtro. Foi o que derrubava a carga de
+~5.000 para ~200 artigos/s, em pontos diferentes a cada rodada (depende de
+quando a compactação gera o arquivo). Por isso o `Engine::open` usa filtros e
+índices **particionados**: blocos de 4 KB, mais um índice de topo pequeno
+fixado no cache. O teste `bloom_filters_larger_than_a_cache_shard_...`
+reproduz o problema em escala pequena, e `perf.py carga-longa` o vigia na
+carga inteira.
+
 ### Três recursos que o projeto usa de forma especial
 
 **WriteBatch (atomicidade).** Um commit de indexação grava centenas de nós e

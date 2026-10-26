@@ -10,6 +10,8 @@
     python3 scripts/perf.py concorrencia      # Fase 5: escala com threads e leitura durante escrita
     python3 scripts/perf.py pr                # Fase 8: checagem rápida; falha se o p50 piorar >10%
     python3 scripts/perf.py frases            # frases e ranking: carga com/sem posições, oráculo, latência
+    python3 scripts/perf.py carga-longa       # carga inteira janela a janela; falha se a velocidade colapsar
+                                              #   [--reproduzir: roda antes o cenário que colapsava]
     python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
     python3 scripts/perf.py comparar A.json B.json
 
@@ -526,6 +528,72 @@ def fase_frases(scale):
     return ok
 
 
+def fase_carga_longa(scale, reproduzir=False):
+    """Cenário do colapso da carga: a velocidade caía de ~5.000 para ~200
+    artigos/s em pontos diferentes (200k, 500k, 600k) da Wikipédia inteira.
+    Causa: filtros de Bloom de um bloco só, maiores que uma parte do block
+    cache (ver `bloom_filters_larger_than_...` em tests/engine.rs). O `wiki
+    load` acompanha a carga em janelas de 10k artigos e acusa a primeira cuja
+    velocidade (MB/s) cai abaixo de 20% da mediana das anteriores.
+
+    - estresse: 200k artigos com cache de 32 MB (partes de 512 KB), onde o
+      problema aparecia já com ~60k artigos;
+    - padrão: a fatia da escala, com a config padrão, como o
+      `carregar_wikipedia.py` (lote de 2000);
+    - com `--reproduzir`, antes, o estresse com filtro inteiro, que tem que
+      colapsar (confere que o cenário e o detector funcionam)."""
+    tmp = db("tmp-carga-longa")
+    runs = [("estresse-cache-32mb", "full", ["--take", 200000, "--cache-mb", 32], False),
+            (f"padrao-{scale}", scale, [], False)]
+    if reproduzir:
+        runs.insert(0, ("estresse-filtro-inteiro", "full", ["--take", 200000, "--cache-mb", 32, "--filtro-inteiro"], True))
+    ok, summary = True, []
+    for name, slice_name, extra, expect_collapse in runs:
+        label = f"carga-longa-{name}"
+        step(f"carga longa: {name}" + (" (tem que colapsar)" if expect_collapse else ""))
+        fresh(tmp)
+        wiki("load", "--db", tmp, "--corpus", corpus(slice_name), "--batch", 2000, *extra, "--label", label)
+        r = latest(load_results(), "load", label)
+        collapse = r.get("colapso")
+        good = bool(collapse) == expect_collapse
+        ok &= good
+        summary.append({"cenario": name, "rotulo": label, "esperava_colapso": expect_collapse, "ok": good,
+                        "colapso_em": collapse and collapse["docs"], "docs": r["docs"], "segundos": r["segundos"]})
+        print(f"  {GREEN + '✔' if good else RED + '✗'}{RESET} {name}: "
+              f"{'colapso em ' + fmt(collapse['docs']) + ' docs' if collapse else 'sem colapso'}, "
+              f"{fmt(r['docs'])} docs em {dur(r['segundos'])}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    save_result("carga-longa", scale, {"ok": ok, "cenarios": summary})
+    return ok
+
+
+def carga_longa_section(R, scale):
+    res = latest(R, "carga-longa", scale)
+    if not res:
+        return []
+    L = [f"## Carga longa ({scale})", "",
+         "Cenário do colapso da carga (filtros de Bloom maiores que uma parte do block cache). Uma janela "
+         "colapsa quando o MB/s cai abaixo de 20% da mediana das 10 anteriores.", "",
+         "| Cenário | Esperado | Resultado | Docs | Tempo | docs/s |", "|---|---|---|---|---|---|"]
+    for c in res["cenarios"]:
+        r = latest(R, "load", c["rotulo"]) or {}
+        got = f"colapso em {fmt(c['colapso_em'])} docs" if c["colapso_em"] else "sem colapso"
+        L.append(f"| {c['cenario']} | {'colapso' if c['esperava_colapso'] else 'sem colapso'} | "
+                 f"{'✅' if c['ok'] else '❌'} {got} | {fmt(c['docs'])} | {dur(c['segundos'])} | {fmt(r.get('docs_por_s'))} |")
+    L.append("")
+    main = next((latest(R, "load", c["rotulo"]) for c in res["cenarios"] if c["cenario"].startswith("padrao")), None)
+    windows = (main or {}).get("janelas") or []
+    if windows:
+        step_ = max(1, len(windows) // 15)
+        L += ["### Janelas da carga padrão", "",
+              "| Docs | MB/s | docs/s | commit | Gets/doc | filtro relido | stall | L0 | RSS |", "|---|---|---|---|---|---|---|---|---|"]
+        for w in windows[step_ - 1::step_]:
+            L.append(f"| {fmt(w['docs'])} | {fmt(w['mb_por_s'], 1)} | {fmt(w['docs_por_s'])} | {fmt(w['commit_fracao'] * 100)}% | "
+                     f"{fmt(w['gets_por_doc'])} | {fmt(w['filtro_mb'])} MB | {fmt(w['stall_s'], 1)}s | {w['l0']} | {fmt(w['rss_mb'])} MB |")
+        L.append("")
+    return L
+
+
 # ------------------------------------------------------------------ comparação
 
 def pct(new, old):
@@ -750,6 +818,7 @@ def cmd_relatorio(scale):
         L.append("")
 
     L += frases_section(R, scale, post, oracles)
+    L += carga_longa_section(R, scale)
 
     # Metas
     load_scale = median_load(R, f"ptwiki-{scale}")
@@ -873,6 +942,8 @@ def main():
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
     pr.add_argument("--salvar-baseline", action="store_true")
+    cl = sub.add_parser("carga-longa", parents=[common], help="cenário do colapso da carga (padrão: escala full)")
+    cl.add_argument("--reproduzir", action="store_true", help="roda antes o cenário com filtro inteiro, que tem que colapsar")
     c = sub.add_parser("comparar", help="compara dois resultados de bench")
     c.add_argument("a")
     c.add_argument("b")
@@ -886,6 +957,8 @@ def main():
         return cmd_relatorio(args.escala)
     REPETICOES = max(1, args.repeticoes)
     scale = args.escala
+    if args.cmd == "carga-longa" and "--escala" not in sys.argv:
+        scale = "full"  # o colapso só aparece em cargas grandes
     build()
     started = time.time()
     ok = True
@@ -901,6 +974,8 @@ def main():
         fase_escada(scale, args.experimentos)
     elif args.cmd == "pr":
         ok = fase_pr(scale, args.salvar_baseline)
+    elif args.cmd == "carga-longa":
+        ok = fase_carga_longa(scale, args.reproduzir)
     else:
         result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
                   "concorrencia": fase_concorrencia, "frases": fase_frases}[args.cmd](scale)

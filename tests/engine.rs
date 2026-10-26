@@ -861,3 +861,75 @@ fn reader_node_cache_under_concurrent_commits() {
         assert_eq!(engine.search(t).unwrap(), [10 + i as u64]);
     }
 }
+
+// ====================================================================
+// Filtro de Bloom maior que uma parte do block cache.
+//
+// O block cache LRU se divide em até 64 partes de pelo menos 512 KB; um bloco
+// maior que uma parte não fica no cache. Se o filtro de um SST for um bloco
+// só, toda leitura que passa por esse SST relê o filtro inteiro. Na Wikipédia
+// inteira (cache de 256 MB, partes de 4 MB) a compactação gera SSTs de chaves
+// `node:` com filtros de ~6 MB, e a carga cai de ~5.000 para ~200 artigos/s
+// no momento em que o primeiro aparece. Aqui o mesmo mecanismo, em escala
+// pequena: cache de 1 MB (2 partes de 512 KB) e um SST com filtro de ~1 MB.
+
+/// Contador do RocksDB pelo nome, a partir do texto das estatísticas.
+fn ticker(engine: &Engine, name: &str) -> u64 {
+    let stats = engine.rocksdb_stats().expect("estatísticas ligadas");
+    stats
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(" COUNT : ")?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("contador {name} ausente"))
+}
+
+/// Bytes de filtro de Bloom que o RocksDB carregou no cache, por `Get`, em
+/// buscas sobre um SST com ~1 milhão de chaves e um cache de 1 MB.
+fn filter_bytes_per_get(partition_filters: bool) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config { block_cache_bytes: 1 << 20, statistics: true, partition_filters, ..Config::default() };
+    // Palavras aleatórias de 9 letras: quase sem prefixo comum, ~6 nós cada.
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let words: Vec<String> = (0..150_000)
+        .map(|_| {
+            (0..9)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    (b'a' + (rng % 26) as u8) as char
+                })
+                .collect()
+        })
+        .collect();
+    {
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
+        let mut batch = engine.batch();
+        for (i, chunk) in words.chunks(20).enumerate() {
+            batch.add_document(i as u64, &chunk.join(" ")).unwrap();
+        }
+        batch.commit().unwrap();
+        // Um SST só, com ~1 milhão de chaves: filtro de ~1 MB se for inteiro.
+        engine.compact();
+    }
+    let engine = Engine::open(dir.path(), config).unwrap();
+    let before = (ticker(&engine, "rocksdb.block.cache.filter.bytes.insert"), engine_reads());
+    for w in words.iter().step_by(71).take(2000) {
+        assert!(!engine.search(w).unwrap().is_empty(), "{w}");
+    }
+    let filter_bytes = ticker(&engine, "rocksdb.block.cache.filter.bytes.insert") - before.0;
+    filter_bytes / (engine_reads() - before.1).max(1)
+}
+
+#[test]
+fn bloom_filters_larger_than_a_cache_shard_are_not_reread_on_every_get() {
+    // O cenário reproduz o problema com o filtro inteiro (~1 MB relido por Get)...
+    let whole = filter_bytes_per_get(false);
+    assert!(whole > 256 << 10, "o cenário não reproduziu o problema: {whole} bytes de filtro por Get");
+    // ...e com partições de 4 KB o filtro fica no cache.
+    let partitioned = filter_bytes_per_get(true);
+    assert!(partitioned < 4096, "{partitioned} bytes de filtro carregados por Get (antes: {whole})");
+}
+
+fn engine_reads() -> u64 {
+    fire_flower::internals::reads_on_this_thread()
+}

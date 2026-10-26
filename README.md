@@ -172,6 +172,11 @@ em chaves separadas para que a busca comum não leia posições.
 - filtro de Bloom, 10 bits por chave (`Config::bloom_bits_per_key`);
 - block cache LRU de 256 MiB (`Config::block_cache_bytes`), com índices e
   filtros dentro do cache e os do nível 0 fixados nele;
+- filtros e índices **particionados** em blocos de 4 KB, com o nível de topo
+  fixado no cache. Sem isso, na Wikipédia inteira, um SST gerado pela
+  compactação tinha um filtro de ~6 MB num bloco só, maior que uma parte do
+  cache (o LRU se divide em 64 partes de 4 MB): cada leitura relia o filtro
+  inteiro, e a carga caía de ~5.000 para ~200 artigos/s;
 - compressão LZ4.
 
 ## Performance

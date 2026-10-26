@@ -63,8 +63,13 @@ Números em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
    cabendo no cache. O cache LRU se divide em 64 partes, e o filtro de Bloom
    do SST (~1,3 MB num bloco só) não cabe numa parte de 1 MB. Com 256 MB as
    partes têm 4 MB e cabe. Na Wikipédia inteira os SSTs são maiores e o filtro
-   pode passar de 4 MB. Candidatos: filtros particionados
-   (`set_partition_filters`), menos partes no cache, ou filtros fora do cache.
+   pode passar de 4 MB. **Confirmado e corrigido (25/10):** na carga inteira a
+   velocidade caía de ~5.000 para ~200 artigos/s em 200k, 500k ou 600k
+   artigos (quando a compactação gerava um SST de chaves `node:` com filtro de
+   ~6 MB); o RocksDB chegou a contar 22 TB de filtro inserido no cache. Agora
+   filtros e índices são particionados (blocos de 4 KB). Cenário de teste:
+   `perf.py carga-longa` (com `--reproduzir`, roda antes a config antiga, que
+   tem que colapsar) e o teste `bloom_filters_larger_than_a_cache_shard_...`.
 6. **Lotes maiores indexam mais rápido:** lote de 10.000 dá +26% docs/s, mas
    o pico de RSS vai de 160 para 300 MB.
 7. **Leitura escala:** `misto` vai de 4,9 mil qps (1 thread) a 30,6 mil qps

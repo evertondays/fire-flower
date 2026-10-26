@@ -44,7 +44,7 @@ enum Command {
         /// Arquivo .jsonl
         arquivo: PathBuf,
         /// Documentos por commit
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = 10000)]
         lote: usize,
         /// Pula as N primeiras linhas (para retomar uma carga interrompida)
         #[arg(long, default_value_t = 0)]

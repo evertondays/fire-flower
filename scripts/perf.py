@@ -63,6 +63,10 @@ REPETICOES = 3  # --repeticoes
 # Quantas rodadas recentes (do mesmo commit e rótulo) entram na mediana.
 MEDIANA_DE = 5
 
+# Artigos por commit nas cargas. Era 1000 até 26/10/2026; com 10 mil a carga
+# inteira cai de 242 s para ~115 s (docs/plano-performance.md, P2).
+LOTE = 10000
+
 # Conjuntos do `pr` (comparados com a linha de base) e das frases/ranking.
 PR_SETS = ["t-medio", "t-freq", "p-2", "rank-freq", "frase-2"]
 FRASE_SETS = ["t-freq", "rank-freq", "and-2", "rank-and", "titulos", "rank-titulos",
@@ -165,7 +169,7 @@ def ensure_loaded(slice_name):
     if not usable(path):
         step(f"carga {slice_name} (banco não existia ou era de outro formato)")
         fresh(path)
-        wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", 1000, "--label", f"ptwiki-{slice_name}")
+        wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", LOTE, "--label", f"ptwiki-{slice_name}")
     return path
 
 
@@ -247,7 +251,7 @@ def fase_escada(scale, experimentos=False):
     for s in ORDER[: ORDER.index(scale) + 1]:
         step(f"escada: carga {s}")
         path = db(f"ptwiki-{s}")
-        load_rounds(path, s, f"ptwiki-{s}", "--batch", 1000)
+        load_rounds(path, s, f"ptwiki-{s}", "--batch", LOTE)
         wiki("sizes", "--db", path)
     if experimentos:
         fase_experimentos(scale)
@@ -258,12 +262,12 @@ def fase_experimentos(scale):
     s = smaller(scale, "100k")
     n = docs_in(s)
     tmp = db("tmp-exp")
-    runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 5000, 10000, 50000) if b <= n]
-    runs += [("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
-             ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
-             ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024]),
-             ("sem-cache-de-nos", ["--batch", 1000, "--cache-nos", 0]),
-             ("sem-posicoes", ["--batch", 1000, "--sem-posicoes"])]
+    runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 1000, 5000, 50000) if b <= n]
+    runs += [("ids-remapeados", ["--batch", LOTE, "--remap-ids"]),
+             ("cache-64mb", ["--batch", LOTE, "--cache-mb", 64]),
+             ("cache-1024mb", ["--batch", LOTE, "--cache-mb", 1024]),
+             ("sem-cache-de-nos", ["--batch", LOTE, "--cache-nos", 0]),
+             ("sem-posicoes", ["--batch", LOTE, "--sem-posicoes"])]
     for label, extra in runs:
         step(f"experimento {s}: {label}")
         load_rounds(tmp, s, f"exp-{s}-{label}", *extra)
@@ -391,7 +395,7 @@ def fase_latencia(scale):
     path = db(f"ptwiki-{scale}")
     step(f"carga {scale} limpa (para medir antes da compactação)")
     fresh(path)
-    wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", 1000, "--label", f"ptwiki-{scale}")
+    wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", LOTE, "--label", f"ptwiki-{scale}")
 
     step("merge pendente: termos, títulos, frases e ranking antes da compactação")
     pre_open = open_time(path)
@@ -504,11 +508,11 @@ def fase_frases(scale):
     small = smaller(scale, "10k")
     path = db(f"ptwiki-{scale}")
     step(f"carga {scale} com posições")
-    load_rounds(path, scale, f"ptwiki-{scale}", "--batch", 1000)
+    load_rounds(path, scale, f"ptwiki-{scale}", "--batch", LOTE)
     sizes_of(path, f"ptwiki-{scale}")
     tmp = db("tmp-sem-posicoes")
     step(f"carga {scale} sem posições")
-    load_rounds(tmp, scale, f"exp-{smaller(scale, '100k')}-sem-posicoes", "--batch", 1000, "--sem-posicoes")
+    load_rounds(tmp, scale, f"exp-{smaller(scale, '100k')}-sem-posicoes", "--batch", LOTE, "--sem-posicoes")
     sizes_of(tmp, f"exp-{smaller(scale, '100k')}-sem-posicoes")
     compact_and_save(tmp, f"{smaller(scale, '100k')}-sem-posicoes")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -598,7 +602,7 @@ def fase_carga_longa(scale, reproduzir=False):
         label = f"carga-longa-{name}"
         step(f"carga longa: {name}" + (" (tem que colapsar)" if expect_collapse else ""))
         fresh(tmp)
-        wiki("load", "--db", tmp, "--corpus", corpus(slice_name), "--batch", 2000, *extra, "--label", label)
+        wiki("load", "--db", tmp, "--corpus", corpus(slice_name), "--batch", LOTE, *extra, "--label", label)
         r = latest(load_results(), "load", label)
         collapse = r.get("colapso")
         good = bool(collapse) == expect_collapse
@@ -790,7 +794,7 @@ def cmd_relatorio(scale):
         base = median_load(R, f"ptwiki-{exp_slice}")
         L += [f"### Experimentos ({exp_slice})", "", "| Experimento | docs/s | vs. padrão | Pico RSS | Banco |", "|---|---|---|---|---|"]
         if base:
-            L.append(f"| padrão (lote 1000) | {docs_s(base)} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
+            L.append(f"| padrão (lote {LOTE}) | {docs_s(base)} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
         for label, r in exps.items():
             vs = f"{pct(r['docs_por_s'], base['docs_por_s']):+.0f}%" if base and "streaming" not in label else "—"
             L.append(f"| {label} | {docs_s(r)} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")

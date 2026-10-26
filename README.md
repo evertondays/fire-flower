@@ -72,8 +72,11 @@ Por padrão lê `~/datasets/ptwiki/ptwiki.jsonl` e grava em
 `~/bench-db/ptwiki-full`, apagando o banco anterior (pede confirmação). O
 painel mostra artigos/s, MB/s, tempo restante, memória e tamanho do banco.
 `Ctrl+C` interrompe e mostra o comando `--pular N` para continuar de onde
-parou. No fim, um resumo vai para `~/bench-db/ptwiki-full.carga.json`. Veja
-`--help` para `--corpus`, `--banco`, `--lote` e `--compactar`.
+parou. No fim, o banco é compactado (~10 s; deixa as buscas 30–50% mais
+rápidas) e um resumo vai para `~/bench-db/ptwiki-full.carga.json`. A carga
+inteira leva ~2 minutos, com lotes de 10 mil artigos e pico de ~1,4 GB de
+memória. Veja `--help` para `--corpus`, `--banco`, `--lote` e
+`--sem-compactar`.
 
 Por baixo, o script chama:
 

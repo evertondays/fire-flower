@@ -51,7 +51,7 @@ enum Cmd {
         db: PathBuf,
         #[arg(long)]
         corpus: PathBuf,
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = 10000)]
         batch: usize,
         #[arg(long, default_value_t = 0)]
         skip: u64,

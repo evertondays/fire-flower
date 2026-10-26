@@ -265,11 +265,12 @@ def main():
     parser = argparse.ArgumentParser(description="Carrega a Wikipédia no fire-flower com painel de progresso.")
     parser.add_argument("--corpus", default="~/datasets/ptwiki/ptwiki.jsonl", help="arquivo .jsonl")
     parser.add_argument("--banco", default="~/bench-db/ptwiki-full", help="pasta do banco")
-    parser.add_argument("--lote", type=int, default=2000, help="artigos por commit (padrão: 2000)")
+    parser.add_argument("--lote", type=int, default=10000,
+                        help="artigos por commit (padrão: 10000; ~1,4 GB de pico na Wikipédia inteira)")
     parser.add_argument("--pular", type=int, default=0,
                         help="retoma a partir desta linha, sem apagar o banco")
-    parser.add_argument("--compactar", action="store_true",
-                        help="compacta o banco no fim (une as listas em pedaços; leva alguns minutos)")
+    parser.add_argument("--sem-compactar", action="store_true",
+                        help="não compacta no fim (compactar leva ~10 s e deixa as buscas 30–50%% mais rápidas)")
     parser.add_argument("--sim", action="store_true", help="não pede confirmação para apagar o banco")
     parser.add_argument("--sem-build", action="store_true", help="não roda o cargo build")
     parser.add_argument("--idiomas", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
@@ -367,7 +368,7 @@ def main():
         "corpus_bytes": last["bytes_total"],
     }
 
-    if args.compactar:
+    if not args.sem_compactar:
         print(f"{DIM}compactando…{RESET}", flush=True)
         t = time.time()
         subprocess.run([BINARY, "compact", banco], check=True, stdout=subprocess.DEVNULL)

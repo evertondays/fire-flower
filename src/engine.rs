@@ -96,9 +96,13 @@ pub struct Config {
     /// Custa um pouco de CPU; use em medições, não em produção.
     pub statistics: bool,
     /// Quantos nós da Trie o escritor mantém em memória entre um lote e
-    /// outro (~200 bytes cada). Sem isso, todo lote relê do banco a raiz e os
-    /// nós dos termos comuns. Passando do limite, saem primeiro os nós que o
-    /// último lote não usou e depois os mais fundos. 0 desliga o cache.
+    /// outro (~130 bytes cada; o cache só cresce até o tamanho da Trie).
+    /// Sem isso, todo lote relê do banco os nós dos termos que aparecem.
+    /// Passando do limite, ficam os usados mais recentemente. 0 desliga.
+    ///
+    /// 3 milhões (~400 MB) cobrem 40% da Trie da Wikipédia inteira (7,3 M
+    /// nós): a carga cai de 139 s para 115 s com lote de 10 mil, e as
+    /// leituras do escritor, de 7,5 para 1,7 por artigo.
     pub writer_cache_nodes: usize,
     /// Até que profundidade da Trie as buscas guardam os nós já decodificados,
     /// compartilhados entre elas (0 = só a raiz). Toda busca começa pela raiz,
@@ -165,7 +169,7 @@ impl Default for Config {
             bloom_bits_per_key: 10.0,
             max_prefix_terms: 256,
             statistics: false,
-            writer_cache_nodes: 1_000_000,
+            writer_cache_nodes: 3_000_000,
             reader_cache_depth: Some(2),
             languages: None,
             positions: None,

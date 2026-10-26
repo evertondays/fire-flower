@@ -11,16 +11,14 @@
 //! | `pos:<nó>` | `n`, `n × (Δdoc, k, k × Δposição)` (a primeira posição é absoluta) |
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
 
-use std::collections::BTreeMap;
-
 use crate::{DocId, Error, Posting};
 
 /// Nó da Trie, gravado em `node:<id>`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TrieNode {
-    /// Caractere -> ID do nó filho. `BTreeMap` mantém os filhos em ordem,
-    /// o que deixa o autocompletar em ordem alfabética.
-    pub children: BTreeMap<char, u64>,
+    /// Caractere -> ID do nó filho, em ordem de caractere (o que deixa o
+    /// autocompletar em ordem alfabética).
+    pub children: Children,
     /// O caminho da raiz até aqui forma uma palavra indexada. Nesse caso a
     /// lista de postagem fica em `post:<id deste nó>`.
     pub is_end_of_word: bool,
@@ -44,14 +42,75 @@ impl TrieNode {
         let mut r = Reader::new(bytes);
         let flags = r.byte()?;
         let n = r.varint()?;
-        let mut children = BTreeMap::new();
+        // Cada filho ocupa pelo menos 2 bytes: limita a pré-alocação a dados reais.
+        let mut children = Vec::with_capacity((n as usize).min(bytes.len() / 2));
         for _ in 0..n {
             let code = u32::try_from(r.varint()?).map_err(|_| corrupt("caractere inválido"))?;
             let ch = char::from_u32(code).ok_or_else(|| corrupt("caractere inválido"))?;
-            children.insert(ch, r.varint()?);
+            if children.last().is_some_and(|&(prev, _)| prev >= ch) {
+                return Err(corrupt("filhos fora de ordem"));
+            }
+            children.push((ch, r.varint()?));
         }
         r.finish()?;
+        let children = Children(children);
         Ok(Self { children, is_end_of_word: flags & FLAG_END_OF_WORD != 0 })
+    }
+}
+
+/// Filhos de um nó da Trie: um vetor ordenado por caractere.
+///
+/// Era um `BTreeMap`, que aloca um nó de ~200 bytes mesmo para um filho só, e
+/// a maioria dos nós da Trie tem um filho só. Com o vetor, o cache de nós do
+/// escritor e o das buscas guardam muito mais nós na mesma memória, e
+/// decodificar um nó é uma alocação de 16 bytes por filho. A busca do filho é
+/// binária; inserir no meio é O(n), mas só a raiz e os primeiros níveis têm
+/// muitos filhos.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Children(Vec<(char, u64)>);
+
+impl Children {
+    #[inline]
+    pub fn get(&self, ch: &char) -> Option<&u64> {
+        match self.0.as_slice() {
+            // A maioria dos nós tem um filho só.
+            [(c, id)] => (c == ch).then_some(id),
+            all => all.binary_search_by_key(ch, |e| e.0).ok().map(|i| &all[i].1),
+        }
+    }
+
+    /// Insere ou troca o filho de `ch`; devolve o anterior.
+    pub fn insert(&mut self, ch: char, id: u64) -> Option<u64> {
+        match self.0.binary_search_by_key(&ch, |e| e.0) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, id)),
+            Err(i) => {
+                self.0.insert(i, (ch, id));
+                None
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Em ordem de caractere.
+    pub fn iter(&self) -> ChildrenIter<'_> {
+        self.0.iter().map(|(ch, id)| (ch, id))
+    }
+}
+
+pub type ChildrenIter<'a> = std::iter::Map<std::slice::Iter<'a, (char, u64)>, fn(&'a (char, u64)) -> (&'a char, &'a u64)>;
+
+impl<'a> IntoIterator for &'a Children {
+    type Item = (&'a char, &'a u64);
+    type IntoIter = ChildrenIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -614,9 +673,17 @@ mod tests {
     #[test]
     fn node_roundtrip() {
         let mut node = TrieNode { is_end_of_word: true, ..Default::default() };
+        node.children.insert('z', u64::MAX);
         node.children.insert('a', 1);
         node.children.insert('ç', 300);
-        node.children.insert('z', u64::MAX);
+        assert_eq!(node.children.insert('a', 2), Some(1), "troca devolve o anterior");
+        assert_eq!(node.children.iter().map(|(c, _)| *c).collect::<String>(), "azç", "em ordem de caractere");
+        assert_eq!(node.children.get(&'a'), Some(&2));
+        assert_eq!(node.children.get(&'b'), None);
+        let mut one = TrieNode::default();
+        one.children.insert('x', 7);
+        assert_eq!((one.children.get(&'x'), one.children.get(&'y')), (Some(&7), None));
+        assert!(TrieNode::decode(&[0, 2, 0x62, 1, 0x61, 2]).is_err(), "filhos fora de ordem");
         assert_eq!(TrieNode::decode(&node.encode()).unwrap(), node);
         assert_eq!(TrieNode::decode(&TrieNode::default().encode()).unwrap(), TrieNode::default());
     }
@@ -754,7 +821,7 @@ mod tests {
                 })
                 .collect();
             // Resultado esperado: mapa doc -> (tf, posições) com o mais novo vencendo.
-            let mut expected: BTreeMap<DocId, Vec<u32>> = BTreeMap::new();
+            let mut expected: std::collections::BTreeMap<DocId, Vec<u32>> = std::collections::BTreeMap::new();
             for piece in &pieces {
                 for (d, ps) in piece {
                     expected.insert(*d, ps.clone());

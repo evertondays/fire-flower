@@ -1511,6 +1511,14 @@ pub struct CommitStats {
     pub total_secs: f64,
 }
 
+/// Caminho na Trie do último termo inserido no commit: `ids[d]` é o nó na
+/// profundidade `d` (`ids[0]` é a raiz) e `chars` são os caracteres até ele.
+#[derive(Default)]
+struct TriePath {
+    chars: Vec<char>,
+    ids: Vec<u64>,
+}
+
 struct CachedNode {
     node: TrieNode,
     dirty: bool,
@@ -1604,12 +1612,13 @@ impl IndexBatch<'_> {
         let mut wb = WriteBatch::default();
         let mut buf = Vec::new();
         let mut trie = std::time::Duration::ZERO;
+        let mut path = TriePath::default();
         let encode_started = Instant::now();
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         for (term, mut acc) in terms {
             let t = Instant::now();
-            let id = self.insert_term(&term)?;
+            let id = self.insert_term(&term, &mut path)?;
             trie += t.elapsed();
             acc.normalize(positions);
             buf.clear();
@@ -1720,10 +1729,23 @@ impl IndexBatch<'_> {
     }
 
     /// Cria (se preciso) o caminho de `term` na Trie e devolve o nó terminal.
-    fn insert_term(&mut self, term: &str) -> Result<u64> {
-        let mut id = ROOT_ID;
-        let mut depth = 0u8;
-        for ch in term.chars() {
+    ///
+    /// Os termos do lote chegam em ordem alfabética, e vizinhos compartilham o
+    /// começo ("casa", "casaco", "casamento"): `path` guarda o caminho do
+    /// termo anterior, e a descida recomeça do fim do prefixo comum em vez da
+    /// raiz. Os nós desse caminho já estão no mapa do lote (o descarte só
+    /// acontece depois do commit).
+    fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<u64> {
+        if path.ids.is_empty() {
+            path.ids.push(ROOT_ID);
+        }
+        let common = path.chars.iter().zip(term.chars()).take_while(|(a, b)| *a == b).count();
+        path.chars.truncate(common);
+        path.ids.truncate(common + 1);
+        let mut id = path.ids[common];
+        // Termos têm no máximo MAX_TOKEN_CHARS (64) caracteres.
+        let mut depth = u8::try_from(common).unwrap_or(u8::MAX);
+        for ch in term.chars().skip(common) {
             let next_free = self.next_node_id;
             let generation = self.generation;
             let parent = self.node_mut(id, depth)?;
@@ -1742,8 +1764,9 @@ impl IndexBatch<'_> {
                     next_free
                 }
             };
-            // Termos têm no máximo MAX_TOKEN_CHARS (64) caracteres.
             depth = depth.saturating_add(1);
+            path.chars.push(ch);
+            path.ids.push(id);
         }
         let leaf = self.node_mut(id, depth)?;
         if !leaf.node.is_end_of_word {

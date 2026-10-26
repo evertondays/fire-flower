@@ -142,6 +142,31 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Avalia a ordenação com consultas de resposta conhecida (docs/plano-relevancia.md)
+    Relevancia {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Pasta dos conjuntos rel-*.tsv. Os que faltarem (todos, com --gerar)
+        /// são gerados do corpus e gravados ali
+        #[arg(long)]
+        sets: PathBuf,
+        /// Consultas escritas à mão (padrão: bench/relevancia/manual.tsv)
+        #[arg(long)]
+        manual: Option<PathBuf>,
+        #[arg(long)]
+        take: Option<u64>,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 1000)]
+        per_set: usize,
+        /// Gera os conjuntos de novo mesmo que já existam
+        #[arg(long)]
+        gerar: bool,
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// Mede latência das consultas (p50/p95/p99/máx, qps, Gets e block reads por consulta)
     Bench {
         #[arg(long)]
@@ -220,6 +245,10 @@ fn main() -> AnyResult {
         }
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label } => {
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label })
+        }
+        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, label } => {
+            let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
+            relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, label)
         }
         Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_mb, label } => {
             bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, cache_mb, label)
@@ -1724,6 +1753,286 @@ fn oracle(args: OracleArgs) -> AnyResult {
     if total > 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+// ================================================================== relevância
+
+/// Uma consulta com resposta conhecida: algum dos `expected` tem que vir no topo.
+struct RelCase {
+    query: String,
+    expected: Vec<DocId>,
+    /// O título esperado (só para mostrar).
+    title: String,
+}
+
+/// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
+/// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
+const REL_SETS: [(&str, usize); 4] = [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10)];
+
+fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "# consulta\tIDs esperados\ttítulo (gerado por `wiki relevancia`)")?;
+    for c in cases {
+        let ids: Vec<String> = c.expected.iter().map(u64::to_string).collect();
+        writeln!(w, "{}\t{}\t{}", c.query, ids.join(","), c.title)?;
+    }
+    Ok(())
+}
+
+fn read_rel_set(path: &Path) -> AnyResult<Vec<RelCase>> {
+    let mut out = Vec::new();
+    for (i, line) in std::fs::read_to_string(path)?.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (Some(query), Some(ids)) = (cols.next(), cols.next()) else {
+            return Err(format!("{}:{}: linha sem IDs", path.display(), i + 1).into());
+        };
+        let expected = ids
+            .split(',')
+            .map(|id| id.trim().parse::<DocId>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
+        out.push(RelCase { query: query.to_string(), expected, title: cols.next().unwrap_or("").to_string() });
+    }
+    Ok(out)
+}
+
+/// Reservatório: guarda `n` itens sorteados de um fluxo de tamanho desconhecido.
+fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usize, item: impl FnOnce() -> T) {
+    if kept.len() < n {
+        kept.push(item());
+    } else if rng.below(seen) < n {
+        let j = rng.below(n);
+        kept[j] = item();
+    }
+}
+
+/// Gera os conjuntos rel-* a partir do corpus (seed fixa: mesmas consultas).
+///
+/// - `rel-titulo`: o título inteiro → o artigo.
+/// - `rel-digitando`: o título com a última palavra cortada em ~60% e `*`,
+///   como o TUI busca enquanto se digita (`coreia do nor*`).
+/// - `rel-hub`: títulos cujos termos aparecem em ≥ 3 outros títulos
+///   ("Coreia do Norte" ⊂ "Bandeira da Coreia do Norte"): o artigo principal
+///   tem que vir em 1º, acima dos derivados.
+/// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
+///   artigo no top-10. Segura o exagero do peso do título.
+fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, seed: u64, per_set: usize) -> AnyResult<Vec<(&'static str, Vec<RelCase>)>> {
+    let mut rng = Rng(seed);
+    let mut titles: Vec<(DocId, String, Vec<String>)> = Vec::new();
+    let mut df: HashMap<String, u32> = HashMap::default();
+    let mut by_title: Vec<RelCase> = Vec::new();
+    let mut typing: Vec<RelCase> = Vec::new();
+    let mut body_docs: Vec<(DocId, String, Vec<String>)> = Vec::new();
+    let (mut seen, mut seen_typing) = (0usize, 0usize);
+    for doc in Corpus::open(corpus, 0, take, false)? {
+        let doc = doc?;
+        let title_terms = index_terms(&doc.title, stopwords);
+        let body_terms = index_terms(&doc.body, stopwords);
+        for t in &body_terms {
+            *df.entry(t.clone()).or_insert(0) += 1;
+        }
+        if title_terms.is_empty() {
+            continue;
+        }
+        seen += 1;
+        let case = || RelCase { query: doc.title.clone(), expected: vec![doc.id], title: doc.title.clone() };
+        reservoir(&mut rng, &mut by_title, seen, per_set, case);
+
+        // Digitando: a última palavra do título, se for indexável e tiver ≥ 5 letras.
+        let tokens = tokenize(&doc.title);
+        if let Some(last) = tokens.last()
+            && !stopwords.contains(last)
+            && last.chars().count() >= 5
+        {
+            seen_typing += 1;
+            let n = last.chars().count();
+            let cut: String = last.chars().take((n * 6).div_ceil(10).max(3).min(n - 1)).collect();
+            let mut words = tokens[..tokens.len() - 1].to_vec();
+            words.push(format!("{cut}*"));
+            let query = words.join(" ");
+            reservoir(&mut rng, &mut typing, seen_typing, per_set, || RelCase { query, expected: vec![doc.id], title: doc.title.clone() });
+        }
+
+        let outside: Vec<String> = body_terms.into_iter().filter(|t| title_terms.binary_search(t).is_err()).collect();
+        reservoir(&mut rng, &mut body_docs, seen, per_set * 3, || (doc.id, doc.title.clone(), outside));
+        titles.push((doc.id, doc.title, title_terms));
+    }
+
+    // Hubs: índice invertido só dos títulos.
+    let mut title_index: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (i, (_, _, terms)) in titles.iter().enumerate() {
+        for t in terms {
+            title_index.entry(t.as_str()).or_default().push(i as u32);
+        }
+    }
+    let mut same_terms: HashMap<&[String], u32> = HashMap::default();
+    for (_, _, terms) in &titles {
+        *same_terms.entry(terms.as_slice()).or_insert(0) += 1;
+    }
+    let mut hubs: Vec<RelCase> = Vec::new();
+    let mut seen_hubs = 0usize;
+    for (id, title, terms) in &titles {
+        // Outro título com exatamente os mesmos termos deixaria a resposta ambígua.
+        if same_terms[terms.as_slice()] > 1 {
+            continue;
+        }
+        let mut lists: Vec<&Vec<u32>> = terms.iter().map(|t| &title_index[t.as_str()]).collect();
+        lists.sort_by_key(|l| l.len());
+        if lists[0].len() < 4 {
+            continue;
+        }
+        let mut containing: Vec<u32> = lists[0].clone();
+        for l in &lists[1..] {
+            containing.retain(|i| l.binary_search(i).is_ok());
+            if containing.len() < 4 {
+                break;
+            }
+        }
+        if containing.len() >= 4 {
+            seen_hubs += 1;
+            reservoir(&mut rng, &mut hubs, seen_hubs, per_set, || RelCase { query: title.clone(), expected: vec![*id], title: title.clone() });
+        }
+    }
+
+    // Corpo: 2 termos com df entre 20 e 2000 que não estão no título.
+    let mut body_cases: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if body_cases.len() >= per_set {
+            break;
+        }
+        let mid: Vec<&String> = terms.iter().filter(|t| (20..=2000).contains(&df[*t])).collect();
+        if mid.len() < 2 {
+            continue;
+        }
+        let a = rng.below(mid.len());
+        let mut b = rng.below(mid.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        body_cases.push(RelCase { query: format!("{} {}", mid[a], mid[b]), expected: vec![*id], title: title.clone() });
+    }
+    Ok(vec![("rel-titulo", by_title), ("rel-digitando", typing), ("rel-hub", hubs), ("rel-corpo", body_cases)])
+}
+
+/// Consultas à mão: `consulta \t títulos esperados (|) \t nota`. Os títulos
+/// viram IDs pelo corpus; consultas sem nenhum artigo no corpus são puladas.
+fn read_manual(path: &Path, corpus: &Path, take: Option<u64>) -> AnyResult<Vec<RelCase>> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let query = cols.next().unwrap_or("").to_string();
+        let titles = cols.next().unwrap_or("").split('|').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        wanted.push((query, titles));
+    }
+    let all: HashSet<&str> = wanted.iter().flat_map(|(_, ts)| ts.iter().map(String::as_str)).collect();
+    let mut ids: HashMap<String, DocId> = HashMap::default();
+    for doc in Corpus::open(corpus, 0, take, false)? {
+        let doc = doc?;
+        if all.contains(doc.title.as_str()) {
+            ids.insert(doc.title, doc.id);
+        }
+    }
+    let mut out = Vec::new();
+    for (query, titles) in wanted {
+        let expected: Vec<DocId> = titles.iter().filter_map(|t| ids.get(t).copied()).collect();
+        if expected.is_empty() {
+            // Numa fatia pequena o artigo pode não existir: a consulta não conta.
+            eprintln!("consulta à mão ignorada (artigo fora do corpus): {query} → {}", titles.join(" | "));
+            continue;
+        }
+        out.push(RelCase { query, expected, title: titles.join(" | ") });
+    }
+    Ok(out)
+}
+
+/// Posição (0 = primeiro) do primeiro esperado nos 1000 melhores, e o top 3.
+fn rank_of(engine: &Engine, case: &RelCase) -> AnyResult<(Option<usize>, Vec<DocId>)> {
+    let hits = engine.search_top(&case.query, 1000)?;
+    let pos = hits.iter().position(|h| case.expected.contains(&h.doc));
+    Ok((pos, hits.iter().take(3).map(|h| h.doc).collect()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relevancia(db: &Path, corpus: &Path, sets_dir: &Path, manual: &Path, take: Option<u64>, seed: u64, per_set: usize, gerar: bool, label: Option<String>) -> AnyResult {
+    let started = Instant::now();
+    let engine = Engine::open(db, Config::default())?;
+    let stopwords = engine.stopwords().clone();
+    std::fs::create_dir_all(sets_dir)?;
+
+    let missing = REL_SETS.iter().any(|(name, _)| !sets_dir.join(format!("{name}.tsv")).exists());
+    if gerar || missing {
+        eprintln!("gerando conjuntos em {}", sets_dir.display());
+        for (name, cases) in generate_rel_sets(corpus, take, &stopwords, seed, per_set)? {
+            write_rel_set(&sets_dir.join(format!("{name}.tsv")), &cases)?;
+        }
+    }
+    let mut sets: Vec<(String, usize, Vec<RelCase>)> = Vec::new();
+    for (name, hit_at) in REL_SETS {
+        sets.push((name.to_string(), hit_at, read_rel_set(&sets_dir.join(format!("{name}.tsv")))?));
+    }
+    sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
+
+    let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
+    let mut results = Vec::new();
+    println!("{:<14} {:>8} {:>7} {:>7} {:>7} {:>7} {:>9}", "conjunto", "consultas", "top-1", "top-3", "top-10", "MRR", "fora 1000");
+    let mut manual_lines = Vec::new();
+    for (name, hit_at, cases) in &sets {
+        let (mut t1, mut t3, mut t10, mut rr, mut out) = (0usize, 0usize, 0usize, 0.0f64, 0usize);
+        let mut misses: Vec<Value> = Vec::new();
+        for case in cases {
+            let (pos, top3) = rank_of(&engine, case)?;
+            match pos {
+                Some(i) => {
+                    t1 += usize::from(i < 1);
+                    t3 += usize::from(i < 3);
+                    t10 += usize::from(i < 10);
+                    rr += 1.0 / (i + 1) as f64;
+                }
+                None => out += 1,
+            }
+            let hit = pos.is_some_and(|i| i < *hit_at);
+            if name == "rel-manual" {
+                let mark = if hit { "✔" } else { "✗" };
+                let shown: Vec<String> = top3.iter().map(|&d| title_of(d)).collect();
+                manual_lines.push(format!(
+                    "  {mark} {:<26} {:>6}  → {}",
+                    case.query,
+                    pos.map_or("—".into(), |i| format!("{}º", i + 1)),
+                    shown.join(" · ")
+                ));
+            }
+            if !hit && misses.len() < 8 {
+                misses.push(json!({ "consulta": case.query, "esperado": case.title, "posicao": pos.map(|i| i + 1),
+                                    "top3": top3.iter().map(|&d| title_of(d)).collect::<Vec<_>>() }));
+            }
+        }
+        let n = cases.len().max(1) as f64;
+        let (top1, top3, top10, mrr) = (t1 as f64 / n, t3 as f64 / n, t10 as f64 / n, rr / n);
+        println!("{name:<14} {:>8} {:>6.1}% {:>6.1}% {:>6.1}% {mrr:>7.3} {out:>9}", cases.len(), top1 * 100.0, top3 * 100.0, top10 * 100.0);
+        results.push(json!({ "conjunto": name, "consultas": cases.len(), "acerto_ate": hit_at, "top1": top1, "top3": top3,
+                             "top10": top10, "mrr": mrr, "fora_do_top1000": out, "erros": misses }));
+    }
+    println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
+    for line in &manual_lines {
+        println!("{line}");
+    }
+    println!("\n{:.1}s", started.elapsed().as_secs_f64());
+
+    let label = label.unwrap_or_else(|| stem(sets_dir));
+    save_result(
+        "relevancia",
+        &label,
+        json!({ "db": db, "corpus": corpus, "take": take, "seed": seed, "config": config_json(engine.config()),
+                "conjuntos": results }),
+    )?;
     Ok(())
 }
 

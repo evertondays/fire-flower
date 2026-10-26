@@ -1,0 +1,39 @@
+# Consultas escritas à mão (docs/plano-relevancia.md, conjunto rel-manual).
+# consulta <TAB> títulos esperados (separados por |) <TAB> nota
+# O artigo esperado tem que vir no top-3. `*` no fim = o que o TUI busca enquanto se digita.
+coreia do norte	Coreia do Norte	o caso que originou o plano
+coreia do nor*	Coreia do Norte	digitando
+coreia do sul	Coreia do Sul
+brasil	Brasil	termo muito frequente
+brasi*	Brasil	digitando
+são paulo	São Paulo
+sao pau*	São Paulo	digitando, sem acento
+segunda guerra mundial	Segunda Guerra Mundial
+segunda guerra mun*	Segunda Guerra Mundial	digitando
+primeira guerra mundial	Primeira Guerra Mundial
+revolução francesa	Revolução Francesa
+revolucao franc*	Revolução Francesa	digitando, sem acento
+portugal	Portugal
+lisboa	Lisboa
+einstein	Albert Einstein	sobrenome
+albert einstein	Albert Einstein
+lula	Luiz Inácio Lula da Silva	apelido
+mozart	Wolfgang Amadeus Mozart	sobrenome
+beatles	The Beatles
+camões	Luís de Camões
+os lusíadas	Os Lusíadas
+machado de assis	Machado de Assis
+ayrton senna	Ayrton Senna
+senna	Ayrton Senna	sobrenome
+copa do mundo	Copa do Mundo FIFA
+guerra fria	Guerra Fria
+união soviética	União Soviética
+sistema solar	Sistema Solar
+teoria da relatividade	Teoria da relatividade
+rio amazonas	Rio Amazonas
+língua portuguesa	Língua portuguesa
+estados unidos	Estados Unidos
+império romano	Império Romano
+napoleão	Napoleão Bonaparte	primeiro nome
+linux	Linux
+fernando pessoa	Fernando Pessoa

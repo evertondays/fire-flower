@@ -10,6 +10,7 @@
     python3 scripts/perf.py concorrencia      # Fase 5: escala com threads e leitura durante escrita
     python3 scripts/perf.py pr                # Fase 8: checagem rápida; falha se o p50 piorar >10%
     python3 scripts/perf.py frases            # frases e ranking: carga com/sem posições, oráculo, latência
+    python3 scripts/perf.py relevancia        # ordenação: consultas de resposta conhecida (docs/plano-relevancia.md)
     python3 scripts/perf.py carga-longa       # carga inteira janela a janela; falha se a velocidade colapsar
                                               #   [--reproduzir: roda antes o cenário que colapsava]
     python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
@@ -528,6 +529,51 @@ def fase_frases(scale):
     return ok
 
 
+def fase_relevancia(scale):
+    """Plano de relevância: top-1/top-3/top-10/MRR em conjuntos com resposta
+    conhecida, gerados da fatia (até 100k) e versionados em bench/relevancia/."""
+    s = smaller(scale, "100k")
+    step(f"relevância {s}: título, digitando, hub, corpo e consultas à mão")
+    sets = os.path.join(PROJECT, "bench", "relevancia", s)
+    wiki("relevancia", "--db", ensure_loaded(s), "--corpus", corpus(s), "--sets", sets, "--label", s)
+
+
+def relevancia_section(R, scale):
+    s = smaller(scale, "100k")
+    rel = latest(R, "relevancia", s)
+    if not rel:
+        return []
+    base = latest(R, "relevancia", f"linha-de-base-{s}")
+    before = {c["conjunto"]: c for c in base["conjuntos"]} if base else {}
+    L = [f"## Relevância ({s})", "",
+         "Consultas com resposta conhecida ([docs/plano-relevancia.md](../docs/plano-relevancia.md)). "
+         "Acerto: top-1 em título, digitando e hub; top-10 em corpo; top-3 nas consultas à mão. "
+         "Entre parênteses, a linha de base (ranking antes do plano).", "",
+         "| Conjunto | Consultas | top-1 | top-3 | top-10 | MRR | fora do top-1000 |", "|---|---|---|---|---|---|---|"]
+    for c in rel["conjuntos"]:
+        b = before.get(c["conjunto"])
+        def cell(key, pctg=True):
+            v = c[key]
+            txt = f"{fmt(v * 100, 1)}%" if pctg else fmt(v, 3)
+            if b:
+                txt += f" ({fmt(b[key] * 100, 1)}%)" if pctg else f" ({fmt(b[key], 3)})"
+            return txt
+        L.append(f"| `{c['conjunto']}` | {c['consultas']} | {cell('top1')} | {cell('top3')} | {cell('top10')} | "
+                 f"{cell('mrr', False)} | {c['fora_do_top1000']} |")
+    L.append("")
+    erros = [(c["conjunto"], e) for c in rel["conjuntos"] for e in c.get("erros", [])[:3]]
+    if erros:
+        L += ["Exemplos de erro (até 3 por conjunto):", "",
+              "| Conjunto | Consulta | Esperado | Posição | Os 3 primeiros |", "|---|---|---|---|---|"]
+        for nome, e in erros:
+            pos = f"{e['posicao']}º" if e.get("posicao") else "—"
+            L.append(f"| `{nome}` | `{e['consulta']}` | {e['esperado']} | {pos} | {' · '.join(e['top3'])} |")
+        L.append("")
+    L.append(f"<sub>{rel['_arquivo']}</sub>")
+    L.append("")
+    return L
+
+
 def fase_carga_longa(scale, reproduzir=False):
     """Cenário do colapso da carga: a velocidade caía de ~5.000 para ~200
     artigos/s em pontos diferentes (200k, 500k, 600k) da Wikipédia inteira.
@@ -827,6 +873,7 @@ def cmd_relatorio(scale):
     divs = sum(r["divergencias"] for r in oracles.values()) if oracles else None
     swap_growth = (load_scale or {}).get("swap_aumento")
     swap_txt = "—" if swap_growth is None else ("sim" if swap_growth < 64 << 20 else f"não (+{mb(swap_growth)} MB)")
+    L += relevancia_section(R, scale)
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
           f"| Carga sem swap (aumento < 64 MB) | {swap_txt} | **sim** |",
@@ -938,6 +985,7 @@ def main():
     e.add_argument("--experimentos", action="store_true")
     for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
                         ("concorrencia", "Fase 5"), ("frases", "frases e ranking (Fase E do plano)"),
+                        ("relevancia", "ordenação: consultas de resposta conhecida"),
                         ("relatorio", "gera bench/RESULTADOS.md")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
@@ -965,6 +1013,7 @@ def main():
     if args.cmd == "tudo":
         fase_escada(scale, experimentos=True)
         ok &= fase_corretude(scale)
+        fase_relevancia(scale)
         fase_consultas(scale)
         fase_latencia(scale)
         if not args.sem_concorrencia:
@@ -978,7 +1027,8 @@ def main():
         ok = fase_carga_longa(scale, args.reproduzir)
     else:
         result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
-                  "concorrencia": fase_concorrencia, "frases": fase_frases}[args.cmd](scale)
+                  "concorrencia": fase_concorrencia, "frases": fase_frases,
+                  "relevancia": fase_relevancia}[args.cmd](scale)
         ok = result is not False
     cmd_relatorio(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

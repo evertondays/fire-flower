@@ -15,6 +15,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::Instant;
 
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 use rustc_hash::FxHashMap;
@@ -1480,6 +1481,36 @@ impl TermAcc {
     }
 }
 
+/// Onde um commit gastou o tempo ([`IndexBatch::commit_with_stats`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitStats {
+    pub docs: usize,
+    /// Termos distintos do lote.
+    pub terms: usize,
+    /// Leituras no RocksDB durante a travessia (nós fora do cache do escritor).
+    pub node_reads: u64,
+    /// Nós criados e nós regravados neste lote.
+    pub new_nodes: usize,
+    pub dirty_nodes: usize,
+    /// Nós no cache do escritor depois do descarte.
+    pub cache_nodes: usize,
+    /// Tamanho do `WriteBatch` gravado.
+    pub batch_bytes: usize,
+    /// Ordenar os termos do lote.
+    pub sort_secs: f64,
+    /// Percorrer e criar caminhos na Trie (inclui ler os nós fora do cache).
+    pub trie_secs: f64,
+    /// Ordenar e codificar as listas `post:`/`pos:` e colocá-las no lote.
+    pub encode_secs: f64,
+    /// Codificar os nós alterados, os blocos de `norm:` e os contadores.
+    pub nodes_secs: f64,
+    /// `db.write` do lote inteiro.
+    pub write_secs: f64,
+    /// Descarte do cache de nós.
+    pub evict_secs: f64,
+    pub total_secs: f64,
+}
+
 struct CachedNode {
     node: TrieNode,
     dirty: bool,
@@ -1552,19 +1583,34 @@ impl IndexBatch<'_> {
     }
 
     /// Grava o lote num único `WriteBatch` atômico.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_with_stats().map(|_| ())
+    }
+
+    /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
+    /// Usado pelo harness de performance para achar o gargalo da carga.
+    pub fn commit_with_stats(mut self) -> Result<CommitStats> {
+        let started = Instant::now();
+        let reads_before = reads_on_this_thread();
+        let mut stats = CommitStats { docs: self.lengths.len(), ..CommitStats::default() };
         let positions = self.engine.positions;
         // Termos em ordem: a criação de nós fica determinística (o mesmo
         // corpus com o mesmo tamanho de lote gera sempre os mesmos IDs).
         let mut terms: Vec<(String, TermAcc)> = std::mem::take(&mut self.pending).into_iter().collect();
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        stats.terms = terms.len();
+        stats.sort_secs = started.elapsed().as_secs_f64();
 
         let mut wb = WriteBatch::default();
         let mut buf = Vec::new();
+        let mut trie = std::time::Duration::ZERO;
+        let encode_started = Instant::now();
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         for (term, mut acc) in terms {
+            let t = Instant::now();
             let id = self.insert_term(&term)?;
+            trie += t.elapsed();
             acc.normalize(positions);
             buf.clear();
             codec::encode_postings_into(&mut buf, &acc.docs);
@@ -1575,18 +1621,27 @@ impl IndexBatch<'_> {
                 wb.merge(Key::new(POS, id), &buf);
             }
         }
+        stats.trie_secs = trie.as_secs_f64();
+        stats.encode_secs = encode_started.elapsed().as_secs_f64() - stats.trie_secs;
+        stats.node_reads = reads_on_this_thread() - reads_before;
+        stats.new_nodes = (self.next_node_id - self.state.next_node_id) as usize;
+        stats.dirty_nodes = self.dirty.len();
+        let t = Instant::now();
         for id in &self.dirty {
             wb.put(Key::new(NODE, *id), self.nodes[id].node.encode());
         }
-        let (stats, blocks) = self.write_lengths(&mut wb)?;
+        let (index, blocks) = self.write_lengths(&mut wb)?;
+        let stats_index = index;
         for (doc_id, label) in &self.labels {
             wb.put(Key::new(DOC, *doc_id), label.as_bytes());
         }
         wb.put(META_NEXT_NODE, varint(self.next_node_id));
         wb.put(META_NEXT_DOC, varint(self.next_doc_id));
-        wb.put(META_DOC_COUNT, varint(stats.doc_count));
-        wb.put(META_TOTAL_LEN, varint(stats.total_len));
-        wb.put(META_TOTAL_TITLE_LEN, varint(stats.total_title_len));
+        wb.put(META_DOC_COUNT, varint(stats_index.doc_count));
+        wb.put(META_TOTAL_LEN, varint(stats_index.total_len));
+        wb.put(META_TOTAL_TITLE_LEN, varint(stats_index.total_title_len));
+        stats.nodes_secs = t.elapsed().as_secs_f64();
+        stats.batch_bytes = wb.size_in_bytes();
 
         // Ver `EpochCache`: marca, grava, publica.
         let engine = self.engine;
@@ -1596,7 +1651,9 @@ impl IndexBatch<'_> {
             let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
             engine.nodes.mark(shallow, next);
         }
+        let t = Instant::now();
         engine.db.write(wb)?;
+        stats.write_secs = t.elapsed().as_secs_f64();
         engine.epoch.store(next, AtomicOrdering::Release);
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
@@ -1605,13 +1662,17 @@ impl IndexBatch<'_> {
                 cached.dirty = false;
             }
         }
+        let t = Instant::now();
         let mut nodes = std::mem::take(&mut self.nodes);
         evict(&mut nodes, self.generation, self.cache_limit);
+        stats.evict_secs = t.elapsed().as_secs_f64();
+        stats.cache_nodes = nodes.len();
         self.state.cache = NodeCache { nodes, generation: self.generation };
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
-        self.state.stats = stats;
-        Ok(())
+        self.state.stats = stats_index;
+        stats.total_secs = started.elapsed().as_secs_f64();
+        Ok(stats)
     }
 
     /// Atualiza os blocos de `norm:` tocados pelo lote e as estatísticas.
@@ -1720,34 +1781,50 @@ impl IndexBatch<'_> {
     }
 }
 
-/// Mantém o cache de nós dentro de `limit`: primeiro saem os nós que o lote
-/// `generation` não usou; se ainda passar, saem os mais fundos.
+/// Mantém o cache de nós dentro de `limit`. Quando passa, descarta até 80%
+/// do limite (para não descartar a cada lote): ficam os nós usados mais
+/// recentemente e, no lote em que o corte cai, os mais rasos, que são os mais
+/// compartilhados.
+///
+/// Antes ficavam só os nós usados pelo último lote. Na Wikipédia isso jogava
+/// fora ~75% do cache a cada vez que ele enchia (1 milhão → 240 mil nós), e as
+/// leituras do escritor subiam de ~7 para ~18 por artigo logo depois.
 fn evict(nodes: &mut FxHashMap<u64, CachedNode>, generation: u64, limit: usize) {
     if nodes.len() <= limit {
         return;
     }
-    nodes.retain(|_, c| c.used == generation);
-    if nodes.len() <= limit {
-        return;
-    }
-    let mut per_depth = [0usize; 256];
+    let target = limit - limit / 5;
+    // Nós por (idade em lotes, profundidade). Idades acima de MAX_AGE contam juntas.
+    const MAX_AGE: usize = 255;
+    let age = |c: &CachedNode| (generation.saturating_sub(c.used) as usize).min(MAX_AGE);
+    let mut per_age = vec![[0usize; 256]; MAX_AGE + 1];
     for c in nodes.values() {
-        per_depth[c.depth as usize] += 1;
+        per_age[age(c)][c.depth as usize] += 1;
     }
-    // Maior profundidade que ainda cabe inteira no limite.
-    let mut total = 0;
-    let mut max_depth = None;
-    for (depth, &n) in per_depth.iter().enumerate() {
-        total += n;
-        if total > limit {
+    // Maior idade que cabe inteira no alvo; da seguinte, os mais rasos que couberem.
+    let mut kept = 0usize;
+    let mut cut_age = None;
+    for (a, depths) in per_age.iter().enumerate() {
+        let n: usize = depths.iter().sum();
+        if kept + n > target {
+            cut_age = Some(a);
             break;
         }
-        max_depth = Some(depth);
+        kept += n;
     }
-    match max_depth {
-        Some(d) => nodes.retain(|_, c| c.depth as usize <= d),
-        None => nodes.clear(),
+    let Some(cut_age) = cut_age else { return };
+    let mut max_depth = None;
+    for (d, &n) in per_age[cut_age].iter().enumerate() {
+        if kept + n > target {
+            break;
+        }
+        kept += n;
+        max_depth = Some(d);
     }
+    nodes.retain(|_, c| {
+        let a = age(c);
+        a < cut_age || (a == cut_age && max_depth.is_some_and(|d| c.depth as usize <= d))
+    });
 }
 
 thread_local! {
@@ -1939,6 +2016,38 @@ pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached(used: u64, depth: u8) -> CachedNode {
+        CachedNode { node: TrieNode::default(), dirty: false, used, depth }
+    }
+
+    #[test]
+    fn evict_keeps_the_most_recent_and_shallowest() {
+        let mut nodes: FxHashMap<u64, CachedNode> = FxHashMap::default();
+        // Lote 10 (o atual): 40 nós; lote 9: 40; lote 3: 40, metade rasa.
+        for i in 0..40 {
+            nodes.insert(i, cached(10, 5));
+            nodes.insert(100 + i, cached(9, 5));
+            nodes.insert(200 + i, cached(3, if i < 20 { 1 } else { 8 }));
+        }
+        evict(&mut nodes, 10, 200); // abaixo do limite: nada sai
+        assert_eq!(nodes.len(), 120);
+        // Limite 100 → alvo 80: ficam os lotes 10 e 9 inteiros.
+        evict(&mut nodes, 10, 100);
+        assert_eq!(nodes.len(), 80);
+        assert!(nodes.keys().all(|&k| k < 140));
+        // Alvo 60 (limite 75): o lote 10 inteiro e 20 do lote 9, os mais rasos.
+        for i in 0..20 {
+            nodes.get_mut(&(100 + i)).unwrap().depth = 2;
+        }
+        evict(&mut nodes, 10, 75);
+        assert_eq!(nodes.len(), 60);
+        assert!((0..40).all(|k| nodes.contains_key(&k)));
+        assert!((100..120).all(|k| nodes.contains_key(&k)));
+        // O lote atual sozinho passa do alvo: ficam os mais rasos dele.
+        evict(&mut nodes, 10, 10);
+        assert!(nodes.len() <= 8);
+    }
 
     #[test]
     fn keys_without_allocation() {

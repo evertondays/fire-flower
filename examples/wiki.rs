@@ -164,6 +164,15 @@ enum Cmd {
         /// Gera os conjuntos de novo mesmo que já existam
         #[arg(long)]
         gerar: bool,
+        /// Peso do título no BM25F (padrão: o do Config)
+        #[arg(long)]
+        peso_titulo: Option<f64>,
+        /// `b` do título no BM25F (padrão: o do Config)
+        #[arg(long)]
+        b_titulo: Option<f64>,
+        /// Não imprime as consultas à mão (para a grade)
+        #[arg(long)]
+        resumo: bool,
         #[arg(long)]
         label: Option<String>,
     },
@@ -246,9 +255,15 @@ fn main() -> AnyResult {
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label } => {
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label })
         }
-        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, label } => {
+        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
-            relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, label)
+            let defaults = Config::default();
+            let config = Config {
+                title_weight: peso_titulo.unwrap_or(defaults.title_weight),
+                title_b: b_titulo.unwrap_or(defaults.title_b),
+                ..defaults
+            };
+            relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
         }
         Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_mb, label } => {
             bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, cache_mb, label)
@@ -1081,8 +1096,9 @@ struct OTerm {
 }
 
 impl OTerm {
-    fn tf(&self, doc: DocId) -> Option<u32> {
-        self.docs.binary_search(&doc).ok().map(|i| self.tfs[i])
+    /// (tf no documento inteiro, tf no título).
+    fn tfs_of(&self, doc: DocId) -> Option<(u32, u32)> {
+        self.docs.binary_search(&doc).ok().map(|i| (self.tfs[i], self.title_tfs[i]))
     }
 
     /// Ordena por documento; o mesmo documento duas vezes: a última vence.
@@ -1176,10 +1192,15 @@ struct Oracle {
     positions: HashMap<String, OPos>,
     /// (tamanho inteiro, tamanho do título), sem stopwords.
     lens: HashMap<DocId, (u32, u32)>,
+    /// Posições ocupadas pelo título (stopwords inclusive): uma frase que
+    /// começa antes disso está no título.
+    spans: HashMap<DocId, u32>,
     total_len: u64,
     total_title_len: u64,
     k1: f64,
     b: f64,
+    title_weight: f64,
+    title_b: f64,
     max_prefix: usize,
 }
 
@@ -1198,12 +1219,19 @@ impl Oracle {
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
     }
 
-    /// Fórmula do plano, escrita de novo aqui (não usa a do motor).
-    fn bm25(&self, idf: f64, tf: u32, len: u32) -> f64 {
-        let avg = self.total_len as f64 / self.lens.len().max(1) as f64;
-        let tf = f64::from(tf);
-        let norm = if avg > 0.0 { 1.0 - self.b + self.b * f64::from(len) / avg } else { 1.0 };
-        idf * tf * (self.k1 + 1.0) / (tf + self.k1 * norm)
+    /// BM25F do plano de relevância (seção 1), escrito de novo aqui (não usa
+    /// a conta do motor): `tf~ = tf_texto / B_texto + w · tf_título / B_título`.
+    fn bm25(&self, idf: f64, tf: u32, title_tf: u32, doc: DocId) -> f64 {
+        let n = self.lens.len().max(1) as f64;
+        let (len, title_len) = self.lens[&doc];
+        let body_len = f64::from(len - title_len);
+        let avg_body = (self.total_len - self.total_title_len) as f64 / n;
+        let avg_title = self.total_title_len as f64 / n;
+        let norm = |b: f64, l: f64, avg: f64| if avg > 0.0 { 1.0 - b + b * l / avg } else { 1.0 - b };
+        let (b_body, b_title) = (norm(self.b, body_len, avg_body), norm(self.title_b, f64::from(title_len), avg_title));
+        let part = |tf: u32, weight: f64, b: f64| if tf == 0 || b <= 0.0 { 0.0 } else { weight * f64::from(tf) / b };
+        let ptf = part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title);
+        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
     }
 
     /// Termos com o prefixo, na ordem da Trie, até o limite do motor.
@@ -1215,21 +1243,23 @@ impl Oracle {
         matches
     }
 
-    /// Ocorrências da frase no documento, por força bruta.
-    fn phrase_count(parts: &[(u32, &OTerm, &OPos)], doc: DocId) -> u32 {
+    /// Ocorrências da frase no documento, por força bruta, e quantas
+    /// começam antes de `span` (no título).
+    fn phrase_count(parts: &[(u32, &OTerm, &OPos)], doc: DocId, span: u32) -> (u32, u32) {
         let lists: Vec<&[u32]> = match parts.iter().map(|(_, _, pos)| pos.get(doc)).collect::<Option<Vec<_>>>() {
             Some(lists) => lists,
-            None => return 0,
+            None => return (0, 0),
         };
-        let mut count = 0;
+        let (mut count, mut in_title) = (0, 0);
         for &p0 in lists[0] {
             let Some(start) = p0.checked_sub(parts[0].0) else { continue };
             let all = parts.iter().zip(&lists).skip(1).all(|((off, _, _), list)| {
                 u32::try_from(u64::from(start) + u64::from(*off)).is_ok_and(|want| list.binary_search(&want).is_ok())
             });
             count += u32::from(all);
+            in_title += u32::from(all && start < span);
         }
-        count
+        (count, in_title)
     }
 
     /// Documentos que casam com a consulta, em ordem. `None` se alguma frase
@@ -1286,7 +1316,7 @@ impl Oracle {
         }
         docs.retain(|&d| {
             resolved.iter().all(|c| match c {
-                OClause::Phrase(parts) => Self::phrase_count(parts, d) > 0,
+                OClause::Phrase(parts) => Self::phrase_count(parts, d, 0).0 > 0,
                 _ => true,
             })
         });
@@ -1299,19 +1329,22 @@ impl Oracle {
         let mut scored: Vec<(DocId, f64)> = docs
             .iter()
             .map(|&d| {
-                let len = self.lens[&d].0;
                 let mut score = 0.0;
                 for c in &resolved {
                     score += match c {
-                        OClause::Term(t) => self.bm25(self.idf(t.docs.len()), t.tf(d).unwrap_or(0), len),
+                        OClause::Term(t) => {
+                            let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
+                            self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
+                        }
                         // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
                         OClause::Prefix(ts, df) => {
-                            let tf: u32 = ts.iter().filter_map(|t| t.tf(d)).sum();
-                            self.bm25(self.idf(*df), tf, len)
+                            let (tf, title_tf) = ts.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                            self.bm25(self.idf(*df), tf, title_tf, d)
                         }
                         OClause::Phrase(parts) => {
                             let idf: f64 = parts.iter().map(|(_, t, _)| self.idf(t.docs.len())).sum();
-                            self.bm25(idf, Self::phrase_count(parts, d), len)
+                            let (tf, title_tf) = Self::phrase_count(parts, d, self.spans[&d]);
+                            self.bm25(idf, tf, title_tf, d)
                         }
                     };
                 }
@@ -1353,10 +1386,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
         terms: HashMap::default(),
         positions: HashMap::default(),
         lens: HashMap::default(),
+        spans: HashMap::default(),
         total_len: 0,
         total_title_len: 0,
         k1: engine.config().bm25_k1,
         b: engine.config().bm25_b,
+        title_weight: engine.config().title_weight,
+        title_b: engine.config().title_b,
         max_prefix: engine.config().max_prefix_terms,
     };
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
@@ -1413,6 +1449,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
                 None => add(o.terms.entry(t.to_string()).or_default(), c),
             }
         }
+        o.spans.insert(doc.id, n_title as u32);
         match o.lens.insert(doc.id, (len, title_len)) {
             Some((old, old_title)) => {
                 repeated += 1;
@@ -1480,12 +1517,14 @@ fn oracle(args: OracleArgs) -> AnyResult {
         phrase_cases.push(window);
     }
 
-    // 4. Consultas de ranking: termo frequente, termo qualquer, E, prefixo e frase.
+    // 4. Consultas de ranking: termo frequente, termo qualquer, E, prefixo,
+    //    frase e título (onde o peso do título mais pesa).
     let frequent: Vec<&str> = vocab.iter().copied().filter(|t| o.terms[*t].docs.len() >= 50).collect();
     let mut rank_cases: Vec<String> = Vec::new();
     for i in 0..args.rank_queries {
         let doc = rng.pick(&sampled_docs);
-        let query = match i % 5 {
+        let query = match i % 6 {
+            5 if !titles.is_empty() => rng.pick(&titles).1.clone(),
             0 if !frequent.is_empty() => rng.pick(&frequent).to_string(),
             0 | 1 => rng.pick(&vocab).to_string(),
             2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| rng.pick(doc).clone()).collect::<Vec<_>>().join(" "),
@@ -1738,7 +1777,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
                         for (_, t, _) in &parts[1..] {
                             docs = fire_flower::internals::intersect(&docs, &t.docs);
                         }
-                        docs.retain(|&d| Oracle::phrase_count(&parts, d) > 0);
+                        docs.retain(|&d| Oracle::phrase_count(&parts, d, 0).0 > 0);
                         docs
                     }
                     None => Vec::new(),
@@ -1762,7 +1801,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
             (format!("total {} {g:?}", got.total), format!("total {total} {want:?}"))
         });
     }
-    ranking.notes.push("termo frequente, termo qualquer, E, termo + prefixo e frase; notas com diferença relativa < 1e-4".into());
+    ranking.notes.push("termo frequente, termo qualquer, E, termo + prefixo, frase e título; BM25F; notas com diferença relativa < 1e-4".into());
     checks.push(ranking);
 
     // Relatório.
@@ -2005,9 +2044,21 @@ fn rank_of(engine: &Engine, case: &RelCase) -> AnyResult<(Option<usize>, Vec<Doc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn relevancia(db: &Path, corpus: &Path, sets_dir: &Path, manual: &Path, take: Option<u64>, seed: u64, per_set: usize, gerar: bool, label: Option<String>) -> AnyResult {
+fn relevancia(
+    db: &Path,
+    corpus: &Path,
+    sets_dir: &Path,
+    manual: &Path,
+    take: Option<u64>,
+    seed: u64,
+    per_set: usize,
+    gerar: bool,
+    config: Config,
+    resumo: bool,
+    label: Option<String>,
+) -> AnyResult {
     let started = Instant::now();
-    let engine = Engine::open(db, Config::default())?;
+    let engine = Engine::open(db, config)?;
     let stopwords = engine.stopwords().clone();
     std::fs::create_dir_all(sets_dir)?;
 
@@ -2064,9 +2115,11 @@ fn relevancia(db: &Path, corpus: &Path, sets_dir: &Path, manual: &Path, take: Op
         results.push(json!({ "conjunto": name, "consultas": cases.len(), "acerto_ate": hit_at, "top1": top1, "top3": top3,
                              "top10": top10, "mrr": mrr, "fora_do_top1000": out, "erros": misses }));
     }
-    println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
-    for line in &manual_lines {
-        println!("{line}");
+    if !resumo {
+        println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
+        for line in &manual_lines {
+            println!("{line}");
+        }
     }
     println!("\n{:.1}s", started.elapsed().as_secs_f64());
 

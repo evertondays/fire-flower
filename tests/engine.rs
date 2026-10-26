@@ -1047,3 +1047,129 @@ fn v2_database_is_rejected_before_wal_recovery() {
     let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
     assert_eq!(db.get(b"post:4").unwrap().unwrap(), [1u8, 7, 1, 1, 9, 1]);
 }
+
+/// BM25F (plano de relevância, R4): tf~ = tf_texto / B_texto + w · tf_título / B_título.
+fn bm25f(n: f64, df: f64, (tf_body, tf_title): (f64, f64), (body_len, title_len): (f64, f64), (avg_body, avg_title): (f64, f64), (w, bt): (f64, f64)) -> f64 {
+    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    let b_body = 1.0 - B + B * body_len / avg_body;
+    let b_title = 1.0 - bt + bt * title_len / avg_title;
+    let ptf = tf_body / b_body + w * tf_title / b_title;
+    idf * ptf * (K1 + 1.0) / (ptf + K1)
+}
+
+fn titled(dir: &tempfile::TempDir, config: Config, docs: &[(u64, &str, &str)]) -> Engine {
+    let engine = Engine::open(dir.path(), config).unwrap();
+    let mut batch = engine.batch();
+    for (id, title, text) in docs {
+        batch.add_titled(*id, title, text).unwrap();
+    }
+    batch.commit().unwrap();
+    engine
+}
+
+#[test]
+fn bm25f_matches_hand_computation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (w, bt) = (3.0, 0.5);
+    let config = Config { title_weight: w, title_b: bt, ..Config::default() };
+    let engine = titled(&dir, config, &[(1, "Coreia", "coreia fica asia"), (2, "Bandeira coreia", "verde"), (3, "Outro", "coreia coreia texto longo aqui")]);
+    // Tamanhos (texto, título): 1 → (3, 1); 2 → (1, 2); 3 → (5, 1). Médias: texto 3, título 4/3.
+    let (n, avg) = (3.0, (3.0, 4.0 / 3.0));
+    let got: std::collections::HashMap<u64, f64> = ranked(&engine, "coreia").into_iter().collect();
+    let want = [
+        (1, bm25f(n, 3.0, (1.0, 1.0), (3.0, 1.0), avg, (w, bt))),
+        (2, bm25f(n, 3.0, (0.0, 1.0), (1.0, 2.0), avg, (w, bt))),
+        (3, bm25f(n, 3.0, (2.0, 0.0), (5.0, 1.0), avg, (w, bt))),
+    ];
+    for (doc, score) in want {
+        assert!(close(got[&doc], score), "doc {doc}: {} vs {score}", got[&doc]);
+    }
+    // Termo só no título também pontua; "verde" só no texto do 2.
+    assert!(close(ranked(&engine, "verde")[0].1, bm25f(n, 1.0, (1.0, 0.0), (1.0, 2.0), avg, (w, bt))));
+}
+
+/// O caso "Coreia do Norte": o artigo cujo título é a consulta vem antes dos
+/// derivados ("Bandeira da…", "Demografia da…"), mesmo sendo mais longo; e
+/// título curto vence título longo.
+#[test]
+fn title_match_ranks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_text = "a coreia do norte é um país da ásia com capital em pyongyang ".repeat(30);
+    let engine = titled(
+        &dir,
+        Config::default(),
+        &[
+            (1, "Bandeira da Coreia do Norte", "a bandeira da coreia do norte tem estrela"),
+            (2, "Coreia do Norte", &long_text),
+            (3, "Demografia da Coreia do Norte", "população da coreia do norte"),
+            (4, "Rio", "coreia norte coreia norte"),
+        ],
+    );
+    let got = ranked(&engine, "coreia do norte");
+    assert_eq!(got[0].0, 2, "{got:?}");
+    assert_eq!(ranked(&engine, "coreia do nor*")[0].0, 2, "digitando também");
+    assert_eq!(ranked(&engine, "\"coreia do norte\"")[0].0, 2, "frase também");
+}
+
+/// Frase no título: a ocorrência conta como título pela posição.
+#[test]
+fn phrase_in_title_counts_as_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = titled(&dir, Config::default(), &[(1, "Casa de papel", "outra coisa aqui"), (2, "Série", "casa de papel outra")]);
+    let got = ranked(&engine, "\"casa de papel\"");
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [1, 2]);
+    assert!(got[0].1 > got[1].1);
+    // Sem peso no título as duas ocorrências valem como texto.
+    drop(engine);
+    let engine = Engine::open(dir.path(), Config { title_weight: 0.0, ..Config::default() }).unwrap();
+    let got: std::collections::HashMap<u64, f64> = ranked(&engine, "\"casa de papel\"").into_iter().collect();
+    assert_eq!(got[&1], 0.0, "com peso 0 a frase só no título não pontua");
+}
+
+#[test]
+fn invalid_ranking_config_is_rejected() {
+    for config in [
+        Config { title_weight: -1.0, ..Config::default() },
+        Config { title_weight: f64::NAN, ..Config::default() },
+        Config { title_b: 1.5, ..Config::default() },
+        Config { bm25_b: -0.1, ..Config::default() },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(Engine::open(dir.path(), config), Err(Error::Config(_))));
+    }
+    // b = 1 é válido (sem limite útil para o corte, mas exato).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = titled(&dir, Config { bm25_b: 1.0, title_b: 1.0, ..Config::default() }, &[(1, "a", "x"), (2, "", "x x")]);
+    assert_eq!(engine.search_top("x", 10).unwrap().len(), 2);
+}
+
+/// O corte do top-k com títulos (chave com o tf do título convertido) não
+/// pode mudar o resultado: com k pequeno, o começo do ranking completo.
+#[test]
+fn top_k_pruning_is_exact_with_titles() {
+    for (w, bt) in [(3.0, 0.5), (8.0, 0.0), (1.0, 0.75), (0.0, 0.5)] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), Config { title_weight: w, title_b: bt, ..Config::default() }).unwrap();
+        let mut batch = engine.batch();
+        let mut rng = 7u64;
+        let mut next = |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        for id in 0..2000u64 {
+            let title = ["", "alvo", "alvo alvo outro", "outro", "x y z alvo"][next(5) as usize];
+            let tf = 1 + next(6) as usize;
+            let filler = ["x"; 4][..next(5) as usize].join(" ");
+            batch.add_titled(id * 3, title, &format!("{} {filler} outro casa de papel", "alvo ".repeat(tf))).unwrap();
+        }
+        batch.commit().unwrap();
+        for q in ["alvo", "alvo outro", "alv*", "x alvo", "\"casa de papel\"", "\"casa de papel\" alvo"] {
+            let all = engine.search_ranked(q, usize::MAX).unwrap();
+            for k in [1, 3, 10, 50, 500] {
+                let top = engine.search_ranked(q, k).unwrap();
+                assert_eq!(top.total, all.total, "{q} k={k} w={w}");
+                assert_eq!(top.hits, all.hits[..k.min(all.hits.len())], "{q} k={k} w={w} b={bt}");
+            }
+        }
+    }
+}

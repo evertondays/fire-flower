@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
-use crate::codec::{self, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, TrieNode};
+use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, TrieNode};
 use crate::stopwords::{self, Language, Stopwords};
 use crate::text::{Analyzer, Clause, normalize_term, parse_query};
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
@@ -127,8 +127,34 @@ pub struct Config {
     pub partition_filters: bool,
     /// Parâmetro `k1` do BM25: quanto a nota cresce com a frequência do termo.
     pub bm25_k1: f64,
-    /// Parâmetro `b` do BM25: quanto o tamanho do documento pesa (0 a 1).
+    /// Parâmetro `b` do BM25: quanto o tamanho do texto pesa (0 a 1).
     pub bm25_b: f64,
+    /// Quanto uma ocorrência no título vale em relação a uma no texto, no
+    /// BM25F (ver `docs/plano-relevancia.md`). 0 ignora o título.
+    pub title_weight: f64,
+    /// `b` do título: quanto um título longo perde para um curto (0 a 1).
+    pub title_b: f64,
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        let in_unit = |v: f64| (0.0..=1.0).contains(&v);
+        let ok = self.bm25_k1.is_finite()
+            && self.bm25_k1 >= 0.0
+            && in_unit(self.bm25_b)
+            && in_unit(self.title_b)
+            && self.title_weight.is_finite()
+            && self.title_weight >= 0.0;
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Config(format!(
+                "parâmetros de ranking inválidos: k1 = {}, b = {}, peso do título = {}, b do título = {} \
+                 (k1 e peso ≥ 0; b entre 0 e 1)",
+                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b
+            )))
+        }
+    }
 }
 
 impl Default for Config {
@@ -146,6 +172,11 @@ impl Default for Config {
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,
             bm25_b: 0.75,
+            // Escolhidos pela grade da Fase 4 do plano de relevância (100k da
+            // Wikipédia, confirmada com outra amostra): a qualidade sobe até
+            // ~50 e depois quase não muda; b 0,9 mantém o limite do corte finito.
+            title_weight: 50.0,
+            title_b: 0.9,
         }
     }
 }
@@ -266,6 +297,7 @@ impl<T> EpochCache<T> {
 impl Engine {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let path = path.as_ref();
+        config.validate()?;
         let mut table = BlockBasedOptions::default();
         table.set_bloom_filter(config.bloom_bits_per_key, false);
         table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
@@ -521,8 +553,8 @@ impl Engine {
                 .ok()
                 .and_then(|b| b.parse().ok())
                 .ok_or_else(|| Error::Corrupt("chave norm: inválida".into()))?;
-            for (offset, len, title_len) in NormBlock::decode(&value)?.iter() {
-                f(block * NORM_BLOCK_DOCS + u64::from(offset), len, u32::from(title_len));
+            for (offset, l) in NormBlock::decode(&value)?.iter() {
+                f(block * NORM_BLOCK_DOCS + u64::from(offset), l.len, u32::from(l.title_len));
             }
         }
         Ok(())
@@ -578,26 +610,70 @@ enum Scorer {
     /// Termo exato, ou prefixo tratado como um termo só (R1 do plano de
     /// relevância): a lista `list` em `lists`.
     Term { weight: f64, list: usize, bound: Bound },
-    /// Frase: entra na nota como um termo, com tf = ocorrências da frase e
-    /// idf = soma dos idfs dos termos (como o Lucene).
+    /// Frase: entra na nota como um termo, com tf = ocorrências da frase (no
+    /// texto e no título, pela posição) e idf = soma dos idfs dos termos
+    /// (como o Lucene).
     Phrase { weight: f64, phrase: usize, bound: Bound },
 }
 
-/// Os parâmetros do BM25 para uma busca.
-struct Bm25 {
-    k1: f64,
-    n: f64,
-    /// k1 · (1 − b): o fator de um documento de tamanho 0.
+/// Normalização de um campo pelo tamanho: `B(len) = 1 − b + b · len / média`.
+#[derive(Clone, Copy)]
+struct FieldNorm {
     base: f64,
-    /// k1 · b / média: quanto cada token a mais pesa no fator.
     slope: f64,
 }
 
+impl FieldNorm {
+    fn new(b: f64, avg: f64) -> Self {
+        Self { base: 1.0 - b, slope: if avg > 0.0 { b / avg } else { 0.0 } }
+    }
+
+    #[inline]
+    fn of(&self, len: f64) -> f64 {
+        self.base + self.slope * len
+    }
+}
+
+/// Os parâmetros do BM25F para uma busca (seção 1 de `plano-relevancia.md`):
+///
+/// ```text
+/// B_f(d) = 1 − b_f + b_f · len_f(d) / média_f      (f = texto, título)
+/// tf~    = tf_texto / B_texto  +  w · tf_título / B_título
+/// nota   = idf · tf~ · (k1 + 1) / (tf~ + k1)
+/// ```
+///
+/// O título multiplica o tf antes da saturação: uma ocorrência nele vale
+/// `w` no texto, e um título curto vale mais que um longo. Sem título
+/// (`tf_título = 0`) é exatamente o BM25 de antes.
+struct Bm25 {
+    k1: f64,
+    n: f64,
+    body: FieldNorm,
+    title: FieldNorm,
+    title_weight: f64,
+    /// Maior `1 / B_texto` (documento de tamanho 0): para o limite superior.
+    max_body: f64,
+    /// Quanto uma ocorrência no título vale, no máximo, em ocorrências do
+    /// texto num documento de tamanho 0: `(w / (1 − b_título)) / max_body`.
+    title_ratio: f64,
+}
+
+/// Os pesos de um documento: `1 / B_texto` e `w / B_título`.
+#[derive(Clone, Copy)]
+struct DocNorm {
+    body: f64,
+    title: f64,
+}
+
 impl Bm25 {
-    fn new(k1: f64, b: f64, stats: IndexStats) -> Self {
-        let avg = stats.avg_len();
-        let slope = if avg > 0.0 { k1 * b / avg } else { 0.0 };
-        Self { k1, n: stats.doc_count as f64, base: k1 * (1.0 - b), slope }
+    fn new(config: &Config, stats: IndexStats) -> Self {
+        let body = FieldNorm::new(config.bm25_b, stats.avg_body_len());
+        let title = FieldNorm::new(config.title_b, stats.avg_title_len());
+        let inv = |x: f64| if x > 0.0 { 1.0 / x } else { f64::INFINITY };
+        let max_body = inv(body.base);
+        let max_title = if config.title_weight > 0.0 { config.title_weight * inv(title.base) } else { 0.0 };
+        let title_ratio = if max_body.is_finite() { max_title / max_body } else { 0.0 };
+        Self { k1: config.bm25_k1, n: stats.doc_count as f64, body, title, title_weight: config.title_weight, max_body, title_ratio }
     }
 
     fn idf(&self, df: usize) -> f64 {
@@ -610,71 +686,124 @@ impl Bm25 {
         idf * (self.k1 + 1.0)
     }
 
-    /// Parte do denominador que só depende do documento:
-    /// k1 · (1 − b + b · |d| / média), sem divisão. Nunca é menor que `base`.
+    /// Os pesos de um documento, uma vez por documento.
     #[inline]
-    fn doc_factor(&self, len: u32) -> f64 {
-        self.base + self.slope * f64::from(len)
+    fn doc_norm(&self, lens: DocLens) -> DocNorm {
+        let title_len = f64::from(lens.title_len);
+        let body_len = f64::from(lens.len) - title_len;
+        // B = 0 só com b = 1 e o campo vazio: aí o tf do campo é 0 também.
+        let b_body = self.body.of(body_len);
+        let b_title = self.title.of(title_len);
+        DocNorm {
+            body: if b_body > 0.0 { 1.0 / b_body } else { 0.0 },
+            title: if b_title > 0.0 { self.title_weight / b_title } else { 0.0 },
+        }
     }
 
-    /// idf · tf · (k1 + 1) / (tf + doc_factor).
+    /// tf~: as ocorrências no texto e no título, cada uma normalizada pelo seu campo.
     #[inline]
-    fn score(weight: f64, tf: u32, doc_factor: f64) -> f64 {
-        let tf = f64::from(tf);
-        weight * tf / (tf + doc_factor)
+    fn pseudo_tf(norm: DocNorm, tf: u32, title_tf: u32) -> f64 {
+        f64::from(tf - title_tf) * norm.body + f64::from(title_tf) * norm.title
+    }
+
+    /// idf · tf~ · (k1 + 1) / (tf~ + k1).
+    #[inline]
+    fn score(&self, weight: f64, pseudo_tf: f64) -> f64 {
+        weight * pseudo_tf / (pseudo_tf + self.k1)
     }
 }
 
-/// Maior nota possível de uma parte para cada tf: a de um documento de
-/// tamanho 0 (fator `base`). Tabelada para os tf comuns: conferir o limite
-/// fica sem divisão. É exato porque `score` cresce com o peso e diminui com o
-/// fator, e o arredondamento de ponto flutuante preserva essa ordem.
+/// Maior nota possível de uma parte, pela chave (ocorrências equivalentes
+/// do texto num documento de tamanho 0, arredondadas para cima): sem título
+/// a chave é o próprio tf. Tabelada para as chaves comuns: conferir o limite
+/// fica sem divisão. A margem relativa cobre o arredondamento de ponto
+/// flutuante, então o corte continua exato.
 struct Bound {
     weight: f64,
-    base: f64,
+    k1: f64,
+    max_body: f64,
+    title_ratio: f64,
     table: [f64; BOUND_TF + 1],
 }
 
 const BOUND_TF: usize = 32;
+const BOUND_MARGIN: f64 = 1.0 + 1e-12;
 
 impl Bound {
-    fn new(weight: f64, base: f64) -> Self {
-        Self { weight, base, table: std::array::from_fn(|tf| Bm25::score(weight, tf as u32, base)) }
+    fn new(weight: f64, bm25: &Bm25) -> Self {
+        let mut b = Self { weight, k1: bm25.k1, max_body: bm25.max_body, title_ratio: bm25.title_ratio, table: [0.0; BOUND_TF + 1] };
+        b.table = std::array::from_fn(|key| b.compute(key as u32));
+        b
+    }
+
+    fn compute(&self, key: u32) -> f64 {
+        if !self.max_body.is_finite() {
+            return self.weight * BOUND_MARGIN; // b = 1: sem limite útil (a nota nunca passa do peso)
+        }
+        let p = self.max_body * f64::from(key);
+        self.weight * p / (p + self.k1) * BOUND_MARGIN
+    }
+
+    /// A chave de uma entrada: o tf, se não houver título; senão o tf do
+    /// texto mais o do título convertido, arredondado para cima.
+    #[inline]
+    fn key(&self, tf: u32, title_tf: u32) -> u32 {
+        if title_tf == 0 {
+            return tf;
+        }
+        let x = f64::from(tf - title_tf) + self.title_ratio * f64::from(title_tf);
+        if x.is_finite() && x < f64::from(u32::MAX - 1) { (x + 1e-9).ceil() as u32 } else { u32::MAX }
     }
 
     #[inline]
-    fn get(&self, tf: u32) -> f64 {
-        match self.table.get(tf as usize) {
+    fn get_key(&self, key: u32) -> f64 {
+        match self.table.get(key as usize) {
             Some(&b) => b,
-            None => Bm25::score(self.weight, tf, self.base),
+            None => self.compute(key),
         }
+    }
+
+    #[inline]
+    fn get(&self, tf: u32, title_tf: u32) -> f64 {
+        self.get_key(self.key(tf, title_tf))
     }
 }
 
-/// Nota de `doc` (já posicionado em todas as listas): soma das partes, na
-/// ordem da consulta.
+/// Nota de um documento (já posicionado em todas as listas): soma das
+/// partes, na ordem da consulta.
 #[inline]
-fn doc_score(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], factor: f64) -> f64 {
+fn doc_score(bm25: &Bm25, scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[(u32, u32)], norm: DocNorm) -> f64 {
     let mut score = 0.0;
     for scorer in scorers {
         score += match scorer {
-            Scorer::Term { weight, list, .. } => Bm25::score(*weight, lists[*list][at[*list]].tf, factor),
-            Scorer::Phrase { weight, phrase, .. } => Bm25::score(*weight, counts[*phrase], factor),
+            Scorer::Term { weight, list, .. } => {
+                let p = lists[*list][at[*list]];
+                bm25.score(*weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf))
+            }
+            Scorer::Phrase { weight, phrase, .. } => {
+                let (tf, title_tf) = counts[*phrase];
+                bm25.score(*weight, Bm25::pseudo_tf(norm, tf, title_tf))
+            }
         };
     }
     score
 }
 
 /// Limite superior de [`doc_score`]: a mesma soma, com o maior valor
-/// possível de cada parte. Soma de limites é limite da soma (arredondamento
-/// monótono de novo).
+/// possível de cada parte.
 #[inline]
-fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32]) -> f64 {
+fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[(u32, u32)]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {
-            Scorer::Term { list, bound, .. } => bound.get(lists[*list][at[*list]].tf),
-            Scorer::Phrase { phrase, bound, .. } => bound.get(counts[*phrase]),
+            Scorer::Term { list, bound, .. } => {
+                let p = lists[*list][at[*list]];
+                bound.get(p.tf, p.title_tf)
+            }
+            Scorer::Phrase { phrase, bound, .. } => {
+                let (tf, title_tf) = counts[*phrase];
+                bound.get(tf, title_tf)
+            }
         };
     }
     bound
@@ -728,7 +857,7 @@ impl View<'_> {
             let mut matcher = PhraseMatcher::new(phrase, &slices)?;
             let mut kept = Vec::with_capacity(result.len());
             for &doc in &result {
-                if matcher.count(doc, true)? > 0 {
+                if matcher.count(doc, true, 0)?.0 > 0 {
                     kept.push(doc);
                 }
             }
@@ -748,7 +877,7 @@ impl View<'_> {
         }
         let stats = self.stats()?;
         let config = &self.engine.config;
-        let bm25 = Bm25::new(config.bm25_k1, config.bm25_b, stats);
+        let bm25 = Bm25::new(config, stats);
 
         // 1. Carrega as listas. Todas entram no E; cada parte da consulta
         //    sabe quais são as suas.
@@ -766,7 +895,7 @@ impl View<'_> {
                         return Ok(TopHits::default());
                     }
                     let weight = bm25.weight(bm25.idf(list.len()));
-                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, bm25.base) });
+                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, &bm25) });
                     lists.push(list);
                 }
                 Clause::Term(t) => {
@@ -779,7 +908,7 @@ impl View<'_> {
                         return Ok(TopHits::default());
                     }
                     let weight = bm25.weight(bm25.idf(list.len()));
-                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, bm25.base) });
+                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, &bm25) });
                     lists.push(list);
                 }
                 Clause::Phrase(parts) => {
@@ -796,7 +925,7 @@ impl View<'_> {
                         lists.push(list);
                     }
                     let weight = bm25.weight(idf);
-                    scorers.push(Scorer::Phrase { weight, phrase: phrases.len(), bound: Bound::new(weight, bm25.base) });
+                    scorers.push(Scorer::Phrase { weight, phrase: phrases.len(), bound: Bound::new(weight, &bm25) });
                     phrases.push(nodes);
                 }
             }
@@ -805,7 +934,8 @@ impl View<'_> {
             phrases.iter().map(|p| self.load_positions(p)).collect::<Result<_>>()?;
         let mut matchers: Vec<PhraseMatcher<'_>> =
             phrases.iter().zip(&slices).map(|(p, s)| PhraseMatcher::new(p, s)).collect::<Result<_>>()?;
-        let mut counts = vec![0u32; matchers.len()];
+        // (ocorrências da frase, quantas no título), por frase.
+        let mut counts = vec![(0u32, 0u32); matchers.len()];
 
         if let [Scorer::Term { weight, list, bound }] = scorers.as_slice()
             && matchers.is_empty()
@@ -828,11 +958,18 @@ impl View<'_> {
                     continue 'docs;
                 }
             }
-            for (m, matcher) in matchers.iter_mut().enumerate() {
-                counts[m] = matcher.count(doc, false)?;
-                if counts[m] == 0 {
-                    continue 'docs;
+            // Com frase, o tamanho vem antes: a extensão do título diz quais
+            // ocorrências estão nele.
+            let mut lens = None;
+            if !matchers.is_empty() {
+                let l = norms.lens(doc)?;
+                for (m, matcher) in matchers.iter_mut().enumerate() {
+                    counts[m] = matcher.count(doc, false, u32::from(l.title_span))?;
+                    if counts[m].0 == 0 {
+                        continue 'docs;
+                    }
                 }
+                lens = Some(l);
             }
             total += 1;
             if k == 0 {
@@ -847,17 +984,22 @@ impl View<'_> {
             {
                 continue;
             }
-            let factor = bm25.doc_factor(norms.len(doc)?);
-            top.push(Hit { doc, score: doc_score(&scorers, &lists, &at, &counts, factor) });
+            let lens = match lens {
+                Some(l) => l,
+                None => norms.lens(doc)?,
+            };
+            let score = doc_score(&bm25, &scorers, &lists, &at, &counts, bm25.doc_norm(lens));
+            top.push(Hit { doc, score });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
     }
 
-    /// Um termo só: a nota depende só do tf e do tamanho, e o limite só do tf.
+    /// Um termo só: a nota depende só dos tf e dos tamanhos, e o limite só
+    /// da chave (`Bound::key`: o tf, sem título).
     ///
-    /// Os documentos são agrupados em níveis de tf (nível 0 = tf ≥ `CAP`,
-    /// nível `CAP − tf` para o resto), e o limite de um nível vale para todos
-    /// os níveis abaixo dele. A lista não é reordenada: cada faixa de níveis é
+    /// Os documentos são agrupados em níveis de chave (nível 0 = chave ≥
+    /// `CAP`, nível `CAP − chave` para o resto), e o limite de um nível vale
+    /// para todos os níveis abaixo dele. A lista não é reordenada: cada faixa de níveis é
     /// uma passada sequencial em ordem de ID, o que mantém a leitura dos
     /// tamanhos em ordem de bloco.
     ///
@@ -876,12 +1018,12 @@ impl View<'_> {
             return Ok(Vec::new());
         }
         const CAP: usize = 64;
-        let level = |tf: u32| CAP - (tf as usize).min(CAP);
-        // Menor tf de um nível: o limite do nível inteiro.
-        let level_tf = |l: usize| (CAP - l) as u32;
+        let level = |p: &Posting| CAP - (bound.key(p.tf, p.title_tf) as usize).min(CAP);
+        // Menor chave de um nível: o limite do nível inteiro.
+        let level_key = |l: usize| (CAP - l) as u32;
         let mut count = [0usize; CAP + 1];
         for p in list {
-            count[level(p.tf)] += 1;
+            count[level(p)] += 1;
         }
 
         let mut top = TopK::new(k);
@@ -904,7 +1046,7 @@ impl View<'_> {
             while hi <= CAP {
                 if count[hi] > 0 {
                     if top.worst().is_some() {
-                        if hi > 0 && loses(&top, bound.get(level_tf(hi)), 0) {
+                        if hi > 0 && loses(&top, bound.get_key(level_key(hi)), 0) {
                             break;
                         }
                     } else if gathered >= k {
@@ -918,12 +1060,12 @@ impl View<'_> {
                 break; // o nível `lo` já não alcança o pior
             }
             for p in list {
-                let l = level(p.tf);
-                if l < lo || l >= hi || loses(&top, bound.get(p.tf), p.doc) {
+                let l = level(p);
+                if l < lo || l >= hi || loses(&top, bound.get(p.tf, p.title_tf), p.doc) {
                     continue;
                 }
-                let factor = bm25.doc_factor(norms.len(p.doc)?);
-                top.push(Hit { doc: p.doc, score: Bm25::score(weight, p.tf, factor) });
+                let norm = bm25.doc_norm(norms.lens(p.doc)?);
+                top.push(Hit { doc: p.doc, score: bm25.score(weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf)) });
             }
             lo = hi;
         }
@@ -974,7 +1116,10 @@ impl View<'_> {
         let mut merged: Vec<Posting> = Vec::with_capacity(all.len());
         for p in all {
             match merged.last_mut() {
-                Some(last) if last.doc == p.doc => last.tf = last.tf.saturating_add(p.tf),
+                Some(last) if last.doc == p.doc => {
+                    last.tf = last.tf.saturating_add(p.tf);
+                    last.title_tf = last.title_tf.saturating_add(p.title_tf);
+                }
                 _ => merged.push(p),
             }
         }
@@ -1124,22 +1269,24 @@ impl<'s> PhraseMatcher<'s> {
         })
     }
 
-    /// Quantas vezes a frase aparece em `doc`. `first_only` para na primeira.
-    fn count(&mut self, doc: DocId, first_only: bool) -> Result<u32> {
+    /// Quantas vezes a frase aparece em `doc`, e quantas dessas no título
+    /// (as que começam antes de `title_span`). `first_only` para na primeira.
+    fn count(&mut self, doc: DocId, first_only: bool, title_span: u32) -> Result<(u32, u32)> {
         for (cursor, positions) in self.cursors.iter_mut().zip(&mut self.positions) {
             if !cursor.seek(doc, positions)? {
-                return Ok(0);
+                return Ok((0, 0));
             }
         }
-        Ok(count_phrase(&self.offsets, &self.positions, &mut self.at, first_only))
+        Ok(count_phrase(&self.offsets, &self.positions, &mut self.at, first_only, title_span))
     }
 }
 
-/// Quantos `p` existem com o termo `i` na posição `p + offsets[i]`, para todo `i`.
-/// As listas estão em ordem crescente, então basta um ponteiro por termo.
-fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool) -> u32 {
+/// Quantos `p` existem com o termo `i` na posição `p + offsets[i]`, para todo
+/// `i`, e quantos desses `p` ficam antes de `title_span` (no título). As listas
+/// estão em ordem crescente, então basta um ponteiro por termo.
+fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool, title_span: u32) -> (u32, u32) {
     at.fill(0);
-    let mut count = 0;
+    let (mut count, mut in_title) = (0, 0);
     'anchors: for &p0 in &positions[0] {
         let Some(start) = p0.checked_sub(offsets[0]) else { continue };
         for i in 1..positions.len() {
@@ -1156,11 +1303,12 @@ fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first
             }
         }
         count += 1;
+        in_title += u32::from(start < title_span);
         if first_only {
             break;
         }
     }
-    count
+    (count, in_title)
 }
 
 /// Tamanho dos documentos de uma busca, um bloco de `norm:` por vez. Rápido
@@ -1180,7 +1328,7 @@ impl<'v, 'a> NormCursor<'v, 'a> {
     }
 
     #[inline]
-    fn len(&mut self, doc: DocId) -> Result<u32> {
+    fn lens(&mut self, doc: DocId) -> Result<DocLens> {
         let block_id = doc / NORM_BLOCK_DOCS;
         if block_id != self.block_id {
             self.block = match self.seen.get(&block_id) {
@@ -1196,7 +1344,7 @@ impl<'v, 'a> NormCursor<'v, 'a> {
         let offset = (doc % NORM_BLOCK_DOCS) as u16;
         self.block
             .as_ref()
-            .and_then(|b| b.get(offset))
+            .and_then(|b| b.get_lens(offset))
             .ok_or_else(|| Error::Corrupt(format!("documento {doc} sem tamanho em norm:")))
     }
 }
@@ -1284,8 +1432,9 @@ pub struct IndexBatch<'a> {
     dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
     pending: FxHashMap<String, TermAcc>,
-    /// (documento, tamanho inteiro, tamanho do título), na ordem em que foram adicionados.
-    lengths: Vec<(DocId, u32, u32)>,
+    /// (documento, tamanho inteiro, tamanho do título, extensão do título),
+    /// na ordem em que foram adicionados.
+    lengths: Vec<(DocId, u32, u32, u32)>,
     labels: Vec<(DocId, String)>,
     analyzer: Analyzer,
 }
@@ -1368,7 +1517,7 @@ impl IndexBatch<'_> {
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
         }
-        self.lengths.push((doc_id, len, title_len));
+        self.lengths.push((doc_id, len, title_len, analyzer.title_span()));
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
@@ -1471,7 +1620,7 @@ impl IndexBatch<'_> {
     fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
         let mut stats = self.state.stats;
         let mut order: Vec<(u64, usize)> =
-            self.lengths.iter().enumerate().map(|(i, &(doc, _, _))| (doc / NORM_BLOCK_DOCS, i)).collect();
+            self.lengths.iter().enumerate().map(|(i, &(doc, ..))| (doc / NORM_BLOCK_DOCS, i)).collect();
         // Estável por bloco: dentro do bloco, a ordem de adição (a última vence).
         if !order.windows(2).all(|w| w[0].0 <= w[1].0) {
             order.sort_by_key(|e| e.0);
@@ -1485,14 +1634,15 @@ impl IndexBatch<'_> {
                 None => NormBlock::default(),
             };
             while i < order.len() && order[i].0 == block_id {
-                let (doc, len, title_len) = self.lengths[order[i].1];
+                let (doc, len, title_len, title_span) = self.lengths[order[i].1];
                 // Título com mais de 65.535 tokens: a contagem para no máximo.
-                let title_len = u16::try_from(title_len).unwrap_or(u16::MAX);
-                match block.set((doc % NORM_BLOCK_DOCS) as u16, len, title_len) {
-                    Some((old, old_title)) => {
-                        stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old));
+                let small = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+                let (title_len, title_span) = (small(title_len), small(title_span));
+                match block.set((doc % NORM_BLOCK_DOCS) as u16, DocLens { len, title_len, title_span }) {
+                    Some(old) => {
+                        stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old.len));
                         stats.total_title_len =
-                            (stats.total_title_len + u64::from(title_len)).saturating_sub(u64::from(old_title));
+                            (stats.total_title_len + u64::from(title_len)).saturating_sub(u64::from(old.title_len));
                     }
                     None => {
                         stats.doc_count += 1;
@@ -1816,17 +1966,19 @@ mod tests {
         let mut at = vec![0; 3];
         // casa@0 papel@2: "casa X papel" em 0 e 10; casa em 5 sem papel em 7.
         let pos = vec![vec![0, 5, 10], vec![2, 12]];
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false), 2);
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], true), 1);
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 0), (2, 0));
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], true, 0), (1, 0));
+        // Título com extensão 3: a ocorrência que começa em 0 está nele, a de 10 não.
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 3), (2, 1));
         // Termo repetido: novo@0 novo@2 em "novo de novo de novo" (0, 2, 4).
         let pos = vec![vec![0, 2, 4], vec![0, 2, 4]];
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false), 2);
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 0), (2, 0));
         // Ordem trocada não casa.
         let pos = vec![vec![3], vec![2]];
-        assert_eq!(count_phrase(&[0, 1], &pos, &mut at[..2], false), 0);
+        assert_eq!(count_phrase(&[0, 1], &pos, &mut at[..2], false, 0), (0, 0));
         // Três termos.
         let pos = vec![vec![1, 8], vec![2, 9], vec![4, 20]];
-        assert_eq!(count_phrase(&[0, 1, 3], &pos, &mut at, false), 1);
+        assert_eq!(count_phrase(&[0, 1, 3], &pos, &mut at, false, 0), (1, 0));
     }
 
     #[test]
@@ -1847,7 +1999,7 @@ mod tests {
         let cache = EpochCache::<NormBlock>::default();
         let a = Arc::new(NormBlock::default());
         let mut b = NormBlock::default();
-        b.set(1, 10, 0);
+        b.set(1, DocLens { len: 10, title_len: 0, title_span: 0 });
         let b = Arc::new(b);
         // Nunca mudou: qualquer busca usa.
         cache.offer(7, 0, &a);

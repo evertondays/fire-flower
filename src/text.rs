@@ -203,6 +203,11 @@ impl Analyzer {
         (tokens.len() as u32, title_len)
     }
 
+    /// Posições ocupadas pelo título do último documento (stopwords inclusive).
+    pub fn title_span(&self) -> u32 {
+        self.title_span
+    }
+
     /// Quantas das `positions` (de um termo do último documento) estão no título.
     pub fn title_tf(&self, positions: &[u32]) -> u32 {
         positions.partition_point(|&p| p < self.title_span) as u32

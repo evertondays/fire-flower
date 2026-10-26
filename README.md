@@ -15,8 +15,9 @@ Suporta:
 - busca por prefixo (`program*`);
 - busca por **frase** (`"casa de papel"`): os termos em sequência, com as
   stopwords contando como buraco;
-- **ranking BM25**: os resultados saem por relevância (`search_top`), com
-  `k1 = 1,2` e `b = 0,75`; `search` continua devolvendo todos os IDs em ordem;
+- **ranking BM25F**: os resultados saem por relevância (`search_top`), com o
+  título como campo de peso próprio (`add_titled`; `k1 = 1,2`, `b = 0,75`,
+  peso do título 50); `search` continua devolvendo todos os IDs em ordem;
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
 - indexação em lotes atômicos, com buscas rodando em paralelo.
 
@@ -213,9 +214,10 @@ python3 scripts/perf.py tudo --escala 10k
 - **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID troca o
   tf, as posições e o tamanho dele (e não conta o documento duas vezes), mas
   termos que saíram do texto continuam apontando para ele.
-- **Título sem peso maior.** O BM25 olha o documento como um texto só; buscar
-  "Brasil" não garante o artigo "Brasil" em primeiro (campos/BM25F ficam para
-  depois).
+- **Peso do título ajustado para a Wikipédia.** O peso 50 saiu de consultas
+  com resposta conhecida na Wikipédia, onde o título descreve o artigo; em
+  outro tipo de corpus, ajuste `Config::title_weight`. Páginas de
+  desambiguação podem passar à frente do artigo principal.
 - **Frases:** uma stopword dentro da frase só conta a distância (`"casa de
   papel"` também casa "casa da papel"); frase só de stopwords fica vazia; não
   há prefixo dentro de frase (`"revolução franc*"`).

@@ -377,20 +377,36 @@ fn merge_positions_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
 
 // ------------------------------------------------------------------ norm:
 
-/// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`):
-/// o do documento inteiro (título e texto) e o do título.
+/// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`).
 ///
-/// No disco, só os documentos que existem: (Δdeslocamento, tamanho, tamanho
-/// do título) em ordem. Em memória o bloco é denso (um par por deslocamento,
-/// até o maior), para o ranking ler o tamanho de um documento com um acesso
-/// direto: ele faz isso milhares de vezes por busca. Ocupa no máximo 6 KB.
+/// Para cada documento: o tamanho do documento inteiro e o do título (tokens
+/// indexados, sem stopwords; o BM25F normaliza cada campo pelo seu), e a
+/// extensão do título nas posições (stopwords inclusive): uma ocorrência de
+/// frase que começa antes dela está no título.
+///
+/// No disco, só os documentos que existem: (Δdeslocamento, tamanho, título,
+/// extensão) em ordem. Em memória o bloco é denso (um registro por
+/// deslocamento, até o maior), para o ranking ler o tamanho de um documento
+/// com um acesso direto: ele faz isso milhares de vezes por busca. Ocupa no
+/// máximo 8 KB.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NormBlock {
     /// Tamanho por deslocamento; [`ABSENT`] onde não há documento.
     lens: Vec<u32>,
-    /// Tamanho do título por deslocamento (0 onde não há documento).
-    title_lens: Vec<u16>,
+    /// (tamanho do título, extensão do título) por deslocamento.
+    titles: Vec<(u16, u16)>,
     count: usize,
+}
+
+/// Os tamanhos de um documento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DocLens {
+    /// Tokens indexados do documento inteiro (título e texto).
+    pub len: u32,
+    /// Tokens indexados do título (já contados em `len`).
+    pub title_len: u16,
+    /// Posições ocupadas pelo título, stopwords inclusive.
+    pub title_span: u16,
 }
 
 /// Documentos por bloco de `norm:`.
@@ -401,13 +417,14 @@ const ABSENT: u32 = u32::MAX;
 
 impl NormBlock {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + self.count * 4);
+        let mut buf = Vec::with_capacity(2 + self.count * 5);
         put_varint(&mut buf, self.count as u64);
         let mut prev = 0;
-        for (off, len, title_len) in self.iter() {
+        for (off, l) in self.iter() {
             put_varint(&mut buf, u64::from(off - prev));
-            put_varint(&mut buf, u64::from(len));
-            put_varint(&mut buf, u64::from(title_len));
+            put_varint(&mut buf, u64::from(l.len));
+            put_varint(&mut buf, u64::from(l.title_len));
+            put_varint(&mut buf, u64::from(l.title_span));
             prev = off;
         }
         buf
@@ -431,11 +448,13 @@ impl NormBlock {
                 return Err(corrupt("documento fora do bloco de tamanhos"));
             }
             let len = r.u32()?;
-            let title_len = u16::try_from(r.varint()?).map_err(|_| corrupt("tamanho de título inválido"))?;
-            if len == ABSENT || u32::from(title_len) > len {
+            let small = |v: u64| u16::try_from(v).map_err(|_| corrupt("tamanho de título inválido"));
+            let title_len = small(r.varint()?)?;
+            let title_span = small(r.varint()?)?;
+            if len == ABSENT || u32::from(title_len) > len || title_len > title_span {
                 return Err(corrupt("tamanho de documento inválido"));
             }
-            block.set(off as u16, len, title_len);
+            block.set(off as u16, DocLens { len, title_len, title_span });
         }
         r.finish()?;
         Ok(block)
@@ -444,39 +463,38 @@ impl NormBlock {
     /// Tamanho do documento inteiro (título e texto).
     #[inline]
     pub fn get(&self, offset: u16) -> Option<u32> {
-        match self.lens.get(usize::from(offset)) {
-            Some(&len) if len != ABSENT => Some(len),
-            _ => None,
-        }
+        self.get_lens(offset).map(|l| l.len)
     }
 
-    /// (tamanho do documento inteiro, tamanho do título).
+    /// Todos os tamanhos do documento.
     #[inline]
-    pub fn get_both(&self, offset: u16) -> Option<(u32, u16)> {
+    pub fn get_lens(&self, offset: u16) -> Option<DocLens> {
         let i = usize::from(offset);
         match self.lens.get(i) {
-            Some(&len) if len != ABSENT => Some((len, self.title_lens[i])),
+            Some(&len) if len != ABSENT => {
+                let (title_len, title_span) = self.titles[i];
+                Some(DocLens { len, title_len, title_span })
+            }
             _ => None,
         }
     }
 
     /// Grava os tamanhos e devolve os anteriores, se o documento já estava no bloco.
-    pub fn set(&mut self, offset: u16, len: u32, title_len: u16) -> Option<(u32, u16)> {
+    pub fn set(&mut self, offset: u16, lens: DocLens) -> Option<DocLens> {
         debug_assert!(u64::from(offset) < NORM_BLOCK_DOCS);
-        debug_assert!(len != ABSENT && u32::from(title_len) <= len);
+        debug_assert!(lens.len != ABSENT && u32::from(lens.title_len) <= lens.len);
         let i = usize::from(offset);
         if i >= self.lens.len() {
             self.lens.resize(i + 1, ABSENT);
-            self.title_lens.resize(i + 1, 0);
+            self.titles.resize(i + 1, (0, 0));
         }
-        let old = std::mem::replace(&mut self.lens[i], len);
-        let old_title = std::mem::replace(&mut self.title_lens[i], title_len);
-        if old == ABSENT {
+        let old = self.get_lens(offset);
+        self.lens[i] = lens.len;
+        self.titles[i] = (lens.title_len, lens.title_span);
+        if old.is_none() {
             self.count += 1;
-            None
-        } else {
-            Some((old, old_title))
         }
+        old
     }
 
     pub fn len(&self) -> usize {
@@ -487,13 +505,9 @@ impl NormBlock {
         self.count == 0
     }
 
-    /// (deslocamento, tamanho, tamanho do título) em ordem crescente.
-    pub fn iter(&self) -> impl Iterator<Item = (u16, u32, u16)> + '_ {
-        self.lens
-            .iter()
-            .enumerate()
-            .filter(|&(_, &len)| len != ABSENT)
-            .map(|(off, &len)| (off as u16, len, self.title_lens[off]))
+    /// (deslocamento, tamanhos) em ordem crescente.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, DocLens)> + '_ {
+        (0..self.lens.len()).filter_map(|i| self.get_lens(i as u16).map(|l| (i as u16, l)))
     }
 }
 
@@ -688,8 +702,9 @@ mod tests {
         assert!(decode_positions(&[1, 1, 2, 5, 0]).is_err()); // posição repetida
         assert!(decode_positions(&[1, 1, 1, 5, 7]).is_err()); // sobra
         assert!(NormBlock::decode(&[1, 0x80, 0x08, 1]).is_err()); // deslocamento 1024
-        assert!(NormBlock::decode(&[2, 3, 1, 0, 0, 1, 0]).is_err()); // repetido
-        assert!(NormBlock::decode(&[1, 3, 1, 2]).is_err()); // título maior que o documento
+        assert!(NormBlock::decode(&[2, 3, 1, 0, 0, 0, 1, 0, 0]).is_err()); // repetido
+        assert!(NormBlock::decode(&[1, 3, 1, 2, 2]).is_err()); // título maior que o documento
+        assert!(NormBlock::decode(&[1, 3, 4, 2, 1]).is_err()); // título maior que a extensão dele
         assert!(merge_postings([&[2u8, 1][..]].into_iter()).is_none());
         assert!(merge_positions([&[1u8, 1, 2, 5][..]].into_iter()).is_none());
     }
@@ -773,17 +788,18 @@ mod tests {
 
     #[test]
     fn norm_block_roundtrip_and_updates() {
+        let l = |len, title_len, title_span| DocLens { len, title_len, title_span };
         let mut block = NormBlock::default();
-        assert_eq!(block.set(5, 100, 3), None);
-        assert_eq!(block.set(900, 7, 0), None);
-        assert_eq!(block.set(2, 0, 0), None, "insere no meio");
-        assert_eq!(block.set(5, 40, 2), Some((100, 3)), "reindexar devolve os tamanhos antigos");
-        assert_eq!(block.iter().collect::<Vec<_>>(), [(2, 0, 0), (5, 40, 2), (900, 7, 0)]);
+        assert_eq!(block.set(5, l(100, 3, 4)), None);
+        assert_eq!(block.set(900, l(7, 0, 0)), None);
+        assert_eq!(block.set(2, l(0, 0, 0)), None, "insere no meio");
+        assert_eq!(block.set(5, l(40, 2, 5)), Some(l(100, 3, 4)), "reindexar devolve os tamanhos antigos");
+        assert_eq!(block.iter().collect::<Vec<_>>(), [(2, l(0, 0, 0)), (5, l(40, 2, 5)), (900, l(7, 0, 0))]);
         let decoded = NormBlock::decode(&block.encode()).unwrap();
         assert_eq!(decoded, block);
         assert_eq!(decoded.get(5), Some(40));
-        assert_eq!(decoded.get_both(5), Some((40, 2)));
-        assert_eq!(decoded.get_both(6), None);
+        assert_eq!(decoded.get_lens(5), Some(l(40, 2, 5)));
+        assert_eq!(decoded.get_lens(6), None);
         assert_eq!(decoded.get(6), None);
         assert_eq!(decoded.get(2), Some(0), "tamanho 0 existe");
         assert_eq!(decoded.get(800), None);

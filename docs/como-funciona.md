@@ -675,18 +675,36 @@ prefixo dentro de frase.
 ### 6.6 Ranking: `search_top("casa azul", 10)`
 
 `search` devolve todos os IDs em ordem. `search_top` (e `search_ranked`, que
-também dá o total) devolve os *k* mais relevantes pelo **BM25**:
+também dá o total) devolve os *k* mais relevantes pelo **BM25F**, o BM25 com
+o título como campo próprio:
 
 ```text
 idf(t)     = ln(1 + (N − df + 0,5) / (df + 0,5))
-nota(t, d) = idf(t) · tf · (k1 + 1) / (tf + k1 · (1 − b + b · |d| / média))
+B_f(d)     = 1 − b_f + b_f · len_f(d) / média_f          (f = texto, título)
+tf~(t, d)  = tf_texto / B_texto  +  w · tf_título / B_título
+nota(t, d) = idf(t) · tf~ · (k1 + 1) / (tf~ + k1)
 nota(d)    = soma das notas das partes da consulta
 ```
 
-*N* é `meta:doc_count`, *df* o tamanho da lista do termo, *|d|* o tamanho do
-documento (`norm:`) e a média é `total_len ÷ N`. `k1 = 1,2` e `b = 0,75`
-(`Config::bm25_k1`, `Config::bm25_b`). Um termo raro (idf alto) pesa mais; o
-tf ajuda, mas satura; e o mesmo tf vale mais num documento curto.
+*N* é `meta:doc_count`, *df* o tamanho da lista do termo, `len_f` o tamanho
+do campo no documento (`norm:` guarda o do documento inteiro e o do título;
+o do texto é a diferença) e as médias vêm de `total_len` e `total_title_len`.
+`k1 = 1,2` e `b = 0,75` no texto (`Config::bm25_k1`, `Config::bm25_b`); no
+título, peso `w = 50` e `b = 0,9` (`Config::title_weight`,
+`Config::title_b`). Um termo raro (idf alto) pesa mais; o tf ajuda, mas
+satura; o mesmo tf vale mais num documento curto; e uma ocorrência no
+título vale como muitas no texto, mais ainda num título curto.
+
+Por que somar dentro da saturação (BM25F) e não dois BM25: com um BM25 por
+campo, cada campo satura sozinho e o título vale quase uma palavra a mais.
+Assim, a consulta `coreia do norte` põe o artigo "Coreia do Norte" à frente
+de "Bandeira da Coreia do Norte" e de "Demografia da…", que antes empatavam
+com ele.
+
+O peso e o `b` do título saíram de uma grade sobre consultas com resposta
+conhecida na Wikipédia de 100k ([plano-relevancia.md](plano-relevancia.md),
+Fase 4): a qualidade sobe até ~50 e depois quase não muda. Sem título
+(`add_document`), `tf_título = 0` e a nota é exatamente o BM25.
 
 - **Prefixo:** conta como **um termo só**. O df é o número de documentos com
   alguma completação, e o tf de um documento é a soma dos tf das completações
@@ -695,7 +713,9 @@ tf ajuda, mas satura; e o mesmo tf vale mais num documento curto.
   uma com o próprio idf), `coreia norte*` punha em 1º um artigo que cita a
   Nortel ([plano-relevancia.md](plano-relevancia.md), R1).
 - **Frase:** entra na soma como um termo, com tf = quantas vezes a frase
-  aparece no documento e idf = soma dos idfs dos termos (como o Lucene).
+  aparece no documento e idf = soma dos idfs dos termos (como o Lucene). Uma
+  ocorrência que começa antes da extensão do título (`norm:` guarda também
+  quantas posições o título ocupa) conta como título.
 - **Empate:** nota decrescente, depois ID crescente.
 
 O E é o mesmo da busca sem ranking: a lista menor conduz e as outras avançam
@@ -704,13 +724,17 @@ casa, a nota é somada na ordem da consulta e entra num heap dos *k* melhores.
 
 Para não pagar a nota de todo documento:
 
-- **Limite superior.** A maior nota que uma parte pode dar com um certo tf é a
-  de um documento de tamanho 0. Isso fica numa tabela por tf, sem divisão. Com
-  o heap cheio, um documento cujo limite não passa do pior guardado é pulado
-  sem ler o tamanho. O corte é exato: ponto flutuante arredonda de forma
-  monótona, então o limite nunca fica abaixo da nota de verdade.
-- **Termo único** (o caso mais comum): a nota só depende do tf e do tamanho.
-  Os documentos são agrupados em níveis de tf, e o limite de um nível vale
+- **Limite superior.** A maior nota que uma parte pode dar é a de um
+  documento de tamanho 0. Ela depende de uma **chave**: as ocorrências
+  equivalentes do texto, com as do título convertidas (`w · (1 − b_texto) /
+  (1 − b_título)` cada) e arredondadas para cima. Sem título, a chave é o
+  próprio tf. O limite por chave fica numa tabela, sem divisão, com uma
+  margem relativa de 1e-12 para o arredondamento. Com o heap cheio, um
+  documento cujo limite não passa do pior guardado é pulado sem ler o
+  tamanho. O corte é exato (os testes comparam o top-k com o ranking
+  completo, com e sem título).
+- **Termo único** (o caso mais comum): a nota só depende dos tf e dos
+  tamanhos. Os documentos são agrupados em níveis de chave, e o limite de um nível vale
   para todos os abaixo dele. Uma passada conta os documentos de cada nível;
   a primeira faixa (do maior tf até juntar *k* documentos) enche o top; a
   segunda vai até o primeiro nível cujo limite não alcança o pior guardado, e
@@ -719,7 +743,7 @@ Para não pagar a nota de todo documento:
   documentos), só ~11% recebem nota; o resto (tf baixo) nem lê o tamanho.
 - **Tamanhos em cache.** Os blocos de `norm:` decodificados ficam num cache do
   `Engine`, compartilhado pelas buscas (seção 7). Em memória o bloco é denso
-  (um número por ID, até 4 KB), então ler o tamanho de um documento é um
+  (um registro por ID, até 8 KB), então ler os tamanhos de um documento é um
   acesso direto.
 
 Na Wikipédia de 100k (cache quente, 1 thread), o top 10 de um termo frequente

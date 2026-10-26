@@ -212,14 +212,90 @@ rodada.
 
 ## 10. Checklist
 
-- [ ] Fase 1: `wiki relevancia`, conjuntos `rel-*` em 100k, `manual.tsv`, seção no relatório
-- [ ] Fase 1: linha de base com o ranking atual
-- [ ] Fase 2: prefixo como um termo só + oráculo + testes
-- [ ] Fase 2: D8 substituída por R1 nos docs; avaliação e latência
-- [ ] Fase 3: analyzer com dois campos e posições com vão
-- [ ] Fase 3: codec v3 (`post:`, `norm:`, merge) + testes
-- [ ] Fase 3: `add_titled`, carga sem concatenar, `index` com nome do arquivo
-- [ ] Fase 3: oráculo v3 + `search` igual ao v2 em 10k
-- [ ] Fase 4: BM25F, limite com dois campos, `Config` validado
-- [ ] Fase 4: grade de peso × b, confirmação com outra seed, padrão escolhido
+- [x] Fase 1: `wiki relevancia`, conjuntos `rel-*` em 100k, `manual.tsv`, seção no relatório
+- [x] Fase 1: linha de base com o ranking atual
+- [x] Fase 2: prefixo como um termo só + oráculo + testes
+- [x] Fase 2: D8 substituída por R1 nos docs; avaliação e latência
+- [x] Fase 3: analyzer com dois campos e posições com vão
+- [x] Fase 3: codec v3 (`post:`, `norm:`, merge) + testes
+- [x] Fase 3: `add_titled`, carga sem concatenar, `index` com nome do arquivo
+- [x] Fase 3: oráculo v3 + `search` igual ao v2 em 10k
+- [x] Fase 4: BM25F, limite com dois campos, `Config` validado
+- [x] Fase 4: grade de peso × b, confirmação com outra seed, padrão escolhido
 - [ ] Rodadas de performance 100k e full; metas preenchidas
+
+---
+
+## 11. Como ficou (26/10/2026)
+
+Commits: `ad30369` (Fase 1), `9bd293b` (Fase 2), `fb63d23` (Fase 3) e o da
+Fase 4.
+
+### Relevância em 100k (linha de base → agora)
+
+| Conjunto | top-1 | top-3 | top-10 | MRR | Meta |
+|---|---|---|---|---|---|
+| `rel-manual` (36 consultas) | 8,3% → **66,7%** | 36,1% → **94,4%** | 55,6% → 100% | 0,251 → 0,811 | todas no top-3 ✗ (34 de 36) |
+| `rel-hub` | 38,6% → **97,9%** | 68,2% → 99,9% | 89,0% → 100% | 0,560 → 0,989 | top-1 ≥ 90% ✔ |
+| `rel-digitando` | 64,6% → **84,4%** | 81,2% → 94,2% | 90,1% → 98,0% | 0,741 → **0,897** | MRR ≥ 0,8 ✔ |
+| `rel-titulo` | 81,3% → **99,3%** | 92,8% → 100% | 97,1% → 100% | 0,875 → 0,996 | top-1 ≥ 95% ✔ |
+| `rel-corpo` | 49,8% → 49,5% | 68,7% → 68,4% | 81,4% → **81,5%** | 0,612 → 0,610 | ≥ base − 2 ✔ |
+
+As duas consultas à mão fora do top-3 são ambíguas: `lula` (o molusco; a
+página de desambiguação vem em 1º) e `brasi*` (prefixo curto: "Brasileiros",
+"Brasiguaios", "Brasília" antes de "Brasil"). `coreia do norte` e `coreia do
+nor*` dão "Coreia do Norte" em 1º.
+
+O que sobra de erro em `rel-hub` e `rel-digitando`: páginas "(desambiguação)"
+antes do artigo principal e prefixos curtos que casam vários títulos
+(`astron*` → "Astrônomo" antes de "Astronomia").
+
+### Grade (Fase 4)
+
+Peso do título × `b` do título em 100k, depois confirmada com outra amostra
+(seed 7). A média do MRR de título, digitando e hub sobe até peso ~50 e
+depois quase não muda (0,961 em 50; 0,965 em 1000), e `rel-corpo` não mexe
+em nenhum ponto. Escolha: **peso 50, `b` do título 0,9** (0,9 em vez de 1,0:
+mesma qualidade, e o limite do corte do top-k continua finito).
+
+| Peso (b 0,9) | 1 | 8 | 24 | 32 | 50 | 100 |
+|---|---|---|---|---|---|---|
+| MRR médio (seed 42) | 0,736* | 0,841* | 0,946 | 0,954 | 0,961 | 0,964 |
+| MRR médio (seed 7) | 0,741 | 0,874 | 0,942 | 0,953 | 0,961 | 0,963 |
+
+<sub>* com b 0,5; a grade inicial ia de 1 a 8 com b ∈ {0,3; 0,5; 0,75}.</sub>
+
+### Desvios do plano
+
+- **`norm:` guarda também a extensão do título** (posições, stopwords
+  inclusive), além do tamanho dele: é o que diz se uma ocorrência de frase
+  está no título. O tamanho sem stopwords não basta.
+- **Fase 3 sem `w = 0`:** o ranking da Fase 3 usou o tf e o tamanho
+  totais, o que reproduz exatamente as notas do v2 (a avaliação deu os mesmos
+  números da Fase 2). Mais forte que `w = 0`, que zeraria documentos que só
+  têm o termo no título.
+- **`b = 1` é aceito** (sem limite útil para o corte, mas exato); `Config`
+  só recusa valores fora de [0, 1], peso negativo e NaN.
+
+### Custo
+
+Mesmo conteúdo, carregado do mesmo jeito (v2 da Fase 2 vs. v3 com BM25F,
+100k, sem compactar, 2 rodadas):
+
+| Conjunto | p50 v2 | p50 v3 | Diferença |
+|---|---|---|---|
+| `t-medio`, `titulos`, `and-2` (sem ranking) | 33 / 50 / 67 µs | 34 / 50 / 69 µs | ~0 |
+| `rank-freq` | 258 µs | 259 µs | 0% |
+| `rank-and` | 165 µs | 200 µs | +21% |
+| `rank-titulos` | 59 µs | 73 µs | +25% |
+| `misto` | 59 µs | 72 µs | +22% |
+
+Acima da meta de +20% nos rankings com vários termos ou com título: com
+peso 50 o limite de um documento com o termo no título fica alto e o corte
+descarta menos. Carga e banco ficaram iguais (100k: ~3.500–3.700 docs/s,
+0,55× o texto).
+
+Uma medição anterior mostrava o v3 ~25% mais lento até na busca sem ranking.
+Era o banco v2 de comparação: compactado em outra época (antes dos filtros
+particionados), cada `get` dele custava ~0,45 µs a menos com os mesmos nós
+byte a byte. Carregando os dois do zero, a diferença some.

@@ -194,6 +194,9 @@ enum Cmd {
         /// Mede também tempos no PerfContext (mais preciso, mas pesa na latência)
         #[arg(long)]
         perf_time: bool,
+        /// Profundidade do cache de nós das buscas ("nenhum" desliga)
+        #[arg(long)]
+        cache_leitura: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
         #[arg(long)]
@@ -265,8 +268,12 @@ fn main() -> AnyResult {
             };
             relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_mb, label } => {
-            bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, cache_mb, label)
+        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, label } => {
+            let mut config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
+            if let Some(depth) = cache_leitura {
+                config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
+            }
+            bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, config, label)
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),
@@ -2389,9 +2396,8 @@ fn drop_os_caches() -> AnyResult {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, cache_mb: usize, label: Option<String>) -> AnyResult {
+fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, config: Config, label: Option<String>) -> AnyResult {
     let sets = read_query_sets(paths)?;
-    let config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
     // O enum do crate também está deslocado: `EnableTime` corresponde a medir tempos no RocksDB 10.
     let level = if perf_time { PerfStatsLevel::EnableTime } else { PerfStatsLevel::EnableCount };
     let mut engine = if cold { None } else { Some(Engine::open(db, config.clone())?) };

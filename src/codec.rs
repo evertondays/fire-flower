@@ -1,4 +1,4 @@
-//! Serialização compacta dos valores gravados no RocksDB (formato v2).
+//! Serialização compacta dos valores gravados no RocksDB (formato v4).
 //!
 //! Inteiros usam varint (LEB128): números pequenos ocupam 1–2 bytes em vez de
 //! 8. Listas são ordenadas por documento e gravam a diferença (delta) entre IDs
@@ -7,8 +7,17 @@
 //! | Chave | Valor |
 //! |---|---|
 //! | `node:<id>` | flags, `n`, `n × (caractere, filho)` |
-//! | `post:<nó>` | `n`, `n × (Δdoc, tf)` |
-//! | `pos:<nó>` | `n`, `n × (Δdoc, k, k × Δposição)` (a primeira posição é absoluta) |
+//! | `post:<nó>` | `n`, saltos, `n × (Δdoc, tf << 1 \| tem título, [tf do título])` |
+//! | `pos:<nó>` | `n`, saltos, `n × (Δdoc, k, k × Δposição)` (a primeira posição é absoluta) |
+//!
+//! **Saltos (v4):** listas com mais de `2 × SKIP_BLOCK` entradas guardam,
+//! antes das entradas, uma tabela com o último documento e o tamanho em bytes
+//! de cada bloco de `SKIP_BLOCK` entradas: `s`, `s × (Δúltimo doc, bytes)`.
+//! Listas menores gravam `s = 0`. As entradas são exatamente as do v3 (os
+//! deltas continuam de um bloco para o outro), então decodificar a lista
+//! inteira só pula a tabela; os cursores ([`PostingsCursor`],
+//! [`PositionsCursor`]) a usam para ir direto ao bloco de um documento sem
+//! decodificar os anteriores.
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
 
 use crate::{DocId, Error, Posting};
@@ -125,17 +134,97 @@ impl<'a> IntoIterator for &'a Children {
 pub fn encode_postings_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)]) {
     debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
     debug_assert!(entries.iter().all(|e| e.1 > 0 && e.2 <= e.1));
-    buf.reserve(1 + entries.len() * 3);
-    put_varint(buf, entries.len() as u64);
-    let mut prev = 0;
-    for &(doc, tf, title_tf) in entries {
-        put_varint(buf, doc - prev);
-        put_varint(buf, (u64::from(tf) << 1) | u64::from(title_tf > 0));
-        if title_tf > 0 {
-            put_varint(buf, u64::from(title_tf));
+    let write = |out: &mut Vec<u8>, blocks: &mut Vec<(DocId, usize)>| {
+        let start = out.len();
+        let mut prev = 0;
+        for (i, &(doc, tf, title_tf)) in entries.iter().enumerate() {
+            put_varint(out, doc - prev);
+            put_varint(out, (u64::from(tf) << 1) | u64::from(title_tf > 0));
+            if title_tf > 0 {
+                put_varint(out, u64::from(title_tf));
+            }
+            prev = doc;
+            if (i + 1) % SKIP_BLOCK == 0 || i + 1 == entries.len() {
+                blocks.push((doc, out.len() - start));
+            }
         }
-        prev = doc;
+    };
+    write_list(buf, entries.len(), write);
+}
+
+/// Entradas por bloco da tabela de saltos.
+pub const SKIP_BLOCK: usize = 128;
+
+/// Grava `n`, a tabela de saltos (se a lista for grande) e as entradas.
+/// `write` grava as entradas num buffer e anota, para cada bloco de
+/// `SKIP_BLOCK` entradas (o último pode ser menor), o último documento e onde
+/// o bloco termina (bytes desde o começo das entradas).
+fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Vec<u8>, &mut Vec<(DocId, usize)>)) {
+    put_varint(buf, n as u64);
+    if n <= 2 * SKIP_BLOCK {
+        // Lista pequena: sem tabela, e as entradas vão direto para `buf`.
+        buf.push(0);
+        write(buf, &mut Vec::new());
+        return;
     }
+    let mut body = Vec::with_capacity(n * 3);
+    let mut blocks = Vec::with_capacity(n.div_ceil(SKIP_BLOCK));
+    write(&mut body, &mut blocks);
+    put_skips(buf, &blocks);
+    buf.extend_from_slice(&body);
+}
+
+/// `s`, depois `(Δúltimo doc, bytes)` de cada bloco. `blocks` traz o último
+/// documento e o fim de cada bloco, acumulados.
+fn put_skips(buf: &mut Vec<u8>, blocks: &[(DocId, usize)]) {
+    put_varint(buf, blocks.len() as u64);
+    let (mut last, mut end) = (0, 0);
+    for &(doc, block_end) in blocks {
+        put_varint(buf, doc - last);
+        put_varint(buf, (block_end - end) as u64);
+        (last, end) = (doc, block_end);
+    }
+}
+
+/// Cabeçalho de uma lista: quantas entradas, os blocos da tabela de saltos
+/// (último documento e início do bloco, relativo às entradas) e onde as
+/// entradas começam.
+struct ListHeader {
+    n: u64,
+    blocks: Vec<(DocId, usize)>,
+    body: usize,
+}
+
+impl ListHeader {
+    /// `parse_skips = false` só pula a tabela (decodificação completa).
+    fn parse(bytes: &[u8], parse_skips: bool) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes);
+        let n = r.varint()?;
+        let s = r.varint()?;
+        let expected = if n as usize > 2 * SKIP_BLOCK { (n as usize).div_ceil(SKIP_BLOCK) } else { 0 };
+        if s as usize != expected {
+            return Err(corrupt("tabela de saltos com tamanho errado"));
+        }
+        let mut blocks = Vec::new();
+        if parse_skips {
+            blocks.reserve(s as usize);
+            let (mut last, mut start) = (0u64, 0usize);
+            for _ in 0..s {
+                last = last.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
+                let len = usize::try_from(r.varint()?).map_err(|_| corrupt("bloco grande demais"))?;
+                blocks.push((last, start));
+                start = start.checked_add(len).ok_or_else(|| corrupt("bloco grande demais"))?;
+            }
+        } else {
+            r.skip_varints(2 * s)?;
+        }
+        Ok(Self { n, blocks, body: r.pos })
+    }
+}
+
+/// Quantas entradas a lista tem (o df do termo), sem decodificá-la.
+pub fn list_len(bytes: &[u8]) -> Result<u64, Error> {
+    Reader::new(bytes).varint()
 }
 
 pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
@@ -146,7 +235,8 @@ pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
 }
 
 /// Lê o tf de uma entrada e, se houver, o do título: `(tf, tf no título)`.
-#[inline]
+/// Sempre embutida: está no laço mais quente da decodificação de listas.
+#[inline(always)]
 fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
     let packed = r.varint()?;
     let tf = u32::try_from(packed >> 1).map_err(|_| corrupt("tf estourou u32"))?;
@@ -159,8 +249,9 @@ fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
 
 /// Lista completa: documento e frequência do termo (total e no título).
 pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
-    let mut r = Reader::new(bytes);
-    let n = r.varint()?;
+    let header = ListHeader::parse(bytes, false)?;
+    let n = header.n;
+    let mut r = Reader { buf: bytes, pos: header.body };
     // Cada entrada ocupa pelo menos 2 bytes: limita a pré-alocação a dados reais.
     let mut out = Vec::with_capacity((n as usize).min(bytes.len() / 2));
     let mut doc: DocId = 0;
@@ -175,8 +266,9 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
 
 /// Só os IDs, pulando as frequências: é o que a busca sem ranking precisa.
 pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
-    let mut r = Reader::new(bytes);
-    let n = r.varint()?;
+    let header = ListHeader::parse(bytes, false)?;
+    let n = header.n;
+    let mut r = Reader { buf: bytes, pos: header.body };
     let mut out = Vec::with_capacity((n as usize).min(bytes.len() / 2));
     let mut doc: DocId = 0;
     for _ in 0..n {
@@ -188,6 +280,73 @@ pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
     }
     r.finish()?;
     Ok(out)
+}
+
+/// Percorre uma lista `post:` em ordem crescente de documento, pulando
+/// blocos inteiros pela tabela de saltos: achar um documento numa lista de
+/// 100 mil entradas decodifica no máximo um bloco (`SKIP_BLOCK` entradas).
+pub struct PostingsCursor<'a> {
+    r: Reader<'a>,
+    body: usize,
+    n: u64,
+    blocks: Vec<(DocId, usize)>,
+    /// Entradas já lidas.
+    read: u64,
+    prev: DocId,
+    /// A última entrada lida (a primeira com documento ≥ o último alvo).
+    current: Option<Posting>,
+}
+
+impl<'a> PostingsCursor<'a> {
+    pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
+        let ListHeader { n, blocks, body } = ListHeader::parse(bytes, true)?;
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, read: 0, prev: 0, current: None })
+    }
+
+    /// Quantas entradas a lista tem.
+    pub fn len(&self) -> u64 {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// A primeira entrada com documento ≥ `target` (o alvo só pode crescer
+    /// entre chamadas), ou `None` se a lista acabou antes.
+    pub fn seek(&mut self, target: DocId) -> Result<Option<Posting>, Error> {
+        if let Some(c) = self.current
+            && c.doc >= target
+        {
+            return Ok(Some(c));
+        }
+        // O bloco da próxima entrada termina antes do alvo: salta.
+        let next_block = (self.read as usize) / SKIP_BLOCK;
+        if next_block < self.blocks.len() && self.blocks[next_block].0 < target {
+            let b = next_block + self.blocks[next_block..].partition_point(|&(last, _)| last < target);
+            if b == self.blocks.len() {
+                self.read = self.n;
+                self.current = None;
+                return Ok(None);
+            }
+            self.r.pos = self.body + self.blocks[b].1;
+            self.prev = if b > 0 { self.blocks[b - 1].0 } else { 0 };
+            self.read = (b * SKIP_BLOCK) as u64;
+        }
+        while self.read < self.n {
+            let doc = self.prev.checked_add(self.r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
+            let (tf, title_tf) = read_tfs(&mut self.r)?;
+            self.read += 1;
+            self.prev = doc;
+            if doc >= target {
+                let p = Posting { doc, tf, title_tf };
+                self.current = Some(p);
+                return Ok(Some(p));
+            }
+        }
+        self.current = None;
+        Ok(None)
+    }
 }
 
 // ------------------------------------------------------------------ pos:
@@ -207,20 +366,26 @@ pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)], p
 }
 
 fn encode_positions_with<'p>(buf: &mut Vec<u8>, n: usize, entries: impl Iterator<Item = (DocId, &'p [u32])>) {
-    put_varint(buf, n as u64);
-    let mut prev = 0;
-    for (doc, positions) in entries {
-        debug_assert!(doc > prev || prev == 0);
-        debug_assert!(!positions.is_empty() && positions.windows(2).all(|w| w[0] < w[1]));
-        put_varint(buf, doc - prev);
-        put_varint(buf, positions.len() as u64);
-        let mut last = 0;
-        for &p in positions {
-            put_varint(buf, u64::from(p - last));
-            last = p;
+    let write = |out: &mut Vec<u8>, blocks: &mut Vec<(DocId, usize)>| {
+        let start = out.len();
+        let mut prev = 0;
+        for (i, (doc, positions)) in entries.enumerate() {
+            debug_assert!(doc > prev || prev == 0);
+            debug_assert!(!positions.is_empty() && positions.windows(2).all(|w| w[0] < w[1]));
+            put_varint(out, doc - prev);
+            put_varint(out, positions.len() as u64);
+            let mut last = 0;
+            for &p in positions {
+                put_varint(out, u64::from(p - last));
+                last = p;
+            }
+            prev = doc;
+            if (i + 1) % SKIP_BLOCK == 0 || i + 1 == n {
+                blocks.push((doc, out.len() - start));
+            }
         }
-        prev = doc;
-    }
+    };
+    write_list(buf, n, write);
 }
 
 /// Lista completa de posições (diagnóstico e testes; a busca usa o cursor).
@@ -236,10 +401,14 @@ pub fn decode_positions(bytes: &[u8]) -> Result<Vec<(DocId, Vec<u32>)>, Error> {
     Ok(out)
 }
 
-/// Percorre uma lista `pos:` sem decodificá-la inteira: as posições dos
-/// documentos que não interessam são puladas byte a byte.
+/// Percorre uma lista `pos:` sem decodificá-la inteira: salta pela tabela de
+/// saltos até o bloco do documento e, dentro do bloco, pula as posições dos
+/// documentos que não interessam byte a byte.
 pub struct PositionsCursor<'a> {
     r: Reader<'a>,
+    body: usize,
+    n: u64,
+    blocks: Vec<(DocId, usize)>,
     remaining: u64,
     prev: DocId,
     /// Cabeçalho (doc, k) já lido, com as posições ainda por ler.
@@ -248,9 +417,28 @@ pub struct PositionsCursor<'a> {
 
 impl<'a> PositionsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let mut r = Reader::new(bytes);
-        let remaining = r.varint()?;
-        Ok(Self { r, remaining, prev: 0, head: None })
+        let ListHeader { n, blocks, body } = ListHeader::parse(bytes, true)?;
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, remaining: n, prev: 0, head: None })
+    }
+
+    /// Se o bloco da próxima entrada termina antes de `target`, vai direto
+    /// ao primeiro bloco que pode conter `target`.
+    fn jump(&mut self, target: DocId) {
+        let next = (self.n - self.remaining) as usize;
+        let block = next / SKIP_BLOCK;
+        // A entrada em `head` já foi contada: se ela é o alvo ou além, fica.
+        if self.head.is_some_and(|(doc, _)| doc >= target) || block >= self.blocks.len() || self.blocks[block].0 >= target {
+            return;
+        }
+        let b = block + self.blocks[block..].partition_point(|&(last, _)| last < target);
+        self.head = None;
+        if b == self.blocks.len() {
+            self.remaining = 0;
+            return;
+        }
+        self.r.pos = self.body + self.blocks[b].1;
+        self.prev = if b > 0 { self.blocks[b - 1].0 } else { 0 };
+        self.remaining = self.n - (b * SKIP_BLOCK) as u64;
     }
 
     /// Próximo documento da lista (sem consumir as posições dele).
@@ -290,6 +478,7 @@ impl<'a> PositionsCursor<'a> {
     /// Avança até `target` (que só pode crescer entre chamadas). Se o
     /// documento estiver na lista, escreve as posições dele em `out`.
     pub fn seek(&mut self, target: DocId, out: &mut Vec<u32>) -> Result<bool, Error> {
+        self.jump(target);
         loop {
             let doc = match self.head {
                 Some((doc, _)) => doc,
@@ -325,8 +514,9 @@ struct Scan {
 }
 
 fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
-    let mut r = Reader::new(bytes);
-    let n = r.varint()?;
+    let header = ListHeader::parse(bytes, false)?;
+    let n = header.n;
+    let mut r = Reader { buf: bytes, pos: header.body };
     let body = r.pos;
     let (mut first, mut doc, mut after_first_delta) = (0, 0u64, body);
     for i in 0..n {
@@ -371,21 +561,47 @@ fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions: bool) -> O
     // fim do anterior. Basta concatenar os bytes, refazendo um delta por pedaço.
     if lists.windows(2).all(|w| w[0].1.last < w[1].1.first) {
         let total: u64 = lists.iter().map(|(_, s)| s.n).sum();
-        let mut out = Vec::with_capacity(10 + lists.iter().map(|(b, _)| b.len()).sum::<usize>());
-        put_varint(&mut out, total);
+        let mut body = Vec::with_capacity(lists.iter().map(|(b, _)| b.len()).sum::<usize>());
         let mut prev_last = 0;
         for (i, (bytes, s)) in lists.iter().enumerate() {
             if i == 0 {
-                out.extend_from_slice(&bytes[s.body..]);
+                body.extend_from_slice(&bytes[s.body..]);
             } else {
-                put_varint(&mut out, s.first - prev_last);
-                out.extend_from_slice(&bytes[s.after_first_delta..]);
+                put_varint(&mut body, s.first - prev_last);
+                body.extend_from_slice(&bytes[s.after_first_delta..]);
             }
             prev_last = s.last;
         }
+        // A tabela de saltos da lista unida sai de uma passada pelas entradas.
+        let blocks = if total as usize > 2 * SKIP_BLOCK { blocks_of(&body, total, positions).ok()? } else { Vec::new() };
+        let mut out = Vec::with_capacity(16 + blocks.len() * 4 + body.len());
+        put_varint(&mut out, total);
+        put_skips(&mut out, &blocks);
+        out.extend_from_slice(&body);
         return Some(out);
     }
     if positions { merge_positions_slow(&lists) } else { merge_postings_slow(&lists) }.ok()
+}
+
+/// Último documento e fim (em bytes) de cada bloco de `SKIP_BLOCK` entradas.
+fn blocks_of(body: &[u8], n: u64, positions: bool) -> Result<Vec<(DocId, usize)>, Error> {
+    let mut r = Reader::new(body);
+    let mut blocks = Vec::with_capacity((n as usize).div_ceil(SKIP_BLOCK));
+    let mut doc = 0u64;
+    for i in 0..n {
+        doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
+        let k = r.varint()?;
+        if positions {
+            r.skip_varints(k)?;
+        } else if k & 1 == 1 {
+            r.skip_varints(1)?;
+        }
+        if (i + 1) % SKIP_BLOCK as u64 == 0 || i + 1 == n {
+            blocks.push((doc, r.pos));
+        }
+    }
+    r.finish()?;
+    Ok(blocks)
 }
 
 /// Ordenação estável por doc: entre entradas do mesmo doc, a ordem dos
@@ -692,7 +908,8 @@ mod tests {
     fn postings_roundtrip_and_size() {
         let list: Vec<Posting> = (1000..2000).map(|d| p(d, 1 + (d % 3) as u32)).collect();
         let bytes = encode_postings(&list);
-        assert!(bytes.len() < 2010, "delta e tf pequenos devem ocupar ~1 byte cada");
+        // ~1 byte por delta e por tf, mais a tabela de saltos (8 blocos, ~25 bytes).
+        assert!(bytes.len() < 2040, "delta e tf pequenos devem ocupar ~1 byte cada: {}", bytes.len());
         assert_eq!(decode_postings(&bytes).unwrap(), list);
         assert_eq!(decode_docs(&bytes).unwrap(), (1000..2000).collect::<Vec<_>>());
         let edge = [p(0, 1), p(u64::MAX, u32::MAX)];
@@ -707,9 +924,9 @@ mod tests {
         let bytes = encode_postings(&list);
         assert_eq!(decode_postings(&bytes).unwrap(), list);
         assert_eq!(decode_docs(&bytes).unwrap(), [1, 2, 5, 9, u64::MAX]);
-        // Sem título a entrada não cresce: Δdoc 1 byte + tf 1 byte.
-        assert_eq!(encode_postings(&[p(1, 1)]).len(), 3);
-        assert_eq!(encode_postings(&[pt(1, 1, 1)]).len(), 4);
+        // Sem título a entrada não cresce: n, s = 0, Δdoc 1 byte + tf 1 byte.
+        assert_eq!(encode_postings(&[p(1, 1)]).len(), 4);
+        assert_eq!(encode_postings(&[pt(1, 1, 1)]).len(), 5);
         // Merge rápido (pedaços em ordem) e lento (sobrepostos), a última versão vence.
         let a = encode_postings(&[pt(1, 2, 1), p(4, 1)]);
         let b = encode_postings(&[pt(7, 1, 1)]);
@@ -851,6 +1068,137 @@ mod tests {
                 assert_eq!(&again, full);
             }
         }
+    }
+
+    /// Gerador pequeno e determinístico para os testes.
+    fn rng(seed: u64) -> impl FnMut(u64) -> u64 {
+        let mut x = seed;
+        move |n| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        }
+    }
+
+    fn sample_list(n: usize, seed: u64) -> Vec<Posting> {
+        let mut next = rng(seed);
+        let mut doc = next(5);
+        (0..n)
+            .map(|_| {
+                let span = if next(10) == 0 { 5000 } else { 30 };
+                doc += 1 + next(span);
+                let tf = 1 + next(4) as u32;
+                Posting { doc, tf, title_tf: if next(5) == 0 { 1 } else { 0 } }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skip_table_only_on_large_lists() {
+        for n in [0, 1, 255, 256, 257, 1000, 5000] {
+            let list = sample_list(n, n as u64 + 1);
+            let bytes = encode_postings(&list);
+            let header = ListHeader::parse(&bytes, true).unwrap();
+            let expected = if n > 2 * SKIP_BLOCK { n.div_ceil(SKIP_BLOCK) } else { 0 };
+            assert_eq!(header.blocks.len(), expected, "n = {n}");
+            assert_eq!(list_len(&bytes).unwrap(), n as u64);
+            assert_eq!(decode_postings(&bytes).unwrap(), list, "n = {n}");
+            assert_eq!(decode_docs(&bytes).unwrap(), list.iter().map(|p| p.doc).collect::<Vec<_>>());
+            // Cada bloco termina no documento certo.
+            for (b, &(last, _)) in header.blocks.iter().enumerate() {
+                assert_eq!(last, list[((b + 1) * SKIP_BLOCK).min(n) - 1].doc);
+            }
+        }
+    }
+
+    #[test]
+    fn postings_cursor_matches_a_reference_search() {
+        for n in [0, 1, 200, 256, 257, 300, 1000, 5000] {
+            let list = sample_list(n, 7 + n as u64);
+            let bytes = encode_postings(&list);
+            let max = list.last().map_or(10, |p| p.doc + 10);
+            for seed in 0..20 {
+                let mut next = rng(seed * 31 + 1);
+                let mut cursor = PostingsCursor::new(&bytes).unwrap();
+                assert_eq!(cursor.len(), n as u64);
+                let mut target = 0;
+                // Alvos crescentes, com passos pequenos e saltos grandes.
+                while target <= max + 5 {
+                    let got = cursor.seek(target).unwrap();
+                    let want = list.iter().find(|p| p.doc >= target).copied();
+                    assert_eq!(got, want, "n = {n}, alvo {target}");
+                    target += if next(4) == 0 { next(max / 3 + 1) } else { next(40) };
+                }
+                // Repetir o mesmo alvo devolve a mesma entrada.
+                if let Some(p) = list.last() {
+                    let mut cursor = PostingsCursor::new(&bytes).unwrap();
+                    assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p));
+                    assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p));
+                    assert_eq!(cursor.seek(p.doc + 1).unwrap(), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn positions_cursor_skips_blocks() {
+        for n in [1, 256, 257, 1500] {
+            let list = sample_list(n, 99 + n as u64);
+            let entries: Vec<(DocId, Vec<u32>)> =
+                list.iter().map(|p| (p.doc, (0..p.tf).map(|i| i * 3 + (p.doc % 7) as u32).collect())).collect();
+            let bytes = pos_bytes(&entries.iter().map(|(d, ps)| (*d, ps.as_slice())).collect::<Vec<_>>());
+            assert_eq!(decode_positions(&bytes).unwrap(), entries);
+            let mut next = rng(5 + n as u64);
+            let mut cursor = PositionsCursor::new(&bytes).unwrap();
+            let mut out = Vec::new();
+            let mut target = 0;
+            let max = entries.last().unwrap().0 + 3;
+            while target <= max {
+                let found = cursor.seek(target, &mut out).unwrap();
+                match entries.iter().find(|(d, _)| *d == target) {
+                    Some((_, ps)) => {
+                        assert!(found, "n = {n}, alvo {target}");
+                        assert_eq!(&out, ps);
+                    }
+                    None => assert!(!found, "n = {n}, alvo {target}"),
+                }
+                // Às vezes um documento que existe, às vezes um salto.
+                target = if next(2) == 0 {
+                    entries.iter().map(|(d, _)| *d).find(|&d| d > target).unwrap_or(max + 1)
+                } else {
+                    target + 1 + next(max / 4 + 1)
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn merging_large_lists_rebuilds_the_skip_table() {
+        // Pedaços crescentes (caminho rápido) e sobrepostos (caminho completo),
+        // atravessando o limite de 256 entradas.
+        let full = sample_list(1200, 3);
+        let pieces: Vec<&[Posting]> = vec![&full[..100], &full[100..250], &full[250..900], &full[900..]];
+        let encoded: Vec<Vec<u8>> = pieces.iter().map(|p| encode_postings(p)).collect();
+        let merged = merge_postings(encoded.iter().map(Vec::as_slice)).unwrap();
+        assert_eq!(merged, encode_postings(&full), "caminho rápido: mesmos bytes do lote único");
+        let mut cursor = PostingsCursor::new(&merged).unwrap();
+        assert_eq!(cursor.seek(full[1000].doc).unwrap(), Some(full[1000]));
+        // Sobreposição: o pedaço mais novo troca o tf de documentos do meio.
+        let newer: Vec<Posting> = full[500..520].iter().map(|p| Posting { tf: p.tf + 10, ..*p }).collect();
+        let merged2 = merge_postings([merged.as_slice(), encode_postings(&newer).as_slice()].into_iter()).unwrap();
+        let mut want = full.clone();
+        want[500..520].copy_from_slice(&newer);
+        assert_eq!(decode_postings(&merged2).unwrap(), want);
+        assert_eq!(merged2, encode_postings(&want));
+        // Posições também.
+        let entries: Vec<(DocId, Vec<u32>)> = full.iter().map(|p| (p.doc, vec![1, 5])).collect();
+        let pieces: Vec<Vec<u8>> = [&entries[..300], &entries[300..]]
+            .iter()
+            .map(|e| pos_bytes(&e.iter().map(|(d, ps)| (*d, ps.as_slice())).collect::<Vec<_>>()))
+            .collect();
+        let merged = merge_positions(pieces.iter().map(Vec::as_slice)).unwrap();
+        assert_eq!(merged, pos_bytes(&entries.iter().map(|(d, ps)| (*d, ps.as_slice())).collect::<Vec<_>>()));
     }
 
     #[test]

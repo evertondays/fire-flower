@@ -20,18 +20,18 @@ use std::time::Instant;
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
-use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, TrieNode};
+use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, PostingsCursor, TrieNode};
 use crate::stopwords::{self, Language, Stopwords};
 use crate::text::{Analyzer, Clause, normalize_term, parse_query};
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 3;
+pub const FORMAT_VERSION: u64 = 4;
 /// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
 /// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
 /// ser aberto para escrita.
-const MERGE_OPERATOR: &str = "fire_flower_v3";
+const MERGE_OPERATOR: &str = "fire_flower_v4";
 
 const META_FORMAT: &[u8] = b"meta:format";
 /// `1` se o banco grava posições (`pos:`), `0` se não.
@@ -786,12 +786,12 @@ impl Bound {
 /// Nota de um documento (já posicionado em todas as listas): soma das
 /// partes, na ordem da consulta.
 #[inline]
-fn doc_score(bm25: &Bm25, scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[(u32, u32)], norm: DocNorm) -> f64 {
+fn doc_score(bm25: &Bm25, scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)], norm: DocNorm) -> f64 {
     let mut score = 0.0;
     for scorer in scorers {
         score += match scorer {
             Scorer::Term { weight, list, .. } => {
-                let p = lists[*list][at[*list]];
+                let p = sources[*list].current();
                 bm25.score(*weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf))
             }
             Scorer::Phrase { weight, phrase, .. } => {
@@ -806,12 +806,12 @@ fn doc_score(bm25: &Bm25, scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usiz
 /// Limite superior de [`doc_score`]: a mesma soma, com o maior valor
 /// possível de cada parte.
 #[inline]
-fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[(u32, u32)]) -> f64 {
+fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {
             Scorer::Term { list, bound, .. } => {
-                let p = lists[*list][at[*list]];
+                let p = sources[*list].current();
                 bound.get(p.tf, p.title_tf)
             }
             Scorer::Phrase { phrase, bound, .. } => {
@@ -823,50 +823,143 @@ fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &
     bound
 }
 
+/// Uma lista do E, antes de escolher quem conduz: os bytes de `post:` (ainda
+/// não decodificados; o tamanho vem do cabeçalho) ou uma lista já
+/// decodificada (a união das completações de um prefixo).
+enum Member<T> {
+    Bytes { idx: usize, len: usize },
+    Decoded(Vec<T>),
+}
+
+impl<T> Member<T> {
+    fn len(&self) -> usize {
+        match self {
+            Member::Bytes { len, .. } => *len,
+            Member::Decoded(list) => list.len(),
+        }
+    }
+}
+
+/// Uma lista do E no ranking, já posicionada: decodificada (a que conduz e as
+/// uniões de prefixo) ou um cursor que salta blocos pela tabela de saltos.
+enum AndList<'s> {
+    Decoded { list: Vec<Posting>, at: usize },
+    Cursor { cursor: PostingsCursor<'s>, current: Posting },
+}
+
+impl AndList<'_> {
+    /// A entrada do documento da última busca bem-sucedida.
+    #[inline]
+    fn current(&self) -> Posting {
+        match self {
+            AndList::Decoded { list, at } => list[*at],
+            AndList::Cursor { current, .. } => *current,
+        }
+    }
+
+    /// Avança até `doc` (os alvos só crescem) e diz se ele está na lista.
+    #[inline]
+    fn seek(&mut self, doc: DocId) -> Result<bool> {
+        match self {
+            AndList::Decoded { list, at } => Ok(seek(list, at, doc)),
+            AndList::Cursor { cursor, current } => match cursor.seek(doc)? {
+                Some(p) if p.doc == doc => {
+                    *current = p;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+        }
+    }
+}
+
 impl View<'_> {
+    /// Bytes da lista `post:` de um nó, presos ao snapshot (sem cópia).
+    fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+        self.snap.get_bytes(Key::new(POST, node).as_ref())
+    }
+
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
         let clauses = parse_query(query, &self.engine.stopwords);
         self.check_phrases(&clauses)?;
-        let mut lists: Vec<Vec<DocId>> = Vec::new();
+        // Listas exatas ficam como bytes até se saber quem conduz o E.
+        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut members: Vec<Member<DocId>> = Vec::new();
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         for clause in &clauses {
             match clause {
-                Clause::Term(t) => {
-                    let list = if t.prefix { self.prefix_docs(&t.text)? } else { self.term_docs(&t.text)? };
+                Clause::Term(t) if t.prefix => {
+                    let list = self.prefix_docs(&t.text)?;
                     if list.is_empty() {
                         return Ok(Vec::new());
                     }
-                    lists.push(list);
+                    members.push(Member::Decoded(list));
+                }
+                Clause::Term(t) => {
+                    if self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut members)? == 0 {
+                        return Ok(Vec::new());
+                    }
                 }
                 Clause::Phrase(parts) => {
                     // Os termos da frase entram no E como termos comuns; as
                     // posições só são conferidas nos documentos que sobrarem.
                     let mut nodes = Vec::with_capacity(parts.len());
                     for part in parts {
-                        let Some(node) = self.term_node(&part.text)? else { return Ok(Vec::new()) };
-                        let list = self.load_docs(node)?;
-                        if list.is_empty() {
+                        let node = self.term_node(&part.text)?;
+                        if self.add_exact(node, &mut bytes, &mut members)? == 0 {
                             return Ok(Vec::new());
                         }
-                        lists.push(list);
-                        nodes.push((part.offset, node));
+                        nodes.push((part.offset, node.unwrap_or_default()));
                     }
                     phrases.push(nodes);
                 }
             }
         }
+        if members.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // Interseção começando pela lista menor: o resultado só encolhe.
-        lists.sort_by_key(Vec::len);
-        let mut lists = lists.into_iter();
-        let Some(mut result) = lists.next() else { return Ok(Vec::new()) };
-        for list in lists {
-            result = intersect(&result, &list);
-            if result.is_empty() {
-                return Ok(result);
+        // A lista menor conduz e é a única decodificada inteira; nas outras,
+        // cada documento dela é procurado por saltos (das menores para as
+        // maiores, que descartam mais cedo).
+        members.sort_by_key(Member::len);
+        let mut members = members.into_iter();
+        let mut result = match members.next().expect("há pelo menos uma lista") {
+            Member::Bytes { idx, .. } => codec::decode_docs(&bytes[idx])?,
+            Member::Decoded(list) => list,
+        };
+        let mut cursors: Vec<PostingsCursor<'_>> = Vec::new();
+        let mut decoded: Vec<(Vec<DocId>, usize)> = Vec::new();
+        for m in members {
+            match m {
+                Member::Bytes { idx, len } if use_cursor(len, result.len()) => {
+                    cursors.push(PostingsCursor::new(&bytes[idx])?)
+                }
+                Member::Bytes { idx, .. } => decoded.push((codec::decode_docs(&bytes[idx])?, 0)),
+                Member::Decoded(list) => decoded.push((list, 0)),
             }
         }
+        if !cursors.is_empty() || !decoded.is_empty() {
+            let mut kept = Vec::with_capacity(result.len());
+            'docs: for &doc in &result {
+                for c in cursors.iter_mut() {
+                    if c.seek(doc)?.is_none_or(|p| p.doc != doc) {
+                        continue 'docs;
+                    }
+                }
+                for (list, at) in decoded.iter_mut() {
+                    if !seek_docs(list, at, doc) {
+                        continue 'docs;
+                    }
+                }
+                kept.push(doc);
+            }
+            result = kept;
+        }
         for phrase in &phrases {
+            if result.is_empty() {
+                break;
+            }
             let slices = self.load_positions(phrase)?;
             let mut matcher = PhraseMatcher::new(phrase, &slices)?;
             let mut kept = Vec::with_capacity(result.len());
@@ -876,11 +969,24 @@ impl View<'_> {
                 }
             }
             result = kept;
-            if result.is_empty() {
-                break;
-            }
         }
         Ok(result)
+    }
+
+    /// Guarda os bytes da lista `post:` do termo e devolve o df (0 se o termo
+    /// não existe).
+    fn add_exact<'s, T>(
+        &'s self,
+        node: Option<u64>,
+        bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+        members: &mut Vec<Member<T>>,
+    ) -> Result<usize> {
+        let Some(node) = node else { return Ok(0) };
+        let Some(value) = self.post_bytes(node)? else { return Ok(0) };
+        let len = codec::list_len(&value)? as usize;
+        members.push(Member::Bytes { idx: bytes.len(), len });
+        bytes.push(value);
+        Ok(len)
     }
 
     fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
@@ -893,24 +999,22 @@ impl View<'_> {
         let config = &self.engine.config;
         let bm25 = Bm25::new(config, stats);
 
-        // 1. Carrega as listas. Todas entram no E; cada parte da consulta
-        //    sabe quais são as suas.
-        let mut lists: Vec<Vec<Posting>> = Vec::new();
+        // 1. As listas. Todas entram no E; cada parte da consulta sabe quais
+        //    são as suas. As exatas ficam como bytes (o df vem do cabeçalho)
+        //    até se saber quem conduz.
+        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut lists: Vec<Member<Posting>> = Vec::new();
         let mut scorers: Vec<Scorer> = Vec::with_capacity(clauses.len());
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         for clause in &clauses {
             match clause {
                 Clause::Term(t) if !t.prefix => {
-                    let list = match self.term_node(&t.text)? {
-                        Some(node) => self.load_postings(node)?,
-                        None => Vec::new(),
-                    };
-                    if list.is_empty() {
+                    let df = self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut lists)?;
+                    if df == 0 {
                         return Ok(TopHits::default());
                     }
-                    let weight = bm25.weight(bm25.idf(list.len()));
-                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, &bm25) });
-                    lists.push(list);
+                    let weight = bm25.weight(bm25.idf(df));
+                    scorers.push(Scorer::Term { weight, list: lists.len() - 1, bound: Bound::new(weight, &bm25) });
                 }
                 Clause::Term(t) => {
                     // Prefixo como um termo só: um documento por entrada, com o
@@ -923,20 +1027,19 @@ impl View<'_> {
                     }
                     let weight = bm25.weight(bm25.idf(list.len()));
                     scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, &bm25) });
-                    lists.push(list);
+                    lists.push(Member::Decoded(list));
                 }
                 Clause::Phrase(parts) => {
                     let mut idf = 0.0;
                     let mut nodes = Vec::with_capacity(parts.len());
                     for part in parts {
-                        let Some(node) = self.term_node(&part.text)? else { return Ok(TopHits::default()) };
-                        let list = self.load_postings(node)?;
-                        if list.is_empty() {
+                        let node = self.term_node(&part.text)?;
+                        let df = self.add_exact(node, &mut bytes, &mut lists)?;
+                        if df == 0 {
                             return Ok(TopHits::default());
                         }
-                        idf += bm25.idf(list.len());
-                        nodes.push((part.offset, node));
-                        lists.push(list);
+                        idf += bm25.idf(df);
+                        nodes.push((part.offset, node.unwrap_or_default()));
                     }
                     let weight = bm25.weight(idf);
                     scorers.push(Scorer::Phrase { weight, phrase: phrases.len(), bound: Bound::new(weight, &bm25) });
@@ -951,24 +1054,48 @@ impl View<'_> {
         // (ocorrências da frase, quantas no título), por frase.
         let mut counts = vec![(0u32, 0u32); matchers.len()];
 
-        if let [Scorer::Term { weight, list, bound }] = scorers.as_slice()
+        // Decodifica uma lista inteira.
+        let decode = |m: Member<Posting>| -> Result<Vec<Posting>> {
+            match m {
+                Member::Bytes { idx, .. } => codec::decode_postings(&bytes[idx]),
+                Member::Decoded(list) => Ok(list),
+            }
+        };
+        if let [Scorer::Term { weight, bound, .. }] = scorers.as_slice()
             && matchers.is_empty()
         {
-            let hits = self.top_single_term(&lists[*list], *weight, bound, &bm25, k)?;
-            return Ok(TopHits { hits, total: lists[*list].len() });
+            let list = decode(lists.pop().expect("um termo, uma lista"))?;
+            let hits = self.top_single_term(&list, *weight, bound, &bm25, k)?;
+            return Ok(TopHits { hits, total: list.len() });
         }
 
-        // 2. E pelas listas: a menor conduz, as outras avançam por saltos.
+        // 2. E pelas listas: a menor conduz (decodificada inteira); nas
+        //    outras, cada documento dela é procurado por saltos, sem
+        //    decodificar os blocos do meio.
         let driver = (0..lists.len()).min_by_key(|&i| lists[i].len()).unwrap_or(0);
-        let mut at = vec![0usize; lists.len()];
+        let driver_len = lists[driver].len();
+        let mut sources: Vec<AndList<'_>> = Vec::with_capacity(lists.len());
+        for (i, m) in lists.into_iter().enumerate() {
+            sources.push(match m {
+                Member::Bytes { idx, len } if i != driver && use_cursor(len, driver_len) => {
+                    AndList::Cursor { cursor: PostingsCursor::new(&bytes[idx])?, current: Posting { doc: 0, tf: 1, title_tf: 0 } }
+                }
+                m => AndList::Decoded { list: decode(m)?, at: 0 },
+            });
+        }
+        let driver_docs: Vec<DocId> = match &sources[driver] {
+            AndList::Decoded { list, .. } => list.iter().map(|p| p.doc).collect(),
+            AndList::Cursor { .. } => unreachable!("quem conduz é decodificada"),
+        };
         let mut norms = NormCursor::new(self);
         let mut top = TopK::new(k);
         let mut total = 0usize;
-        'docs: for i in 0..lists[driver].len() {
-            let doc = lists[driver][i].doc;
-            at[driver] = i;
-            for (j, list) in lists.iter().enumerate() {
-                if j != driver && !seek(list, &mut at[j], doc) {
+        'docs: for (i, &doc) in driver_docs.iter().enumerate() {
+            if let AndList::Decoded { at, .. } = &mut sources[driver] {
+                *at = i;
+            }
+            for (j, source) in sources.iter_mut().enumerate() {
+                if j != driver && !source.seek(doc)? {
                     continue 'docs;
                 }
             }
@@ -994,7 +1121,7 @@ impl View<'_> {
             //    passaria do pior não precisa do tamanho (nem da nota exata).
             //    Empate também perde: os IDs chegam em ordem crescente.
             if let Some(worst) = top.threshold()
-                && doc_bound(&scorers, &lists, &at, &counts) <= worst
+                && doc_bound(&scorers, &sources, &counts) <= worst
             {
                 continue;
             }
@@ -1002,7 +1129,7 @@ impl View<'_> {
                 Some(l) => l,
                 None => norms.lens(doc)?,
             };
-            let score = doc_score(&bm25, &scorers, &lists, &at, &counts, bm25.doc_norm(lens));
+            let score = doc_score(&bm25, &scorers, &sources, &counts, bm25.doc_norm(lens));
             top.push(Hit { doc, score });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
@@ -1112,12 +1239,6 @@ impl View<'_> {
         })
     }
 
-    fn term_docs(&self, term: &str) -> Result<Vec<DocId>> {
-        match self.term_node(term)? {
-            Some(node) => self.load_docs(node),
-            None => Ok(Vec::new()),
-        }
-    }
 
     /// Listas das completações de `prefix` unidas por documento, com o tf
     /// somado: o prefixo como se fosse um termo só.
@@ -1314,6 +1435,38 @@ impl View<'_> {
         self.engine.norms.offer(block, self.epoch, &decoded);
         Ok(Some(decoded))
     }
+}
+
+/// Procurar documento a documento com o cursor só compensa quando a lista é
+/// bem maior que a que conduz: aí a maioria dos blocos de `SKIP_BLOCK`
+/// entradas não tem nenhum candidato e é pulada sem decodificar. Com tamanhos
+/// parecidos, decodificar a lista inteira e andar nela em sequência é mais
+/// barato (E de dois termos frequentes: +16% com cursor).
+fn use_cursor(len: usize, driver_len: usize) -> bool {
+    len >= 32 * driver_len
+}
+
+/// Como [`seek`], numa lista só de IDs.
+#[inline]
+fn seek_docs(list: &[DocId], at: &mut usize, target: DocId) -> bool {
+    let mut lo = *at;
+    if lo >= list.len() {
+        return false;
+    }
+    if list[lo] >= target {
+        return list[lo] == target;
+    }
+    let mut step = 1;
+    let mut hi = lo + 1;
+    while hi < list.len() && list[hi] < target {
+        lo = hi;
+        step *= 2;
+        hi = lo + step;
+    }
+    let hi = hi.min(list.len());
+    let found = lo + 1 + list[lo + 1..hi].partition_point(|&d| d < target);
+    *at = found;
+    found < list.len() && list[found] == target
 }
 
 /// Avança `at` até a primeira entrada com documento ≥ `target` (busca

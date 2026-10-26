@@ -1987,7 +1987,8 @@ struct RelCase {
 
 /// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
 /// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
-const REL_SETS: [(&str, usize); 4] = [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10)];
+const REL_SETS: [(&str, usize); 5] =
+    [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10), ("rel-flexao", 10)];
 
 fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
     let mut w = BufWriter::new(File::create(path)?);
@@ -2039,6 +2040,10 @@ fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usize, item: i
 ///   tem que vir em 1º, acima dos derivados.
 /// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
 ///   artigo no top-10. Segura o exagero do peso do título.
+/// - `rel-flexao`: as consultas do `rel-corpo` com cada palavra trocada pela
+///   flexão mais comum do mesmo radical (Snowball do português) que não está
+///   no artigo ("eleitos" → "eleito"): o artigo no top-10. Sem stemming não
+///   tem como achar; mede o que o stemming recupera.
 fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, seed: u64, per_set: usize) -> AnyResult<Vec<(&'static str, Vec<RelCase>)>> {
     let mut rng = Rng(seed);
     let mut titles: Vec<(DocId, String, Vec<String>)> = Vec::new();
@@ -2134,7 +2139,50 @@ fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, se
         }
         body_cases.push(RelCase { query: format!("{} {}", mid[a], mid[b]), expected: vec![*id], title: title.clone() });
     }
-    Ok(vec![("rel-titulo", by_title), ("rel-digitando", typing), ("rel-hub", hubs), ("rel-corpo", body_cases)])
+    // Flexões: radical -> palavras do corpo com ele, da mais comum para a menos.
+    let stemmer = fire_flower::Stemmer::new(Stemming::Snowball(Language::Portuguese));
+    let mut by_stem: HashMap<String, Vec<(&str, u32)>> = HashMap::default();
+    for (word, &n) in &df {
+        if n >= 3 {
+            by_stem.entry(stemmer.stem(word)).or_default().push((word.as_str(), n));
+        }
+    }
+    for words in by_stem.values_mut() {
+        words.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    }
+    let mut inflected: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if inflected.len() >= per_set {
+            break;
+        }
+        let title_terms = index_terms(title, stopwords);
+        let absent = |w: &str| terms.binary_search_by(|t| t.as_str().cmp(w)).is_err() && !title_terms.iter().any(|t| t == w);
+        // Termos de frequência média com uma flexão que o artigo não tem.
+        let pairs: Vec<&str> = terms
+            .iter()
+            .filter(|t| (20..=2000).contains(&df[*t]))
+            .filter_map(|t| by_stem.get(&stemmer.stem(t))?.iter().map(|(w, _)| *w).find(|w| absent(w)))
+            .collect();
+        if pairs.len() < 2 {
+            continue;
+        }
+        let a = rng.below(pairs.len());
+        let mut b = rng.below(pairs.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        if pairs[a] == pairs[b] {
+            continue;
+        }
+        inflected.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
+    }
+    Ok(vec![
+        ("rel-titulo", by_title),
+        ("rel-digitando", typing),
+        ("rel-hub", hubs),
+        ("rel-corpo", body_cases),
+        ("rel-flexao", inflected),
+    ])
 }
 
 /// Consultas à mão: `consulta \t títulos esperados (|) \t nota`. Os títulos
@@ -2202,7 +2250,10 @@ fn relevancia(
     if gerar || missing {
         eprintln!("gerando conjuntos em {}", sets_dir.display());
         for (name, cases) in generate_rel_sets(corpus, take, &stopwords, seed, per_set)? {
-            write_rel_set(&sets_dir.join(format!("{name}.tsv")), &cases)?;
+            let path = sets_dir.join(format!("{name}.tsv"));
+            if gerar || !path.exists() {
+                write_rel_set(&path, &cases)?;
+            }
         }
     }
     let mut sets: Vec<(String, usize, Vec<RelCase>)> = Vec::new();

@@ -171,9 +171,84 @@ começa se a guarda continuar caindo.
 
 - [x] Stemming na indexação como opção (`--stemming pt`), com oráculo e A/B (`perf.py stemming`)
 - [x] Conjunto `rel-flexao` e análise ([ANALISE-stemming.md](https://github.com/evertondays/fire-flower-bench/blob/main/ANALISE-stemming.md))
-- [ ] Fase 0: erros novos classificados por causa; grupos problemáticos listados
-- [ ] Fase 1: `rel-plural`, `rel-flexao-manual`, `t-flexao`
-- [ ] Fase 2: plural antes do Snowball, radical mínimo, stemmer leve
-- [ ] Fase 3: espaço `stem:`, grupos de flexões na consulta, oráculo
-- [ ] Fase 4: grade de α e modo de expansão
+- [x] Fase 0: erros novos classificados por causa; grupos problemáticos listados
+- [x] Fase 1: `rel-plural`, `rel-flexao-manual`, `t-flexao`
+- [x] Fase 2: plural antes do Snowball, radical mínimo (descartado), stemmer de plural (`pt-plural`)
+- [x] Fase 3: espaço `stem:`, grupos de flexões na consulta, oráculo
+- [x] Fase 4: grade de α e modo de expansão
 - [ ] Decisão final: qual modo fica, qual sai, e o padrão
+
+---
+
+## 11. Como ficou (26/10/2026)
+
+Branch `stemming-snowball`. Números da rodada `perf.py stemming --escala
+full` (relevância em 100k), em [RESULTADOS.md](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md)
+e [ANALISE-flexoes.md](https://github.com/evertondays/fire-flower-bench/blob/main/ANALISE-flexoes.md).
+
+### Fase 0
+
+- `rel-hub`: 102 consultas perdidas com o Snowball, 1 ganha. A maioria dos
+  pares (palavra da consulta → palavra do título do 1º) não tem relação:
+  nomes próprios e radicais curtos (`lage→lago`, `prato→prata`, `som→soma`).
+  Os outros são derivações (`terror→terrorismo`) ou flexões de verdade
+  (`torre→torres`), que também erram porque "Torre" e "Torres" são artigos
+  diferentes. O radical mínimo (D7) separaria 42 dos 104 pares.
+- `rel-corpo`: 165 perdidas, 2 ganhas. Quase todos os pares são flexões
+  legítimas (`fisicas→fisica`); a perda vem de cada palavra casar 5,7× mais
+  documentos (mediana), não de junções erradas. D7 separaria 7 dos 36.
+
+Conclusão: corrigir o algoritmo ajuda, mas a palavra exata precisa valer
+mais que as flexões.
+
+### Fase 2 (100k, stemming na indexação)
+
+| Variante | hub@1 | corpo@10 | plural@10 | flexão à mão@3 |
+|---|---|---|---|---|
+| sem stemming | 97,9% | 81,5% | 0% | 38,2% |
+| Snowball | 87,8% | 65,2% | 41,4% | 86,3% |
+| Snowball + plural antes (D8) | 87,7% | 65,1% | 46,3% | 90,8% |
+| Snowball + radical mínimo (D7) | 90,8% | 68,0% | 34,2% | 81,7% |
+| **só plural (`pt-plural`, D9)** | **96,3%** | **78,2%** | **71,1%** | **96,2%** |
+
+D8 entrou no Snowball; D7 ficou de fora (perde recuperação). O `pt-plural`
+ganhou também o "e" final depois de r/z ("mercadores" = "mercador"), que
+levou os pares plural/singular separados de 12% para 7%.
+
+### Fases 3 e 4
+
+A primeira fórmula, `BM25(exata) + α · BM25(flexões)`, derrubava o `rel-hub`
+para 77% mesmo com α = 0,1: a segunda parte saturada, com o idf da flexão,
+desempatava a favor de artigos longos. A que ficou é a do D3: um termo só,
+`tf~ = tf~_exata + α · tf~_flexões`, com o idf do maior df (como o
+`SynonymQuery` do Lucene, sem decodificar as listas para contar a união). O
+modo "só se faltar" não ajuda: "planetas" já acha documentos demais para
+expandir, e o `rel-flexao-manual` fica em 38%. Padrão: α = 0,5, sempre.
+
+### Resultado (Wikipédia inteira; relevância em 100k)
+
+| Métrica | Sem stemming | Plural na indexação | Flexões na consulta | Meta |
+|---|---|---|---|---|
+| `rel-titulo` / `rel-hub` top-1 | 99,3% / 97,9% | 99,1% / 96,3% | **99,3% / 97,9%** | ≥ 99% / ≥ 97% |
+| `rel-corpo` top-10 | 81,5% | 78,2% | 79,8% | ≥ 80% |
+| `rel-digitando` top-1 | 84,4% | 83,9% | 84,3% | ≥ 84% |
+| `rel-plural` top-10 | 0% | **71,1%** | 65,0% | ≥ 80% |
+| `rel-flexao-manual` top-3 | 38,2% | **96,2%** | 93,1% | ≥ 70% |
+| p50 de frases | 506 µs (`frase-2`) | +17% a +35% | **sem mudança** | sem mudança |
+| p50 / p99 de `t-medio` | 18 / 53 µs | **+3% / +89%** | +61% / +245% | ≤ +15% / ≤ 2× |
+| p50 / p99 de `and-2` | 33 / 86 µs | **+3% / +42%** | +58% / +113% | ≤ +15% / ≤ 2× |
+| Carga | 118 s | **116 s** | 121 s | ≤ +5% |
+| Banco compactado | 1.434 MB | **1.376 MB** | 1.467 MB | ≤ +5% |
+| Autocompletar | palavras | palavras (singular) | palavras | palavras |
+| Oráculo | 0 | 0 | 0 | 0 |
+
+Nenhuma das duas cumpre todas as metas. O plural na indexação perde 1,6
+ponto no `rel-hub` e 3,3 no `rel-corpo`, e as frases ficam 17–35% mais
+lentas; em troca, é quase de graça no resto e o que mais acha flexões. As
+flexões na consulta mantêm a ordenação de sem stemming, mas termos e E ficam
+1,5–2,4× mais lentos (cada palavra lê também as listas das flexões).
+
+**Recomendação:** `--stemming pt-plural` como a opção indicada (e candidata a
+padrão). Manter as flexões na consulta como opção para quem precisa da
+palavra exata na frente, e o Snowball como opção para verbos e derivados
+(ele é o único que acha `rel-flexao`, 55%, mas perde 10 pontos no `rel-hub`).

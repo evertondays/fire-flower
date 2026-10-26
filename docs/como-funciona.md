@@ -242,7 +242,8 @@ prefixo na chave:
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
-| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming` | versão do formato, se grava posições, idiomas das stopwords e stemming | |
+| `stem:<radical>` | nós das palavras com esse radical (só com flexões na consulta) | |
+| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | versão do formato, se grava posições, idiomas das stopwords, stemming e flexões | |
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -495,11 +496,30 @@ termo que não existe e voltaria vazia. Como prefixo (`de*`) elas continuam
 valendo. "são" e "era" ficam fora da lista de propósito: são também nomes
 (São Paulo, Era Vargas).
 
-**Stemming (opcional).** Com `Config::stemming` (`--stemming pt` na CLI), cada
-token que não é stopword vira o seu radical pelo Snowball (`src/stem.rs`):
-"correndo", "correu" e "corrida" viram `corr`. As stopwords são conferidas
-antes, na palavra inteira. Como os idiomas, a escolha é gravada na criação
-(`meta:stemming`) e conferida no `open`.
+**Stemming e flexões (opcionais).** Há dois jeitos de achar outras formas
+da palavra (`docs/plano-stemming.md`), e os dois usam os stemmers de
+`src/stem.rs`: o Snowball (`pt`: "correndo", "correu" e "corrida" viram
+`corr`) ou o de plural (`pt-plural`: "eleicoes" → "eleicao", "casas" →
+"casa", "mercadores" → "mercador", e nada mais).
+
+- **Flexões na consulta** (`Config::inflections`, `--flexoes`): o índice
+  guarda as palavras como estão. Quando uma palavra aparece pela primeira vez
+  na Trie, o commit grava o nó dela em `stem:<radical>` (um conjunto de nós,
+  unido pelo merge operator). Na busca, cada palavra exata vira um grupo
+  `{exata, flexões}`: o E usa a união das listas (com um cursor por lista
+  quando o grupo não conduz), e o ranking trata o grupo como um termo do
+  BM25F em que as flexões são um campo de peso α: `tf~ = tf~_exata + α ·
+  tf~_flexões`, com uma saturação só e o idf do maior df entre as palavras
+  (como o `SynonymQuery` do Lucene). Com α < 1 (padrão 0,5), a palavra exata
+  ganha os empates: "Torre" fica à frente de "Torres". Frases, prefixos e
+  autocompletar continuam exatos.
+- **Stemming na indexação** (`Config::stemming`, `--stemming`): cada token
+  que não é stopword vira o seu radical já no índice. É mais barato na
+  busca, mas a palavra exata deixa de existir.
+
+As stopwords são conferidas antes, na palavra inteira. Como os idiomas, a
+escolha é gravada na criação (`meta:stemming`, `meta:inflections`) e
+conferida no `open`; os dois não combinam.
 
 O radical sai do token **já normalizado**, para a busca continuar insensível a
 acentos. O Snowball do português, porém, foi escrito para texto acentuado e
@@ -511,13 +531,16 @@ palavra original, com acentos, juntaria mais flexões, mas 4% das palavras da
 Wikipédia mudariam de radical quando digitadas sem acento ("são" → `sa`, "sao"
 → `sao`).
 
-O Snowball custa ~200 ns por palavra, mais que o resto da tokenização; a
-indexação guarda os radicais já calculados (`StemCache`, até 1 milhão de
-palavras, mantido entre lotes) e paga ~40 ns. Na busca, termos exatos e de
-frase são reduzidos do mesmo jeito; um prefixo não (`bras*` casa os radicais
-que começam com `bras`), mas o radical do texto digitado também entra
-(`brasileiro*` casa `brasileir`, senão a palavra inteira, digitada sem espaço
-no TUI, não acharia nada).
+Antes do Snowball, o plural irregular vira singular (`-ções` → `-ção`,
+`-ões` → `-ão`): sozinho, o Snowball deixa "eleição" e "eleições" separados.
+
+O Snowball custa ~200 ns por palavra, mais que o resto da tokenização; com
+stemming na indexação, os radicais já calculados ficam num cache (`StemCache`,
+até 1 milhão de palavras, mantido entre lotes) e custam ~40 ns. Na busca,
+termos exatos e de frase são reduzidos do mesmo jeito; um prefixo não (`bras*`
+casa os radicais que começam com `bras`), mas o radical do texto digitado
+também entra (`brasileiro*` casa `brasileir`, senão a palavra inteira,
+digitada sem espaço no TUI, não acharia nada).
 
 ### 5.2 Lote invertido
 

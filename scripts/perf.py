@@ -213,15 +213,17 @@ def latest(results, kind, label=None):
 
 
 def formato(r):
-    """Formato do banco de um resultado de carga: 1 antes de tf e posições."""
+    """Formato do banco de um resultado de carga: 1 antes de tf e posições.
+    Até 26/10/2026 o `wiki load` gravava 2 para qualquer formato com tf."""
     return r.get("formato", 1)
 
 
 def median_load(results, label, fmt=None):
     """Carga mediana (por docs/s) entre as últimas MEDIANA_DE rodadas com o
     rótulo, todas do mesmo commit da mais recente. `fmt` restringe ao formato
-    do banco (1 ou 2). Ganha `_rodadas`, `_min` e `_max`."""
-    results = [r for r in results if fmt is None or r.get("tipo") != "load" or formato(r) == fmt]
+    do banco: 1 (sem tf nem posições) ou 2 (qualquer formato com tf, 2 em
+    diante). Ganha `_rodadas`, `_min` e `_max`."""
+    results = [r for r in results if fmt is None or r.get("tipo") != "load" or min(formato(r), 2) == fmt]
     last = latest(results, "load", label)
     if not last:
         return None

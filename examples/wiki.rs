@@ -595,7 +595,7 @@ fn load(
         "db": db, "corpus": corpus_path, "batch": batch_size, "skip": skip, "take": take,
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
         "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
-        "formato": 2, "posicoes": engine.has_positions(),
+        "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,

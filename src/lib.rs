@@ -32,7 +32,7 @@ mod engine;
 pub mod stopwords;
 pub mod text;
 
-pub use engine::{CommitStats, Config, Engine, IndexBatch};
+pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch};
 pub use stopwords::{Language, Stopwords};
 
 /// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).

@@ -1,0 +1,52 @@
+{
+  "commit": "d088f12",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "bm25_b": 0.75,
+    "bm25_k1": 1.2,
+    "languages": null,
+    "max_prefix_terms": 256,
+    "partition_filters": true,
+    "positions": null,
+    "reader_cache_depth": 2,
+    "statistics": false,
+    "writer_cache_nodes": 1000000
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 0.0,
+      "cache_hits_por_consulta": 78.954,
+      "conjunto": "misto",
+      "consultas": 1000,
+      "gets_por_consulta": 26.318,
+      "max_us": 3011.757,
+      "media_us": 84.503505,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 0.0,
+      "modo": "search",
+      "p50_us": 31.15,
+      "p95_us": 283.227,
+      "p99_us": 1058.388,
+      "qps": 11492.991418677506,
+      "resultados_media": 744.173,
+      "threads": 1
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf-v3-100k/ptwiki-100k",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 7248023552,
+    "ram_total": 8266141696,
+    "swap_usado": 42987520
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-26T03-52-11",
+  "rotulo": "100k-misto-t1",
+  "threads": 1,
+  "tipo": "bench"
+}

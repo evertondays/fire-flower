@@ -1,8 +1,22 @@
 # Design — Escrita com um escritor, leitura multi-core
 
-Status: **proposta, não implementada.**
+Status: **proposta, parcialmente superada (revista em 26/10/2026).**
 Relacionado: [plano-performance.md](plano-performance.md), que diz como medir
 cada passo.
+
+**O que mudou desde a proposta:**
+
+| Item | Situação |
+|---|---|
+| 1.3 Cache de nós que sobrevive ao commit | ✅ feito de outro jeito: cache de até `Config::writer_cache_nodes` nós (1 M), com descarte dos não usados e dos mais fundos, em vez de corte por profundidade |
+| 2.6 `meta:format` | ✅ feito (formato v2 em `0393dcb`, v3 em `fb63d23`); um banco antigo é recusado com "formato antigo" |
+| 2.4 Merge operator | mudou: o merge une **por documento**, com a gravação mais nova vencendo (reindexar troca tf e posições), mas ainda sem remoção |
+| 3.3 Topo da Trie decodificado | ✅ feito como cache de nós rasos das buscas (`Config::reader_cache_depth`, `3e1b2fe`), com consistência por snapshot (`EpochCache`) |
+| 1.2 Preparo em paralelo com N workers | **adiado:** na carga inteira o commit (um escritor só) é 74–80% do tempo, então o ganho máximo seria ~1,25× (Amdahl), menos que usar lote de 10 mil (+63%). Volta a valer se o commit ficar barato (plano de performance, P1) |
+| 3.1 Block cache `HyperClock` | continua relevante: a leitura escala só 4,3× com 12 threads (plano de performance, P4) |
+| Parte 2 (`update`/`delete`, `fwd:`) | continua em aberto; não é performance, é funcionalidade |
+
+O resto deste documento é a proposta original.
 
 ## Resumo
 

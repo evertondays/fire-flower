@@ -1,0 +1,9 @@
+{
+  "segundos": 1.5243799686431885,
+  "banco_antes": 106088078,
+  "banco_depois": 95286149,
+  "tipo": "compact",
+  "rotulo": "100k-sem-posicoes",
+  "commit": "d088f12",
+  "quando": "2026-10-26T03-47-59"
+}

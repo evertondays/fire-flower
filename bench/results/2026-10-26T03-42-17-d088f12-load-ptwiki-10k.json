@@ -1,0 +1,82 @@
+{
+  "arquivos_l0": 1,
+  "banco_bytes": 70968520,
+  "banco_por_texto": 0.7298534220755697,
+  "batch": 1000,
+  "bytes_corpus": 97236675,
+  "chaves_estimadas": 2073681,
+  "colapso": null,
+  "commit": "d088f12",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "bm25_b": 0.75,
+    "bm25_k1": 1.2,
+    "languages": null,
+    "max_prefix_terms": 256,
+    "partition_filters": true,
+    "positions": null,
+    "reader_cache_depth": 2,
+    "statistics": true,
+    "writer_cache_nodes": 1000000
+  },
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-10000.jsonl",
+  "db": "/home/evertondays/bench-db/perf-v3-100k/ptwiki-10k",
+  "docs": 10000,
+  "docs_por_s": 2449.3281504272754,
+  "escrita": {
+    "block_cache_hit": 0,
+    "block_cache_miss": 1084,
+    "bloom_util": 9,
+    "bytes_compactacao": 0,
+    "bytes_escritos_usuario": 79274466,
+    "bytes_flush": 30152131,
+    "stall_micros": 0,
+    "write_amp": 0.38035110826227453
+  },
+  "formato": 2,
+  "idiomas": [
+    "pt",
+    "en"
+  ],
+  "janelas": [
+    {
+      "banco_mb": 67.68073081970215,
+      "commit_fracao": 0.6299282463753152,
+      "compactacao_pendente_mb": 0.0,
+      "dados_miss": 0,
+      "docs": 10000,
+      "docs_por_s": 2450.023318770693,
+      "filtro_mb": 1.0683002471923828,
+      "filtro_miss": 542,
+      "gets_por_doc": 0.0029,
+      "l0": 1,
+      "mb_por_s": 22.719585532162405,
+      "ram_livre_mb": 6662.390625,
+      "rss_mb": 284.10546875,
+      "segundos": 4.0821084,
+      "stall_s": 0.0,
+      "swap_mb": 40.99609375
+    }
+  ],
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 6985248768,
+    "ram_total": 8266141696,
+    "swap_usado": 42987520
+  },
+  "mb_por_s": 22.713139088768777,
+  "nos_trie": 728495,
+  "pico_rss": 297906176,
+  "posicoes": true,
+  "quando": "2026-10-26T03-42-17",
+  "remap_ids": false,
+  "rotulo": "ptwiki-10k",
+  "segundos": 4.082752243,
+  "skip": 0,
+  "streaming": false,
+  "swap_aumento": 0,
+  "take": null,
+  "tipo": "load"
+}

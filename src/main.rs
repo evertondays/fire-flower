@@ -203,7 +203,9 @@ fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>, posicoes: 
         if is_html(path) {
             content = text::strip_html(&content);
         }
-        batch.add_labeled(&path.display().to_string(), &content)?;
+        // O nome do arquivo (sem extensão) é o título: pesa mais no ranking.
+        let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        batch.add_labeled_titled(&path.display().to_string(), &title, &content)?;
         indexed += 1;
         if batch.len() >= DOCS_PER_COMMIT {
             batch.commit()?;

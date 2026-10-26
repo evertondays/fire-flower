@@ -1,0 +1,491 @@
+{
+  "commit": "9bd293b-modificado",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "bm25_b": 0.75,
+    "bm25_k1": 1.2,
+    "languages": null,
+    "max_prefix_terms": 256,
+    "partition_filters": true,
+    "positions": null,
+    "reader_cache_depth": 2,
+    "statistics": false,
+    "writer_cache_nodes": 1000000
+  },
+  "conjuntos": [
+    {
+      "acerto_ate": 1,
+      "conjunto": "rel-titulo",
+      "consultas": 1000,
+      "erros": [
+        {
+          "consulta": "Batna",
+          "esperado": "Batna",
+          "posicao": 2,
+          "top3": [
+            "Batna (província)",
+            "Batna",
+            "Províncias da Argélia"
+          ]
+        },
+        {
+          "consulta": "Deuterão",
+          "esperado": "Deuterão",
+          "posicao": 2,
+          "top3": [
+            "Deutério",
+            "Deuterão"
+          ]
+        },
+        {
+          "consulta": "Litografia",
+          "esperado": "Litografia",
+          "posicao": 2,
+          "top3": [
+            "Alois Senefelder",
+            "Litografia",
+            "Joseph Nicéphore Niépce"
+          ]
+        },
+        {
+          "consulta": "Condado de Perry (Ohio)",
+          "esperado": "Condado de Perry (Ohio)",
+          "posicao": 2,
+          "top3": [
+            "Condado de Perry",
+            "Condado de Perry (Ohio)",
+            "Condado de Morgan (Ohio)"
+          ]
+        },
+        {
+          "consulta": "Número de amura",
+          "esperado": "Número de amura",
+          "posicao": 2,
+          "top3": [
+            "Lista de navios da Marinha Portuguesa por número de amura",
+            "Número de amura",
+            "NRP Cacheu (F470)"
+          ]
+        },
+        {
+          "consulta": "Club Olimpia",
+          "esperado": "Club Olimpia",
+          "posicao": 2,
+          "top3": [
+            "Olímpia (desambiguação)",
+            "Club Olimpia",
+            "Julio César Manzur"
+          ]
+        },
+        {
+          "consulta": "Geografia da Bélgica",
+          "esperado": "Geografia da Bélgica",
+          "posicao": 3,
+          "top3": [
+            "Benelux",
+            "Waterloo",
+            "Geografia da Bélgica"
+          ]
+        },
+        {
+          "consulta": "Caixa negra",
+          "esperado": "Caixa negra",
+          "posicao": 3,
+          "top3": [
+            "A Caixa-Preta de Darwin",
+            "Amos Oz",
+            "Caixa negra"
+          ]
+        }
+      ],
+      "fora_do_top1000": 3,
+      "mrr": 0.8753512866102702,
+      "top1": 0.813,
+      "top10": 0.971,
+      "top3": 0.928
+    },
+    {
+      "acerto_ate": 1,
+      "conjunto": "rel-digitando",
+      "consultas": 1000,
+      "erros": [
+        {
+          "consulta": "astron*",
+          "esperado": "Astronomia",
+          "posicao": 8,
+          "top3": [
+            "Astrônomo",
+            "Astronáutica",
+            "Astronauta (Mauricio de Sousa)"
+          ]
+        },
+        {
+          "consulta": "caesalpini*",
+          "esperado": "Caesalpinioideae",
+          "posicao": 2,
+          "top3": [
+            "Caesalpinia mexicana",
+            "Caesalpinioideae",
+            "Fabaceae"
+          ]
+        },
+        {
+          "consulta": "callao regi*",
+          "esperado": "Callao (região)",
+          "posicao": 2,
+          "top3": [
+            "El Callao",
+            "Callao (região)",
+            "Lima (região)"
+          ]
+        },
+        {
+          "consulta": "after the funer*",
+          "esperado": "After the Funeral",
+          "posicao": 3,
+          "top3": [
+            "Funeral",
+            "Funerária",
+            "After the Funeral"
+          ]
+        },
+        {
+          "consulta": "vendo*",
+          "esperado": "Vendoire",
+          "posicao": 3,
+          "top3": [
+            "Nónego",
+            "Polissíndeto",
+            "Vendoire"
+          ]
+        },
+        {
+          "consulta": "mesao frio guimar*",
+          "esperado": "Mesão Frio (Guimarães)",
+          "posicao": 2,
+          "top3": [
+            "Mesão Frio (desambiguação)",
+            "Mesão Frio (Guimarães)",
+            "Distrito de Vila Real"
+          ]
+        },
+        {
+          "consulta": "corn*",
+          "esperado": "Cornes",
+          "posicao": 61,
+          "top3": [
+            "Língua córnica",
+            "Cornualha",
+            "Cornucópia"
+          ]
+        },
+        {
+          "consulta": "itaoc*",
+          "esperado": "Itaocara",
+          "posicao": 2,
+          "top3": [
+            "Itaoca",
+            "Itaocara",
+            "Nova Campina"
+          ]
+        }
+      ],
+      "fora_do_top1000": 1,
+      "mrr": 0.7885886313071443,
+      "top1": 0.698,
+      "top10": 0.936,
+      "top3": 0.865
+    },
+    {
+      "acerto_ate": 1,
+      "conjunto": "rel-hub",
+      "consultas": 1000,
+      "erros": [
+        {
+          "consulta": "Astronomia",
+          "esperado": "Astronomia",
+          "posicao": 2,
+          "top3": [
+            "Astronomia galáctica",
+            "Astronomia",
+            "Clube de Astronomia de Brasília"
+          ]
+        },
+        {
+          "consulta": "Astrologia",
+          "esperado": "Astrologia",
+          "posicao": 2,
+          "top3": [
+            "Astrologia e alquimia",
+            "Astrologia",
+            "História da astrologia"
+          ]
+        },
+        {
+          "consulta": "A Italiana",
+          "esperado": "A Italiana",
+          "posicao": 176,
+          "top3": [
+            "Costa (desambiguação)",
+            "Agência Espacial Italiana",
+            "Torino (desambiguação)"
+          ]
+        },
+        {
+          "consulta": "Litoral",
+          "esperado": "Litoral",
+          "posicao": 7,
+          "top3": [
+            "Krai do Litoral",
+            "Costa Verde (Brasil)",
+            "Alentejo Litoral"
+          ]
+        },
+        {
+          "consulta": "Mario Bros.",
+          "esperado": "Mario Bros.",
+          "posicao": 2,
+          "top3": [
+            "Super Mario Bros. 2",
+            "Mario Bros.",
+            "Luigi (personagem)"
+          ]
+        },
+        {
+          "consulta": "Esmeralda",
+          "esperado": "Esmeralda",
+          "posicao": 3,
+          "top3": [
+            "Esmeralda (desambiguação)",
+            "Notre-Dame de Paris (romance)",
+            "Esmeralda"
+          ]
+        },
+        {
+          "consulta": "Algoritmo",
+          "esperado": "Algoritmo",
+          "posicao": 19,
+          "top3": [
+            "Lista de algoritmos",
+            "Algoritmo de Floyd-Warshall",
+            "Algoritmo de Borůvka"
+          ]
+        },
+        {
+          "consulta": "Luxor",
+          "esperado": "Luxor",
+          "posicao": 3,
+          "top3": [
+            "Museu de Luxor",
+            "Luxor Hotel",
+            "Luxor"
+          ]
+        }
+      ],
+      "fora_do_top1000": 9,
+      "mrr": 0.5604825767945859,
+      "top1": 0.386,
+      "top10": 0.89,
+      "top3": 0.682
+    },
+    {
+      "acerto_ate": 10,
+      "conjunto": "rel-corpo",
+      "consultas": 1000,
+      "erros": [
+        {
+          "consulta": "baden wurttemberg",
+          "esperado": "Berg (Ravensburg)",
+          "posicao": 605,
+          "top3": [
+            "Baden-Württemberg",
+            "Waldenburg (Baden-Württemberg)",
+            "Wies (Baden-Württemberg)"
+          ]
+        },
+        {
+          "consulta": "cantao ticino",
+          "esperado": "Carona (Tessino)",
+          "posicao": 90,
+          "top3": [
+            "Fontana",
+            "Brione",
+            "Pura (Suíça)"
+          ]
+        },
+        {
+          "consulta": "maritimo sena",
+          "esperado": "Pommeréval",
+          "posicao": 250,
+          "top3": [
+            "Beaurepaire (Sena Marítimo)",
+            "Bénouville (Sena Marítimo)",
+            "Boos (Sena Marítimo)"
+          ]
+        },
+        {
+          "consulta": "po pavia",
+          "esperado": "Breme",
+          "posicao": 17,
+          "top3": [
+            "San Zenone al Po",
+            "Verrua Po",
+            "Pinarolo Po"
+          ]
+        },
+        {
+          "consulta": "estendia dordonha",
+          "esperado": "Saint-Aulaye",
+          "posicao": 37,
+          "top3": [
+            "Mareuil (Dordonha)",
+            "Maurens (Dordonha)",
+            "Mouzens (Dordonha)"
+          ]
+        },
+        {
+          "consulta": "baviera kelheim",
+          "esperado": "Rohr (Alemanha)",
+          "posicao": 17,
+          "top3": [
+            "Kelheim (distrito)",
+            "Kirchdorf (Kelheim)",
+            "Train (Baviera)"
+          ]
+        },
+        {
+          "consulta": "reno 05",
+          "esperado": "Ammerzwiller",
+          "posicao": 11,
+          "top3": [
+            "Still (Baixo Reno)",
+            "Forstheim",
+            "Obersteinbach"
+          ]
+        },
+        {
+          "consulta": "maritimo sena",
+          "esperado": "Quiberville",
+          "posicao": 253,
+          "top3": [
+            "Beaurepaire (Sena Marítimo)",
+            "Bénouville (Sena Marítimo)",
+            "Boos (Sena Marítimo)"
+          ]
+        }
+      ],
+      "fora_do_top1000": 0,
+      "mrr": 0.6124541507751755,
+      "top1": 0.498,
+      "top10": 0.814,
+      "top3": 0.687
+    },
+    {
+      "acerto_ate": 3,
+      "conjunto": "rel-manual",
+      "consultas": 36,
+      "erros": [
+        {
+          "consulta": "coreia do norte",
+          "esperado": "Coreia do Norte",
+          "posicao": 6,
+          "top3": [
+            "Bandeira da Coreia do Norte",
+            "Demografia da Coreia do Norte",
+            "Região Industrial de Kaesong"
+          ]
+        },
+        {
+          "consulta": "coreia do nor*",
+          "esperado": "Coreia do Norte",
+          "posicao": 6,
+          "top3": [
+            "Bandeira da Coreia do Norte",
+            "Demografia da Coreia do Norte",
+            "Região Industrial de Kaesong"
+          ]
+        },
+        {
+          "consulta": "coreia do sul",
+          "esperado": "Coreia do Sul",
+          "posicao": 21,
+          "top3": [
+            "Política da Coreia do Sul",
+            "Península da Coreia",
+            "Estreito da Coreia"
+          ]
+        },
+        {
+          "consulta": "brasil",
+          "esperado": "Brasil",
+          "posicao": 274,
+          "top3": [
+            "Igreja Evangélica Pentecostal O Brasil Para Cristo",
+            "Príncipe do Brasil",
+            "Colonização portuguesa da América"
+          ]
+        },
+        {
+          "consulta": "brasi*",
+          "esperado": "Brasil",
+          "posicao": 159,
+          "top3": [
+            "Brasília (desambiguação)",
+            "Seleção Brasileira",
+            "Setembro"
+          ]
+        },
+        {
+          "consulta": "são paulo",
+          "esperado": "São Paulo",
+          "posicao": 43,
+          "top3": [
+            "São Paulo (desambiguação)",
+            "Chen Kong Fang",
+            "Jorge Americano"
+          ]
+        },
+        {
+          "consulta": "sao pau*",
+          "esperado": "São Paulo",
+          "posicao": 47,
+          "top3": [
+            "São Paulo (desambiguação)",
+            "Paulista (desambiguação)",
+            "Chen Kong Fang"
+          ]
+        },
+        {
+          "consulta": "segunda guerra mundial",
+          "esperado": "Segunda Guerra Mundial",
+          "posicao": 312,
+          "top3": [
+            "1940",
+            "U-boot",
+            "Senta a Pua! (documentário)"
+          ]
+        }
+      ],
+      "fora_do_top1000": 0,
+      "mrr": 0.26408957063321914,
+      "top1": 0.08333333333333333,
+      "top10": 0.6111111111111112,
+      "top3": 0.3888888888888889
+    }
+  ],
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-100000.jsonl",
+  "db": "/home/evertondays/bench-db/v3/ptwiki-100000",
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 7208173568,
+    "ram_total": 8266141696,
+    "swap_usado": 42987520
+  },
+  "quando": "2026-10-26T03-18-24",
+  "rotulo": "fase3-v3-100k",
+  "seed": 42,
+  "take": null,
+  "tipo": "relevancia"
+}

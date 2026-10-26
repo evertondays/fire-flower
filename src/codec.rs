@@ -57,28 +57,48 @@ impl TrieNode {
 
 // ------------------------------------------------------------------ post:
 
-/// Grava em `buf` a lista `(doc, tf)`, **ordenada por doc e sem repetições**.
-pub fn encode_postings_into(buf: &mut Vec<u8>, entries: &[(DocId, u32)]) {
+/// Grava em `buf` a lista `(doc, tf, tf no título)`, **ordenada por doc e
+/// sem repetições**.
+///
+/// Cada entrada: `Δdoc`, `tf << 1 | tem título` e, só se tiver, o tf do
+/// título. A maioria das entradas não tem o termo no título e não paga nada
+/// a mais que no formato v2.
+pub fn encode_postings_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)]) {
     debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
-    debug_assert!(entries.iter().all(|e| e.1 > 0));
+    debug_assert!(entries.iter().all(|e| e.1 > 0 && e.2 <= e.1));
     buf.reserve(1 + entries.len() * 3);
     put_varint(buf, entries.len() as u64);
     let mut prev = 0;
-    for &(doc, tf) in entries {
+    for &(doc, tf, title_tf) in entries {
         put_varint(buf, doc - prev);
-        put_varint(buf, u64::from(tf));
+        put_varint(buf, (u64::from(tf) << 1) | u64::from(title_tf > 0));
+        if title_tf > 0 {
+            put_varint(buf, u64::from(title_tf));
+        }
         prev = doc;
     }
 }
 
 pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
-    let entries: Vec<(DocId, u32)> = postings.iter().map(|p| (p.doc, p.tf)).collect();
+    let entries: Vec<(DocId, u32, u32)> = postings.iter().map(|p| (p.doc, p.tf, p.title_tf)).collect();
     let mut buf = Vec::new();
     encode_postings_into(&mut buf, &entries);
     buf
 }
 
-/// Lista completa: documento e frequência do termo.
+/// Lê o tf de uma entrada e, se houver, o do título: `(tf, tf no título)`.
+#[inline]
+fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
+    let packed = r.varint()?;
+    let tf = u32::try_from(packed >> 1).map_err(|_| corrupt("tf estourou u32"))?;
+    let title_tf = if packed & 1 == 1 { r.u32()? } else { 0 };
+    if tf == 0 || title_tf > tf || (packed & 1 == 1 && title_tf == 0) {
+        return Err(corrupt("tf inválido na lista"));
+    }
+    Ok((tf, title_tf))
+}
+
+/// Lista completa: documento e frequência do termo (total e no título).
 pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
     let mut r = Reader::new(bytes);
     let n = r.varint()?;
@@ -87,8 +107,8 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
     let mut doc: DocId = 0;
     for _ in 0..n {
         doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
-        let tf = r.u32()?;
-        out.push(Posting { doc, tf });
+        let (tf, title_tf) = read_tfs(&mut r)?;
+        out.push(Posting { doc, tf, title_tf });
     }
     r.finish()?;
     Ok(out)
@@ -102,7 +122,9 @@ pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
     let mut doc: DocId = 0;
     for _ in 0..n {
         doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
-        r.skip_varints(1)?;
+        if r.varint()? & 1 == 1 {
+            r.skip_varints(1)?;
+        }
         out.push(doc);
     }
     r.finish()?;
@@ -111,13 +133,14 @@ pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
 
 // ------------------------------------------------------------------ pos:
 
-/// Grava em `buf` as posições de cada documento. `entries` traz `(doc, tf)`
-/// ordenado por doc; `positions` traz as posições de todos, em sequência
-/// (`tf` posições crescentes por documento).
-pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32)], positions: &[u32]) {
+/// Grava em `buf` as posições de cada documento. `entries` traz
+/// `(doc, tf, tf no título)` ordenado por doc (só o tf é usado); `positions`
+/// traz as posições de todos, em sequência (`tf` posições crescentes por
+/// documento).
+pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)], positions: &[u32]) {
     debug_assert_eq!(entries.iter().map(|e| e.1 as usize).sum::<usize>(), positions.len());
     let mut at = 0usize;
-    encode_positions_with(buf, entries.len(), entries.iter().map(|&(doc, tf)| {
+    encode_positions_with(buf, entries.len(), entries.iter().map(|&(doc, tf, _)| {
         let slice = &positions[at..at + tf as usize];
         at += tf as usize;
         (doc, slice)
@@ -256,6 +279,8 @@ fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
         let k = r.varint()?;
         if positions {
             r.skip_varints(k)?;
+        } else if k & 1 == 1 {
+            r.skip_varints(1)?; // tf do título
         }
     }
     r.finish()?;
@@ -307,12 +332,12 @@ fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions: bool) -> O
 /// Ordenação estável por doc: entre entradas do mesmo doc, a ordem dos
 /// pedaços se mantém e a última (a mais nova) fica.
 fn merge_postings_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
-    let mut all: Vec<(DocId, u32)> = Vec::with_capacity(lists.iter().map(|(_, s)| s.n as usize).sum());
+    let mut all: Vec<(DocId, u32, u32)> = Vec::with_capacity(lists.iter().map(|(_, s)| s.n as usize).sum());
     for (bytes, _) in lists {
-        all.extend(decode_postings(bytes)?.into_iter().map(|p| (p.doc, p.tf)));
+        all.extend(decode_postings(bytes)?.into_iter().map(|p| (p.doc, p.tf, p.title_tf)));
     }
     all.sort_by_key(|e| e.0);
-    let mut kept: Vec<(DocId, u32)> = Vec::with_capacity(all.len());
+    let mut kept: Vec<(DocId, u32, u32)> = Vec::with_capacity(all.len());
     for e in all {
         match kept.last_mut() {
             Some(last) if last.0 == e.0 => *last = e,
@@ -352,16 +377,19 @@ fn merge_positions_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
 
 // ------------------------------------------------------------------ norm:
 
-/// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`).
+/// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`):
+/// o do documento inteiro (título e texto) e o do título.
 ///
-/// No disco, só os documentos que existem: (deslocamento, tamanho) em ordem.
-/// Em memória o bloco é denso (um `u32` por deslocamento, até o maior), para
-/// o ranking ler o tamanho de um documento com um acesso direto: ele faz isso
-/// milhares de vezes por busca. Ocupa no máximo 4 KB por bloco.
+/// No disco, só os documentos que existem: (Δdeslocamento, tamanho, tamanho
+/// do título) em ordem. Em memória o bloco é denso (um par por deslocamento,
+/// até o maior), para o ranking ler o tamanho de um documento com um acesso
+/// direto: ele faz isso milhares de vezes por busca. Ocupa no máximo 6 KB.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NormBlock {
     /// Tamanho por deslocamento; [`ABSENT`] onde não há documento.
     lens: Vec<u32>,
+    /// Tamanho do título por deslocamento (0 onde não há documento).
+    title_lens: Vec<u16>,
     count: usize,
 }
 
@@ -373,12 +401,13 @@ const ABSENT: u32 = u32::MAX;
 
 impl NormBlock {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + self.count * 3);
+        let mut buf = Vec::with_capacity(2 + self.count * 4);
         put_varint(&mut buf, self.count as u64);
         let mut prev = 0;
-        for (off, len) in self.iter() {
+        for (off, len, title_len) in self.iter() {
             put_varint(&mut buf, u64::from(off - prev));
             put_varint(&mut buf, u64::from(len));
+            put_varint(&mut buf, u64::from(title_len));
             prev = off;
         }
         buf
@@ -402,15 +431,17 @@ impl NormBlock {
                 return Err(corrupt("documento fora do bloco de tamanhos"));
             }
             let len = r.u32()?;
-            if len == ABSENT {
+            let title_len = u16::try_from(r.varint()?).map_err(|_| corrupt("tamanho de título inválido"))?;
+            if len == ABSENT || u32::from(title_len) > len {
                 return Err(corrupt("tamanho de documento inválido"));
             }
-            block.set(off as u16, len);
+            block.set(off as u16, len, title_len);
         }
         r.finish()?;
         Ok(block)
     }
 
+    /// Tamanho do documento inteiro (título e texto).
     #[inline]
     pub fn get(&self, offset: u16) -> Option<u32> {
         match self.lens.get(usize::from(offset)) {
@@ -419,20 +450,32 @@ impl NormBlock {
         }
     }
 
-    /// Grava o tamanho e devolve o anterior, se o documento já estava no bloco.
-    pub fn set(&mut self, offset: u16, len: u32) -> Option<u32> {
+    /// (tamanho do documento inteiro, tamanho do título).
+    #[inline]
+    pub fn get_both(&self, offset: u16) -> Option<(u32, u16)> {
+        let i = usize::from(offset);
+        match self.lens.get(i) {
+            Some(&len) if len != ABSENT => Some((len, self.title_lens[i])),
+            _ => None,
+        }
+    }
+
+    /// Grava os tamanhos e devolve os anteriores, se o documento já estava no bloco.
+    pub fn set(&mut self, offset: u16, len: u32, title_len: u16) -> Option<(u32, u16)> {
         debug_assert!(u64::from(offset) < NORM_BLOCK_DOCS);
-        debug_assert!(len != ABSENT);
+        debug_assert!(len != ABSENT && u32::from(title_len) <= len);
         let i = usize::from(offset);
         if i >= self.lens.len() {
             self.lens.resize(i + 1, ABSENT);
+            self.title_lens.resize(i + 1, 0);
         }
         let old = std::mem::replace(&mut self.lens[i], len);
+        let old_title = std::mem::replace(&mut self.title_lens[i], title_len);
         if old == ABSENT {
             self.count += 1;
             None
         } else {
-            Some(old)
+            Some((old, old_title))
         }
     }
 
@@ -444,9 +487,13 @@ impl NormBlock {
         self.count == 0
     }
 
-    /// (deslocamento, tamanho) em ordem crescente.
-    pub fn iter(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
-        self.lens.iter().enumerate().filter(|&(_, &len)| len != ABSENT).map(|(off, &len)| (off as u16, len))
+    /// (deslocamento, tamanho, tamanho do título) em ordem crescente.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u32, u16)> + '_ {
+        self.lens
+            .iter()
+            .enumerate()
+            .filter(|&(_, &len)| len != ABSENT)
+            .map(|(off, &len)| (off as u16, len, self.title_lens[off]))
     }
 }
 
@@ -537,7 +584,11 @@ mod tests {
     use super::*;
 
     fn p(doc: DocId, tf: u32) -> Posting {
-        Posting { doc, tf }
+        Posting::new(doc, tf)
+    }
+
+    fn pt(doc: DocId, tf: u32, title_tf: u32) -> Posting {
+        Posting { doc, tf, title_tf }
     }
 
     fn pos_bytes(entries: &[(DocId, &[u32])]) -> Vec<u8> {
@@ -570,6 +621,29 @@ mod tests {
     }
 
     #[test]
+    fn title_tf_roundtrip_and_merge() {
+        let list = [pt(1, 3, 1), p(2, 1), pt(5, 2, 2), p(9, 4), pt(u64::MAX, u32::MAX, u32::MAX)];
+        let bytes = encode_postings(&list);
+        assert_eq!(decode_postings(&bytes).unwrap(), list);
+        assert_eq!(decode_docs(&bytes).unwrap(), [1, 2, 5, 9, u64::MAX]);
+        // Sem título a entrada não cresce: Δdoc 1 byte + tf 1 byte.
+        assert_eq!(encode_postings(&[p(1, 1)]).len(), 3);
+        assert_eq!(encode_postings(&[pt(1, 1, 1)]).len(), 4);
+        // Merge rápido (pedaços em ordem) e lento (sobrepostos), a última versão vence.
+        let a = encode_postings(&[pt(1, 2, 1), p(4, 1)]);
+        let b = encode_postings(&[pt(7, 1, 1)]);
+        let fast = merge_postings([a.as_slice(), b.as_slice()].into_iter()).unwrap();
+        assert_eq!(decode_postings(&fast).unwrap(), [pt(1, 2, 1), p(4, 1), pt(7, 1, 1)]);
+        let c = encode_postings(&[p(1, 5), pt(4, 3, 2)]);
+        let slow = merge_postings([a.as_slice(), b.as_slice(), c.as_slice()].into_iter()).unwrap();
+        assert_eq!(decode_postings(&slow).unwrap(), [p(1, 5), pt(4, 3, 2), pt(7, 1, 1)]);
+        // tf do título maior que o tf, ou marcado e zero: corrompido.
+        assert!(decode_postings(&[1, 1, (1 << 1) | 1, 2]).is_err());
+        assert!(decode_postings(&[1, 1, (1 << 1) | 1, 0]).is_err());
+        assert!(decode_postings(&[1, 1, 0]).is_err(), "tf 0");
+    }
+
+    #[test]
     fn positions_roundtrip_and_cursor() {
         let entries: Vec<(DocId, &[u32])> = vec![(3, &[0, 5, 9]), (10, &[2]), (11, &[0, 1, 300, 70_000]), (500, &[u32::MAX])];
         let bytes = pos_bytes(&entries);
@@ -581,7 +655,7 @@ mod tests {
         // encode_positions_into (formato do lote) dá os mesmos bytes.
         let mut via_batch = Vec::new();
         let flat: Vec<u32> = entries.iter().flat_map(|(_, ps)| ps.iter().copied()).collect();
-        let pairs: Vec<(DocId, u32)> = entries.iter().map(|(d, ps)| (*d, ps.len() as u32)).collect();
+        let pairs: Vec<(DocId, u32, u32)> = entries.iter().map(|(d, ps)| (*d, ps.len() as u32, 0)).collect();
         encode_positions_into(&mut via_batch, &pairs, &flat);
         assert_eq!(via_batch, bytes);
 
@@ -607,14 +681,15 @@ mod tests {
         assert!(decode_postings(&[1, 1]).is_err()); // falta o tf
         assert!(decode_postings(&[0, 9]).is_err()); // sobra
         assert!(decode_docs(&[1, 1]).is_err());
-        assert!(decode_postings(&[1, 1, 0x80, 0x80, 0x80, 0x80, 0x10]).is_err()); // tf > u32
+        assert!(decode_postings(&[1, 1, 0x80, 0x80, 0x80, 0x80, 0x20]).is_err()); // tf > u32 (o tf vai deslocado 1 bit)
         assert!(get_varint(&[0xff; 11]).is_err());
         assert!(decode_positions(&[1, 1, 2, 5]).is_err()); // diz 2 posições, tem 1
         assert!(decode_positions(&[1, 1, 0]).is_err()); // documento sem posições
         assert!(decode_positions(&[1, 1, 2, 5, 0]).is_err()); // posição repetida
         assert!(decode_positions(&[1, 1, 1, 5, 7]).is_err()); // sobra
         assert!(NormBlock::decode(&[1, 0x80, 0x08, 1]).is_err()); // deslocamento 1024
-        assert!(NormBlock::decode(&[2, 3, 1, 0, 1]).is_err()); // repetido
+        assert!(NormBlock::decode(&[2, 3, 1, 0, 0, 1, 0]).is_err()); // repetido
+        assert!(NormBlock::decode(&[1, 3, 1, 2]).is_err()); // título maior que o documento
         assert!(merge_postings([&[2u8, 1][..]].into_iter()).is_none());
         assert!(merge_positions([&[1u8, 1, 2, 5][..]].into_iter()).is_none());
     }
@@ -699,14 +774,16 @@ mod tests {
     #[test]
     fn norm_block_roundtrip_and_updates() {
         let mut block = NormBlock::default();
-        assert_eq!(block.set(5, 100), None);
-        assert_eq!(block.set(900, 7), None);
-        assert_eq!(block.set(2, 0), None, "insere no meio");
-        assert_eq!(block.set(5, 40), Some(100), "reindexar devolve o tamanho antigo");
-        assert_eq!(block.iter().collect::<Vec<_>>(), [(2, 0), (5, 40), (900, 7)]);
+        assert_eq!(block.set(5, 100, 3), None);
+        assert_eq!(block.set(900, 7, 0), None);
+        assert_eq!(block.set(2, 0, 0), None, "insere no meio");
+        assert_eq!(block.set(5, 40, 2), Some((100, 3)), "reindexar devolve os tamanhos antigos");
+        assert_eq!(block.iter().collect::<Vec<_>>(), [(2, 0, 0), (5, 40, 2), (900, 7, 0)]);
         let decoded = NormBlock::decode(&block.encode()).unwrap();
         assert_eq!(decoded, block);
         assert_eq!(decoded.get(5), Some(40));
+        assert_eq!(decoded.get_both(5), Some((40, 2)));
+        assert_eq!(decoded.get_both(6), None);
         assert_eq!(decoded.get(6), None);
         assert_eq!(decoded.get(2), Some(0), "tamanho 0 existe");
         assert_eq!(decoded.get(800), None);

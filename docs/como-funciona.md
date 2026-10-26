@@ -235,14 +235,14 @@ prefixo na chave:
 | Chave | Valor | Exemplo |
 |---|---|---|
 | `node:<id>` | um nó da Trie: "é fim de palavra?" + filhos (`caractere → id`) | `node:0` é sempre a raiz |
-| `post:<id>` | lista de postagem do termo que **termina** no nó `<id>`: cada documento e quantas vezes o termo aparece nele (tf) | `post:11` = documentos com `casa` |
-| `pos:<id>` | as posições do termo em cada documento (só em bancos com posições) | `pos:11` = onde `casa` aparece |
-| `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco | `norm:0` = documentos 0 a 1023 |
+| `post:<id>` | lista de postagem do termo que **termina** no nó `<id>`: cada documento, quantas vezes o termo aparece nele (tf) e quantas dessas estão no título | `post:11` = documentos com `casa` |
+| `pos:<id>` | as posições do termo em cada documento (só em bancos com posições); o título vem primeiro e o texto começa 100 posições depois do fim dele | `pos:11` = onde `casa` aparece |
+| `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco, e o do título | `norm:0` = documentos 0 a 1023 |
 | `doc:<id>` | rótulo do documento (a CLI grava o caminho do arquivo) | `doc:42` → `/home/.../notas.txt` |
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
-| `meta:doc_count`, `meta:total_len` | total de documentos e soma dos tamanhos (para o ranking) | |
-| `meta:format`, `meta:positions`, `meta:languages` | versão do formato (2), se grava posições e idiomas das stopwords | |
+| `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
+| `meta:format`, `meta:positions`, `meta:languages` | versão do formato (3), se grava posições e idiomas das stopwords | |
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -264,12 +264,13 @@ ordem em que o RocksDB as guarda):
 
 ```text
 meta:doc_count         02
-meta:format            02
+meta:format            03
 meta:languages         pt,en
 meta:next_doc_id       03
 meta:next_node_id      0c
 meta:positions         01
 meta:total_len         05
+meta:total_title_len   00
 node:0                 00 02 61 01 63 05
 node:1                 00 01 7a 02
 node:10                00 01 61 0b
@@ -282,14 +283,18 @@ node:6                 00 02 72 07 73 0a
 node:7                 00 01 72 08
 node:8                 00 01 6f 09
 node:9                 01 00
-norm:0                 02 01 02 01 03
+norm:0                 02 01 02 00 01 03 00
 pos:11                 02 01 01 01 01 01 05
 pos:4                  02 01 01 02 01 01 02
 pos:9                  01 02 01 01
-post:11                02 01 01 01 01
-post:4                 02 01 01 01 01
-post:9                 01 02 01
+post:11                02 01 02 01 02
+post:4                 02 01 02 01 02
+post:9                 01 02 02
 ```
+
+Os dois documentos foram indexados sem título (`add_document`). Com
+`add_titled`, as palavras do título entram nas mesmas listas e o tf do título
+aparece à parte (abaixo).
 
 "a", "o" e "e" são stopwords: não entram no índice. A Trie que esses bytes
 descrevem tem só `azul`, `carro` e `casa`:
@@ -331,9 +336,15 @@ autocompletar em ordem alfabética sem esforço extra.
 
 ```text
 02          2 documentos
-01 01       documento 0 + 1 = 1, tf 1
-01 01       documento 1 + 1 = 2, tf 1
+01 02       documento 0 + 1 = 1; 02 = tf 1 << 1, sem título
+01 02       documento 1 + 1 = 2; tf 1, sem título
 ```
+
+O segundo número é `tf << 1 | tem título`. Quando o bit de baixo é 1, vem
+mais um número: quantas das ocorrências estão no título. Um documento com
+"Casa" no título e mais duas vezes no texto teria `.. 07 01` (tf 3, 1 no
+título). Entradas sem o termo no título, que são quase todas, não pagam nada
+a mais.
 
 ### Lendo as posições: `pos:11`
 
@@ -351,12 +362,13 @@ conferida: `azul` em 2 e `casa` em 2 + 3.
 
 ```text
 02          2 documentos neste bloco (IDs 0 a 1023)
-01 02       deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul)
-01 03       deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa)
+01 02 00    deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul), título 0
+01 03 00    deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa), título 0
 ```
 
-O tamanho conta só os tokens indexados (sem stopwords). `meta:total_len = 5`
-é a soma dos tamanhos e `meta:doc_count = 2`; o ranking usa o tamanho médio
+O tamanho conta só os tokens indexados (sem stopwords), título e texto
+juntos; o terceiro número é quanto disso é título. `meta:total_len = 5` é a
+soma dos tamanhos e `meta:doc_count = 2`; o ranking usa o tamanho médio
 (5 ÷ 2) para comparar documentos.
 
 Duas técnicas deixam tudo isso pequeno:

@@ -373,7 +373,7 @@ fn database_without_stopwords() {
 use fire_flower::{Error, Hit, IndexStats, Posting};
 
 fn p(doc: u64, tf: u32) -> Posting {
-    Posting { doc, tf }
+    Posting::new(doc, tf)
 }
 
 fn positions(engine: &Engine, term: &str) -> Vec<(u64, Vec<u32>)> {
@@ -400,11 +400,11 @@ fn stores_tf_positions_lengths_and_stats() {
     assert_eq!(engine.doc_len(2).unwrap(), Some(1));
     assert_eq!(engine.doc_len(3).unwrap(), Some(0));
     assert_eq!(engine.doc_len(4).unwrap(), None);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 5 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 5, total_title_len: 0 });
 
     let mut lens = Vec::new();
-    engine.for_each_doc_len(|d, l| lens.push((d, l))).unwrap();
-    assert_eq!(lens, [(1, 4), (2, 1), (3, 0)]);
+    engine.for_each_doc_len(|d, l, t| lens.push((d, l, t))).unwrap();
+    assert_eq!(lens, [(1, 4, 0), (2, 1, 0), (3, 0, 0)]);
 
     // Persistem e seguem certos depois de reabrir e compactar.
     drop(engine);
@@ -413,7 +413,7 @@ fn stores_tf_positions_lengths_and_stats() {
     engine.compact();
     assert_eq!(engine.term_postings("papel").unwrap(), [p(1, 1), p(2, 1), p(2000, 2)]);
     assert_eq!(positions(&engine, "papel"), [(1, vec![2]), (2, vec![0]), (2000, vec![0, 1])]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7, total_title_len: 0 });
     assert_eq!(engine.doc_len(2000).unwrap(), Some(2));
 }
 
@@ -427,7 +427,7 @@ fn reindexing_replaces_tf_positions_and_length() {
     engine.index_document(7, "eco").unwrap();
     assert_eq!(engine.term_postings("eco").unwrap(), [p(7, 1)]);
     assert_eq!(positions(&engine, "eco"), [(7, vec![0])]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 1, total_len: 1 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 1, total_len: 1, total_title_len: 0 });
 
     // No mesmo lote, fora de ordem: a última adição vence.
     let mut batch = engine.batch();
@@ -439,15 +439,15 @@ fn reindexing_replaces_tf_positions_and_length() {
     assert_eq!(positions(&engine, "sol"), [(8, vec![0]), (9, vec![1])]);
     assert_eq!(positions(&engine, "lua"), [(8, vec![1]), (9, vec![0, 2])]);
     assert_eq!(engine.doc_len(9).unwrap(), Some(3));
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3, total_title_len: 0 });
 
     // Depois de compactar (merge completo) continua igual.
     engine.compact();
     assert_eq!(engine.term_postings("sol").unwrap(), [p(8, 1), p(9, 1)]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6, total_title_len: 0 });
     drop(engine);
     let engine = open(&dir);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6, total_title_len: 0 });
 }
 
 #[test]
@@ -959,4 +959,91 @@ fn bloom_filters_larger_than_a_cache_shard_are_not_reread_on_every_get() {
 
 fn engine_reads() -> u64 {
     fire_flower::internals::reads_on_this_thread()
+}
+
+/// Formato v3: o título é um campo. As palavras dele são buscáveis, o tf do
+/// título vem à parte na lista e os tamanhos do título ficam guardados.
+#[test]
+fn title_is_a_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_titled(1, "Coreia do Norte", "A Coreia do Norte fica na Ásia. Coreia, Coreia.").unwrap();
+    batch.add_titled(2, "Bandeira", "A bandeira da Coreia do Norte.").unwrap();
+    batch.add_document(3, "norte sem título").unwrap();
+    batch.commit().unwrap();
+
+    assert_eq!(engine.term_postings("coreia").unwrap(), [Posting { doc: 1, tf: 4, title_tf: 1 }, p(2, 1)]);
+    assert_eq!(engine.term_postings("bandeira").unwrap(), [Posting { doc: 2, tf: 2, title_tf: 1 }]);
+    assert_eq!(engine.term_postings("norte").unwrap(), [Posting { doc: 1, tf: 2, title_tf: 1 }, p(2, 1), p(3, 1)]);
+    // Termo só no título também casa.
+    assert_eq!(engine.search("bandeira").unwrap(), [2]);
+
+    // Tamanhos: o inteiro (título + texto) e o do título, sem stopwords.
+    let mut lens = Vec::new();
+    engine.for_each_doc_len(|d, l, t| lens.push((d, l, t))).unwrap();
+    assert_eq!(lens, [(1, 8, 2), (2, 4, 1), (3, 2, 0)]);
+    let stats = engine.stats().unwrap();
+    assert_eq!((stats.doc_count, stats.total_len, stats.total_title_len), (3, 14, 3));
+
+    // Reindexar troca o título e as estatísticas.
+    engine.index_document(2, "outro texto").unwrap();
+    assert_eq!(engine.stats().unwrap().total_title_len, 2);
+
+    // add_labeled_titled grava o rótulo e o título.
+    let mut batch = engine.batch();
+    let id = batch.add_labeled_titled("docs/readme.md", "readme", "instruções").unwrap();
+    batch.commit().unwrap();
+    assert_eq!(engine.label(id).unwrap().as_deref(), Some("docs/readme.md"));
+    assert_eq!(engine.term_postings("readme").unwrap(), [Posting { doc: id, tf: 1, title_tf: 1 }]);
+}
+
+/// Posições: o título em 0…T − 1, o texto a partir de T + TITLE_GAP. Uma
+/// frase não casa atravessando o fim do título e o começo do texto.
+#[test]
+fn phrase_does_not_cross_from_title_to_text() {
+    use fire_flower::text::TITLE_GAP;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_titled(1, "Casa de", "papel azul").unwrap();
+    batch.add_titled(2, "Outro", "casa de papel").unwrap();
+    batch.commit().unwrap();
+    let node = engine.term_node("papel").unwrap().unwrap();
+    // Título "Casa de" tem 2 tokens: o texto começa em 2 + TITLE_GAP.
+    assert_eq!(engine.positions_of_node(node).unwrap(), [(1, vec![2 + TITLE_GAP]), (2, vec![1 + TITLE_GAP + 2])]);
+    assert_eq!(engine.search("\"casa de papel\"").unwrap(), [2]);
+    assert_eq!(engine.search("casa papel").unwrap(), [1, 2], "o E continua valendo entre os campos");
+}
+
+/// Banco v2 (formato anterior ao título) com merges pendentes no WAL: tem que
+/// ser recusado com a mensagem de recarregar, sem rodar o merge operator novo
+/// e sem alterar o banco.
+#[test]
+fn v2_database_is_rejected_before_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let concat = |_: &[u8], existing: Option<&[u8]>, ops: &rocksdb::MergeOperands| {
+        let mut out = existing.map(<[u8]>::to_vec).unwrap_or_default();
+        for op in ops {
+            out.extend_from_slice(op);
+        }
+        Some(out)
+    };
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.set_merge_operator_associative("fire_flower_v2", concat);
+        let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+        db.put(b"meta:format", [2u8]).unwrap();
+        db.put(b"meta:next_node_id", [5u8]).unwrap();
+        db.merge(b"post:4", [1u8, 7, 1]).unwrap();
+        db.merge(b"post:4", [1u8, 9, 1]).unwrap();
+    }
+    let err = Engine::open(dir.path(), Config::default()).err().expect("v2 tem que falhar");
+    assert!(matches!(&err, Error::Config(m) if m.contains("formato 2") && m.contains("recarregue")), "{err}");
+    // O merge operator antigo ainda lê a lista como era: nada foi tocado.
+    let mut opts = rocksdb::Options::default();
+    opts.set_merge_operator_associative("fire_flower_v2", concat);
+    let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+    assert_eq!(db.get(b"post:4").unwrap().unwrap(), [1u8, 7, 1, 1, 9, 1]);
 }

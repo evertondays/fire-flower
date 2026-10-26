@@ -81,18 +81,18 @@ fn bench_postings(c: &mut Criterion) {
     let area_pos = engine.positions_of_node(engine.term_node("area").unwrap().unwrap()).unwrap();
     let mut area_pos_bytes = Vec::new();
     {
-        // Mesmo formato do lote: (doc, tf) + posições em sequência.
-        let pairs: Vec<(u64, u32)> = area_pos.iter().map(|(d, ps)| (*d, ps.len() as u32)).collect();
+        // Mesmo formato do lote: (doc, tf, tf no título) + posições em sequência.
+        let pairs: Vec<(u64, u32, u32)> = area_pos.iter().map(|(d, ps)| (*d, ps.len() as u32, 0)).collect();
         let flat: Vec<u32> = area_pos.iter().flat_map(|(_, ps)| ps.iter().copied()).collect();
         fire_flower::internals::encode_positions_into(&mut area_pos_bytes, &pairs, &flat);
     }
     // Pedaços pequenos como os que um lote grava via merge.
     let max = area.last().map_or(0, |p| p.doc);
     let pieces: Vec<Vec<u8>> = (1..=8u64)
-        .map(|i| encode_postings(&[Posting { doc: max + i * 10, tf: 1 }, Posting { doc: max + i * 10 + 1, tf: 2 }]))
+        .map(|i| encode_postings(&[Posting::new(max + i * 10, 1), Posting::new(max + i * 10 + 1, 2)]))
         .collect();
     // Pedaço que sobrepõe a lista: força o merge lento (ordenação).
-    let overlap = encode_postings(&[Posting { doc: area[area.len() / 2].doc, tf: 3 }]);
+    let overlap = encode_postings(&[Posting::new(area[area.len() / 2].doc, 3)]);
 
     let mut g = c.benchmark_group("listas");
     g.bench_function(format!("decode_area_{}_postings", area.len()), |b| {

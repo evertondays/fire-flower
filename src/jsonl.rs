@@ -51,7 +51,6 @@ pub fn index(engine: &Engine, path: &Path, opts: &Options) -> Result<(), Box<dyn
     let started = Instant::now();
     let mut last_report = Instant::now();
     let mut line = Vec::new();
-    let mut text = String::new();
 
     let mut batch = engine.batch();
     loop {
@@ -69,12 +68,8 @@ pub fn index(engine: &Engine, path: &Path, opts: &Options) -> Result<(), Box<dyn
 
         match serde_json::from_slice::<Article>(&line) {
             Ok(article) => {
-                // Título junto do texto: buscar o título traz o próprio artigo.
-                text.clear();
-                text.push_str(&article.title);
-                text.push('\n');
-                text.push_str(&article.text);
-                batch.add_document(article.id, &text)?;
+                // O título é um campo à parte: buscável e com peso próprio no ranking.
+                batch.add_titled(article.id, &article.title, &article.text)?;
                 batch.set_label(article.id, &article.title);
                 progress.documentos += 1;
                 progress.ultimo_titulo = article.title;

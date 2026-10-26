@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::{Clause, index_terms, parse_query, tokenize};
+use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query, tokenize};
 use fire_flower::{Language, Stopwords};
 use fire_flower::{Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
@@ -276,7 +276,9 @@ struct Doc {
     line: u64,
     id: DocId,
     title: String,
-    /// `title + "\n" + text`, o que o motor indexa.
+    /// O texto sem o título (o motor indexa os dois, como campos).
+    text: String,
+    /// `title + "\n" + text`: para quem só quer o conjunto de termos.
     body: String,
     bytes: usize,
 }
@@ -332,7 +334,7 @@ impl Iterator for Corpus {
             body.push('\n');
             body.push_str(&article.text);
             let id = if self.remap_ids { self.line } else { article.id };
-            return Some(Ok(Doc { line: self.line, id, title: article.title, body, bytes: self.buf.len() }));
+            return Some(Ok(Doc { line: self.line, id, title: article.title, text: article.text, body, bytes: self.buf.len() }));
         }
     }
 }
@@ -540,7 +542,7 @@ fn load(
         let doc = doc?;
         match batch.as_mut() {
             Some(b) => {
-                b.add_document(doc.id, &doc.body)?;
+                b.add_titled(doc.id, &doc.title, &doc.text)?;
                 b.set_label(doc.id, &doc.title);
                 if b.len() >= batch_size {
                     let t = Instant::now();
@@ -549,7 +551,12 @@ fn load(
                     batch = Some(engine.batch());
                 }
             }
-            None => engine.index_document(doc.id, &doc.body)?,
+            None => {
+                let mut b = engine.batch();
+                b.add_titled(doc.id, &doc.title, &doc.text)?;
+                b.set_label(doc.id, &doc.title);
+                b.commit()?;
+            }
         }
         docs += 1;
         bytes += doc.bytes as u64;
@@ -1064,11 +1071,13 @@ fn trie_order(a: &&str, b: &&str) -> std::cmp::Ordering {
     a.chars().count().cmp(&b.chars().count()).then_with(|| a.cmp(b))
 }
 
-/// Lista de um termo no oráculo: documentos em ordem e o tf de cada um.
+/// Lista de um termo no oráculo: documentos em ordem, o tf de cada um e
+/// quantas ocorrências estão no título.
 #[derive(Default)]
 struct OTerm {
     docs: Vec<DocId>,
     tfs: Vec<u32>,
+    title_tfs: Vec<u32>,
 }
 
 impl OTerm {
@@ -1081,10 +1090,11 @@ impl OTerm {
         if self.docs.windows(2).all(|w| w[0] < w[1]) {
             return;
         }
-        let mut pairs: Vec<(DocId, u32)> = self.docs.iter().copied().zip(self.tfs.iter().copied()).collect();
-        pairs.sort_by_key(|p| p.0);
-        let mut kept: Vec<(DocId, u32)> = Vec::with_capacity(pairs.len());
-        for p in pairs {
+        let mut entries: Vec<(DocId, u32, u32)> =
+            (0..self.docs.len()).map(|i| (self.docs[i], self.tfs[i], self.title_tfs[i])).collect();
+        entries.sort_by_key(|p| p.0);
+        let mut kept: Vec<(DocId, u32, u32)> = Vec::with_capacity(entries.len());
+        for p in entries {
             match kept.last_mut() {
                 Some(last) if last.0 == p.0 => *last = p,
                 _ => kept.push(p),
@@ -1092,7 +1102,21 @@ impl OTerm {
         }
         self.docs = kept.iter().map(|p| p.0).collect();
         self.tfs = kept.iter().map(|p| p.1).collect();
+        self.title_tfs = kept.iter().map(|p| p.2).collect();
     }
+}
+
+/// Tokens de um artigo com as posições do motor: o título em 0…T − 1 e o
+/// texto a partir de T + `TITLE_GAP` (ou de 0, sem título). Também diz quantos
+/// tokens são do título.
+fn doc_tokens(title: &str, text: &str) -> (Vec<(String, u32)>, usize) {
+    let title_tokens = tokenize(title);
+    let span = title_tokens.len() as u32;
+    let offset = if span > 0 { span + TITLE_GAP } else { 0 };
+    let n_title = title_tokens.len();
+    let mut out: Vec<(String, u32)> = title_tokens.into_iter().enumerate().map(|(i, t)| (t, i as u32)).collect();
+    out.extend(tokenize(text).into_iter().enumerate().map(|(i, t)| (t, offset + i as u32)));
+    (out, n_title)
 }
 
 /// Posições de um termo no oráculo, achatadas para caber na memória.
@@ -1150,8 +1174,10 @@ impl OPos {
 struct Oracle {
     terms: HashMap<String, OTerm>,
     positions: HashMap<String, OPos>,
-    lens: HashMap<DocId, u32>,
+    /// (tamanho inteiro, tamanho do título), sem stopwords.
+    lens: HashMap<DocId, (u32, u32)>,
     total_len: u64,
+    total_title_len: u64,
     k1: f64,
     b: f64,
     max_prefix: usize,
@@ -1273,7 +1299,7 @@ impl Oracle {
         let mut scored: Vec<(DocId, f64)> = docs
             .iter()
             .map(|&d| {
-                let len = self.lens[&d];
+                let len = self.lens[&d].0;
                 let mut score = 0.0;
                 for c in &resolved {
                     score += match c {
@@ -1328,6 +1354,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         positions: HashMap::default(),
         lens: HashMap::default(),
         total_len: 0,
+        total_title_len: 0,
         k1: engine.config().bm25_k1,
         b: engine.config().bm25_b,
         max_prefix: engine.config().max_prefix_terms,
@@ -1339,12 +1366,18 @@ fn oracle(args: OracleArgs) -> AnyResult {
     for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
         let doc = doc?;
         docs += 1;
-        let tokens = tokenize(&doc.body);
-        let mut counts: HashMap<&str, u32> = HashMap::default();
-        let mut len = 0u32;
-        for t in tokens.iter().filter(|t| !stopwords.contains(t)) {
-            *counts.entry(t.as_str()).or_insert(0) += 1;
+        let (positioned, n_title) = doc_tokens(&doc.title, &doc.text);
+        let tokens: Vec<String> = positioned.iter().map(|(t, _)| t.clone()).collect();
+        // termo -> (tf, tf no título)
+        let mut counts: HashMap<&str, (u32, u32)> = HashMap::default();
+        let (mut len, mut title_len) = (0u32, 0u32);
+        for (i, t) in tokens.iter().enumerate().filter(|(_, t)| !stopwords.contains(t)) {
+            let in_title = i < n_title;
+            let c = counts.entry(t.as_str()).or_insert((0, 0));
+            c.0 += 1;
+            c.1 += u32::from(in_title);
             len += 1;
+            title_len += u32::from(in_title);
         }
         // Reservatórios: documentos para consultas AND e frases, títulos para revocação.
         let mut unique: Vec<String> = counts.keys().map(|t| t.to_string()).collect();
@@ -1369,9 +1402,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
                 titles[j] = (doc.id, doc.title.clone());
             }
         }
-        let add = |e: &mut OTerm, tf: u32| {
+        let add = |e: &mut OTerm, (tf, title_tf): (u32, u32)| {
             e.docs.push(doc.id);
             e.tfs.push(tf);
+            e.title_tfs.push(title_tf);
         };
         for (t, c) in counts {
             match o.terms.get_mut(t) {
@@ -1379,12 +1413,16 @@ fn oracle(args: OracleArgs) -> AnyResult {
                 None => add(o.terms.entry(t.to_string()).or_default(), c),
             }
         }
-        match o.lens.insert(doc.id, len) {
-            Some(old) => {
+        match o.lens.insert(doc.id, (len, title_len)) {
+            Some((old, old_title)) => {
                 repeated += 1;
                 o.total_len = o.total_len + u64::from(len) - u64::from(old);
+                o.total_title_len = o.total_title_len + u64::from(title_len) - u64::from(old_title);
             }
-            None => o.total_len += u64::from(len),
+            None => {
+                o.total_len += u64::from(len);
+                o.total_title_len += u64::from(title_len);
+            }
         }
         if docs.is_multiple_of(20_000) {
             eprintln!("oráculo: {docs} docs, {} termos ({:.0}s)", o.terms.len(), started.elapsed().as_secs_f64());
@@ -1490,10 +1528,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
         for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
             let doc = doc?;
             let mut found: HashMap<&str, Vec<u32>> = HashMap::default();
-            let tokens = tokenize(&doc.body);
-            for (i, t) in tokens.iter().enumerate() {
+            let (tokens, _) = doc_tokens(&doc.title, &doc.text);
+            for (t, p) in &tokens {
                 if !stopwords.contains(t) && (full || needed.contains(t)) {
-                    found.entry(t.as_str()).or_default().push(i as u32);
+                    found.entry(t.as_str()).or_default().push(*p);
                 }
             }
             for (t, ps) in found {
@@ -1523,7 +1561,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         nodes
     };
     let posting_list = |t: &OTerm| -> Vec<fire_flower::Posting> {
-        t.docs.iter().zip(&t.tfs).map(|(&doc, &tf)| fire_flower::Posting { doc, tf }).collect()
+        (0..t.docs.len()).map(|i| fire_flower::Posting { doc: t.docs[i], tf: t.tfs[i], title_tf: t.title_tfs[i] }).collect()
     };
     for term in &check_terms {
         let node = node_of.get(*term).copied();
@@ -1560,19 +1598,20 @@ fn oracle(args: OracleArgs) -> AnyResult {
 
     // 7. Tamanhos dos documentos e estatísticas.
     let mut lengths = Check::new("tamanhos e estatísticas");
-    let mut engine_lens: Vec<(DocId, u32)> = Vec::new();
-    engine.for_each_doc_len(|d, l| engine_lens.push((d, l)))?;
+    let mut engine_lens: Vec<(DocId, (u32, u32))> = Vec::new();
+    engine.for_each_doc_len(|d, l, t| engine_lens.push((d, (l, t))))?;
     engine_lens.sort_unstable();
-    let mut oracle_lens: Vec<(DocId, u32)> = o.lens.iter().map(|(&d, &l)| (d, l)).collect();
+    let mut oracle_lens: Vec<(DocId, (u32, u32))> = o.lens.iter().map(|(&d, &l)| (d, l)).collect();
     oracle_lens.sort_unstable();
     lengths.compare("documentos com tamanho", &engine_lens.len(), &oracle_lens.len());
-    let engine_map: HashMap<DocId, u32> = engine_lens.into_iter().collect();
-    for (doc, len) in &oracle_lens {
-        lengths.compare(&format!("tamanho do {doc}"), &engine_map.get(doc).copied(), &Some(*len));
+    let engine_map: HashMap<DocId, (u32, u32)> = engine_lens.into_iter().collect();
+    for (doc, lens) in &oracle_lens {
+        lengths.compare(&format!("tamanhos (inteiro, título) do {doc}"), &engine_map.get(doc).copied(), &Some(*lens));
     }
     let stats = engine.stats()?;
     lengths.compare("doc_count", &stats.doc_count, &(o.lens.len() as u64));
     lengths.compare("total_len", &stats.total_len, &o.total_len);
+    lengths.compare("total_title_len", &stats.total_title_len, &o.total_title_len);
     if repeated > 0 {
         lengths.notes.push(format!("{repeated} IDs repetidos no corpus (a última versão vence)"));
     }
@@ -2379,6 +2418,7 @@ fn digest(db: &Path) -> AnyResult {
         for p in engine.term_postings_of_node(*node)? {
             h.write(&p.doc.to_le_bytes());
             h.write(&p.tf.to_le_bytes());
+            h.write(&p.title_tf.to_le_bytes());
             postings += 1;
         }
         h.write(&[0xfe]);
@@ -2393,15 +2433,17 @@ fn digest(db: &Path) -> AnyResult {
         h.write(&[0xff]);
     }
     let mut lens = Vec::new();
-    engine.for_each_doc_len(|doc, len| lens.push((doc, len)))?;
+    engine.for_each_doc_len(|doc, len, title_len| lens.push((doc, len, title_len)))?;
     lens.sort_unstable();
-    for (doc, len) in &lens {
+    for (doc, len, title_len) in &lens {
         h.write(&doc.to_le_bytes());
         h.write(&len.to_le_bytes());
+        h.write(&title_len.to_le_bytes());
     }
     let stats = engine.stats()?;
     h.write(&stats.doc_count.to_le_bytes());
     h.write(&stats.total_len.to_le_bytes());
+    h.write(&stats.total_title_len.to_le_bytes());
     println!(
         "{}",
         json!({ "db": db, "termos": nodes.len(), "postagens": postings, "posicoes": positions,
@@ -2463,7 +2505,7 @@ fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queri
     let mut batch = engine.batch();
     for doc in Corpus::open(corpus_path, skip, take, false)? {
         let doc = doc?;
-        batch.add_document(doc.id, &doc.body)?;
+        batch.add_titled(doc.id, &doc.title, &doc.text)?;
         batch.set_label(doc.id, &doc.title);
         docs += 1;
         bytes += doc.bytes as u64;

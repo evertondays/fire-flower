@@ -80,8 +80,10 @@ Por baixo, o script chama:
 ./target/release/fire-flower index-jsonl ~/bench-db/ptwiki-full ~/datasets/ptwiki/ptwiki.jsonl
 ```
 
-Cada linha do JSONL é `{"id", "title", "text"}`: indexa `title + texto` sob o
-`id` e guarda o título como rótulo.
+Cada linha do JSONL é `{"id", "title", "text"}`: indexa o texto e o título
+(como campo próprio, que pesa mais no ranking) sob o `id`, e guarda o título
+como rótulo. No `index` de arquivos, o título é o nome do arquivo sem a
+extensão.
 
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
 usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
@@ -149,18 +151,18 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 ### Chaves no RocksDB
 
-Formato v2 (`meta:format = 2`). Um banco do formato anterior não abre: o
-`open` diz "formato antigo; recarregue o banco".
+Formato v3 (`meta:format = 3`). Um banco de formato anterior não abre: o
+`open` diz em que formato ele está e pede para recarregar.
 
 | Chave | Valor |
 |---|---|
 | `node:<id>` | nó da Trie: flag de fim de palavra + filhos (`caractere → id`). `node:0` é a raiz |
-| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: `(Δdoc, tf)` por documento |
-| `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições) |
-| `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco` |
+| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: `(Δdoc, tf << 1 \| tem título, [tf no título])` por documento |
+| `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições); o título vem primeiro e o texto começa 100 posições depois |
+| `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco`, e o do título |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
-| `meta:doc_count`, `meta:total_len` | total de documentos e soma dos tamanhos (BM25) |
+| `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
 | `meta:format`, `meta:positions`, `meta:languages` | formato, se grava posições e idiomas das stopwords |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,

@@ -1,10 +1,11 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v2; a codificação está em `codec.rs`):
+//! Espaços de chave (formato v3; a codificação está em `codec.rs`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
-//! - `post:<id>`    -> (documento, tf) do termo que termina no nó `<id>`
-//! - `pos:<id>`     -> posições do termo em cada documento (só com posições)
-//! - `norm:<bloco>` -> tamanho de cada documento com `id ÷ 1024 = bloco`
+//! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
+//! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
+//!   o título vem primeiro, e o texto começa `TITLE_GAP` posições depois
+//! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
 //! - `meta:*`       -> formato, contadores de ID, estatísticas e idiomas
 
@@ -25,7 +26,11 @@ use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 2;
+pub const FORMAT_VERSION: u64 = 3;
+/// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
+/// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
+/// ser aberto para escrita.
+const MERGE_OPERATOR: &str = "fire_flower_v3";
 
 const META_FORMAT: &[u8] = b"meta:format";
 /// `1` se o banco grava posições (`pos:`), `0` se não.
@@ -34,6 +39,7 @@ const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
 const META_DOC_COUNT: &[u8] = b"meta:doc_count";
 const META_TOTAL_LEN: &[u8] = b"meta:total_len";
+const META_TOTAL_TITLE_LEN: &[u8] = b"meta:total_title_len";
 /// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
 const META_LANGUAGES: &[u8] = b"meta:languages";
 
@@ -282,7 +288,7 @@ impl Engine {
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_merge_operator_associative("fire_flower_v2", merge_operator);
+        opts.set_merge_operator_associative(MERGE_OPERATOR, merge_operator);
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
         if config.statistics {
@@ -290,16 +296,20 @@ impl Engine {
             opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptTimers);
         }
 
-        // Antes de abrir para escrita: a recuperação do WAL de um banco v1
-        // rodaria o merge operator novo sobre listas antigas.
-        if was_opened_as_v1(path) {
-            return Err(old_format());
+        // Antes de abrir para escrita: a recuperação do WAL de um banco de
+        // outro formato rodaria o merge operator novo sobre listas antigas.
+        if let Some(name) = previous_merge_operator(path)
+            && name != MERGE_OPERATOR
+        {
+            return Err(stored_format_error(path).unwrap_or_else(|| {
+                Error::Config(format!("banco de outro formato (merge operator {name}); recarregue o banco"))
+            }));
         }
         let db = match DB::open(&opts, path) {
             Ok(db) => db,
-            // Um banco v1 com merges pendentes no WAL falha já na recuperação,
-            // porque o merge operator não entende o formato antigo.
-            Err(e) => return Err(old_format_error(path).unwrap_or(Error::Db(e))),
+            // Um banco antigo com merges pendentes no WAL falha já na
+            // recuperação, porque o merge operator não entende o formato antigo.
+            Err(e) => return Err(stored_format_error(path).unwrap_or(Error::Db(e))),
         };
         let positions = resolve_format(&db, config.positions)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
@@ -307,6 +317,7 @@ impl Engine {
         let stats = IndexStats {
             doc_count: read_counter(&db, META_DOC_COUNT)?.unwrap_or(0),
             total_len: read_counter(&db, META_TOTAL_LEN)?.unwrap_or(0),
+            total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
         };
         let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
         let writer = Mutex::new(WriterState { next_node_id, next_doc_id, stats, cache: NodeCache::default() });
@@ -499,8 +510,9 @@ impl Engine {
         }
     }
 
-    /// Percorre o tamanho de todos os documentos (em ordem de bloco).
-    pub fn for_each_doc_len(&self, mut f: impl FnMut(DocId, u32)) -> Result<()> {
+    /// Percorre os tamanhos de todos os documentos (em ordem de bloco):
+    /// `f(documento, tamanho inteiro, tamanho do título)`.
+    pub fn for_each_doc_len(&self, mut f: impl FnMut(DocId, u32, u32)) -> Result<()> {
         let mode = rocksdb::IteratorMode::From(NORM, rocksdb::Direction::Forward);
         for item in self.db.iterator(mode) {
             let (key, value) = item?;
@@ -509,8 +521,8 @@ impl Engine {
                 .ok()
                 .and_then(|b| b.parse().ok())
                 .ok_or_else(|| Error::Corrupt("chave norm: inválida".into()))?;
-            for (offset, len) in NormBlock::decode(&value)?.iter() {
-                f(block * NORM_BLOCK_DOCS + u64::from(offset), len);
+            for (offset, len, title_len) in NormBlock::decode(&value)?.iter() {
+                f(block * NORM_BLOCK_DOCS + u64::from(offset), len, u32::from(title_len));
             }
         }
         Ok(())
@@ -929,7 +941,11 @@ impl View<'_> {
         let get = |key: &[u8]| -> Result<u64> {
             self.snap.get_bytes(key)?.map(|v| codec::get_varint(&v)).transpose().map(|v| v.unwrap_or(0))
         };
-        Ok(IndexStats { doc_count: get(META_DOC_COUNT)?, total_len: get(META_TOTAL_LEN)? })
+        Ok(IndexStats {
+            doc_count: get(META_DOC_COUNT)?,
+            total_len: get(META_TOTAL_LEN)?,
+            total_title_len: get(META_TOTAL_TITLE_LEN)?,
+        })
     }
 
     /// `term` já deve estar normalizado.
@@ -1268,8 +1284,8 @@ pub struct IndexBatch<'a> {
     dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
     pending: FxHashMap<String, TermAcc>,
-    /// (documento, tamanho), na ordem em que foram adicionados.
-    lengths: Vec<(DocId, u32)>,
+    /// (documento, tamanho inteiro, tamanho do título), na ordem em que foram adicionados.
+    lengths: Vec<(DocId, u32, u32)>,
     labels: Vec<(DocId, String)>,
     analyzer: Analyzer,
 }
@@ -1277,8 +1293,8 @@ pub struct IndexBatch<'a> {
 /// O que o lote juntou de um termo.
 #[derive(Default)]
 struct TermAcc {
-    /// (documento, tf), na ordem em que os documentos foram adicionados.
-    docs: Vec<(DocId, u32)>,
+    /// (documento, tf, tf no título), na ordem em que os documentos foram adicionados.
+    docs: Vec<(DocId, u32, u32)>,
     /// `tf` posições por entrada de `docs`, em sequência (vazio sem posições).
     positions: Vec<u32>,
 }
@@ -1290,14 +1306,14 @@ impl TermAcc {
         if self.docs.windows(2).all(|w| w[0].0 < w[1].0) {
             return; // o caso comum: IDs crescentes
         }
-        let mut entries: Vec<(DocId, u32, usize)> = Vec::with_capacity(self.docs.len());
+        let mut entries: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(self.docs.len());
         let mut start = 0usize;
-        for &(doc, tf) in &self.docs {
-            entries.push((doc, tf, start));
+        for &(doc, tf, title_tf) in &self.docs {
+            entries.push((doc, tf, title_tf, start));
             start += tf as usize;
         }
         entries.sort_by_key(|e| e.0); // estável: a ordem de adição se mantém
-        let mut kept: Vec<(DocId, u32, usize)> = Vec::with_capacity(entries.len());
+        let mut kept: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(entries.len());
         for e in entries {
             match kept.last_mut() {
                 Some(last) if last.0 == e.0 => *last = e,
@@ -1306,12 +1322,12 @@ impl TermAcc {
         }
         if positions {
             let mut sorted = Vec::with_capacity(self.positions.len());
-            for &(_, tf, start) in &kept {
+            for &(_, tf, _, start) in &kept {
                 sorted.extend_from_slice(&self.positions[start..start + tf as usize]);
             }
             self.positions = sorted;
         }
-        self.docs = kept.into_iter().map(|(doc, tf, _)| (doc, tf)).collect();
+        self.docs = kept.into_iter().map(|(doc, tf, title_tf, _)| (doc, tf, title_tf)).collect();
     }
 }
 
@@ -1325,25 +1341,34 @@ struct CachedNode {
 }
 
 impl IndexBatch<'_> {
-    /// Indexa `text` sob um ID escolhido por você. Reindexar um ID troca o
-    /// tf, as posições e o tamanho dele (termos que saíram do texto ficam).
+    /// Indexa `text` sob um ID escolhido por você, sem título. Reindexar um
+    /// ID troca o tf, as posições e o tamanho dele (termos que saíram do
+    /// texto ficam).
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
+        self.add_titled(doc_id, "", text)
+    }
+
+    /// Indexa um documento com título. As palavras do título são buscáveis
+    /// como as do texto, e o ranking as conta à parte (`Posting::title_tf`),
+    /// para pesar o título mais que o resto.
+    pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
-        let len = self.analyzer.run(text, &self.engine.stopwords);
+        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords);
+        let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
-            acc.docs.push((doc_id, found.len() as u32));
+            acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
             if positions {
                 acc.positions.extend_from_slice(found);
             }
         };
-        for (term, found) in self.analyzer.terms() {
+        for (term, found) in analyzer.terms() {
             // Só aloca a `String` do termo na primeira vez que ele aparece no lote.
             match self.pending.get_mut(term) {
                 Some(acc) => record(acc, found),
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
         }
-        self.lengths.push((doc_id, len));
+        self.lengths.push((doc_id, len, title_len));
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
@@ -1351,8 +1376,13 @@ impl IndexBatch<'_> {
 
     /// Indexa `text` com um ID novo e grava `label` (ex.: caminho do arquivo).
     pub fn add_labeled(&mut self, label: &str, text: &str) -> Result<DocId> {
+        self.add_labeled_titled(label, "", text)
+    }
+
+    /// Como [`IndexBatch::add_labeled`], com título (ex.: o nome do arquivo).
+    pub fn add_labeled_titled(&mut self, label: &str, title: &str, text: &str) -> Result<DocId> {
         let doc_id = self.next_doc_id;
-        self.add_document(doc_id, text)?;
+        self.add_titled(doc_id, title, text)?;
         self.labels.push((doc_id, label.to_string()));
         Ok(doc_id)
     }
@@ -1407,6 +1437,7 @@ impl IndexBatch<'_> {
         wb.put(META_NEXT_DOC, varint(self.next_doc_id));
         wb.put(META_DOC_COUNT, varint(stats.doc_count));
         wb.put(META_TOTAL_LEN, varint(stats.total_len));
+        wb.put(META_TOTAL_TITLE_LEN, varint(stats.total_title_len));
 
         // Ver `EpochCache`: marca, grava, publica.
         let engine = self.engine;
@@ -1440,7 +1471,7 @@ impl IndexBatch<'_> {
     fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
         let mut stats = self.state.stats;
         let mut order: Vec<(u64, usize)> =
-            self.lengths.iter().enumerate().map(|(i, &(doc, _))| (doc / NORM_BLOCK_DOCS, i)).collect();
+            self.lengths.iter().enumerate().map(|(i, &(doc, _, _))| (doc / NORM_BLOCK_DOCS, i)).collect();
         // Estável por bloco: dentro do bloco, a ordem de adição (a última vence).
         if !order.windows(2).all(|w| w[0].0 <= w[1].0) {
             order.sort_by_key(|e| e.0);
@@ -1454,12 +1485,19 @@ impl IndexBatch<'_> {
                 None => NormBlock::default(),
             };
             while i < order.len() && order[i].0 == block_id {
-                let (doc, len) = self.lengths[order[i].1];
-                match block.set((doc % NORM_BLOCK_DOCS) as u16, len) {
-                    Some(old) => stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old)),
+                let (doc, len, title_len) = self.lengths[order[i].1];
+                // Título com mais de 65.535 tokens: a contagem para no máximo.
+                let title_len = u16::try_from(title_len).unwrap_or(u16::MAX);
+                match block.set((doc % NORM_BLOCK_DOCS) as u16, len, title_len) {
+                    Some((old, old_title)) => {
+                        stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old));
+                        stats.total_title_len =
+                            (stats.total_title_len + u64::from(title_len)).saturating_sub(u64::from(old_title));
+                    }
                     None => {
                         stats.doc_count += 1;
                         stats.total_len += u64::from(len);
+                        stats.total_title_len += u64::from(title_len);
                     }
                 }
                 i += 1;
@@ -1641,27 +1679,34 @@ fn old_format() -> Error {
 }
 
 /// O RocksDB grava as opções da última abertura em `OPTIONS-<n>`, inclusive o
-/// nome do merge operator. O formato v1 usava outro nome.
-fn was_opened_as_v1(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else { return false };
-    let latest = entries
+/// nome do merge operator, que muda a cada formato.
+fn previous_merge_operator(path: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let (_, latest) = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             let n: u64 = name.strip_prefix("OPTIONS-")?.parse().ok()?;
             Some((n, e.path()))
         })
-        .max_by_key(|(n, _)| *n);
-    latest
-        .and_then(|(_, p)| std::fs::read_to_string(p).ok())
-        .is_some_and(|options| options.contains("merge_operator=fire_flower_postings_union"))
+        .max_by_key(|(n, _)| *n)?;
+    let options = std::fs::read_to_string(latest).ok()?;
+    let name = options.lines().find_map(|l| l.trim().strip_prefix("merge_operator="))?;
+    // Sem merge operator o RocksDB grava "nullptr" (ou nada).
+    (name != "nullptr" && !name.is_empty()).then(|| name.to_string())
 }
 
-/// Se o `open` falhou, confere (sem merge operator, só leitura) se é um banco v1.
-fn old_format_error(path: &Path) -> Option<Error> {
+/// Lê o formato gravado sem abrir para escrita (sem merge operator, sem
+/// recuperar o WAL) e monta o erro: v1 (sem `meta:format`) ou outra versão.
+fn stored_format_error(path: &Path) -> Option<Error> {
     let db = DB::open_for_read_only(&Options::default(), path, false).ok()?;
-    let is_v1 = read_counter(&db, META_FORMAT).ok()?.is_none() && read_counter(&db, META_NEXT_NODE).ok()?.is_some();
-    is_v1.then(old_format)
+    match read_counter(&db, META_FORMAT).ok()? {
+        None if read_counter(&db, META_NEXT_NODE).ok()?.is_some() => Some(old_format()),
+        Some(v) if v != FORMAT_VERSION => Some(Error::Config(format!(
+            "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
+        ))),
+        _ => None,
+    }
 }
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
@@ -1754,7 +1799,7 @@ mod tests {
 
     #[test]
     fn seek_gallops_and_stops_at_first_not_less() {
-        let list: Vec<Posting> = [1u64, 3, 5, 7, 9, 11, 100, 101].iter().map(|&doc| Posting { doc, tf: 1 }).collect();
+        let list: Vec<Posting> = [1u64, 3, 5, 7, 9, 11, 100, 101].iter().map(|&doc| Posting::new(doc, 1)).collect();
         let mut at = 0;
         assert!(seek(&list, &mut at, 1));
         assert!(!seek(&list, &mut at, 4));
@@ -1802,7 +1847,7 @@ mod tests {
         let cache = EpochCache::<NormBlock>::default();
         let a = Arc::new(NormBlock::default());
         let mut b = NormBlock::default();
-        b.set(1, 10);
+        b.set(1, 10, 0);
         let b = Arc::new(b);
         // Nunca mudou: qualquer busca usa.
         cache.offer(7, 0, &a);

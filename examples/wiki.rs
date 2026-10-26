@@ -1160,7 +1160,8 @@ struct Oracle {
 /// Uma parte da consulta resolvida no oráculo.
 enum OClause<'a> {
     Term(&'a OTerm),
-    Prefix(Vec<&'a OTerm>),
+    /// As completações e o df do conjunto (documentos com alguma delas).
+    Prefix(Vec<&'a OTerm>, usize),
     Phrase(Vec<(u32, &'a OTerm, &'a OPos)>),
 }
 
@@ -1221,7 +1222,10 @@ impl Oracle {
                     if terms.is_empty() {
                         return empty();
                     }
-                    resolved.push(OClause::Prefix(terms));
+                    let mut union: Vec<DocId> = terms.iter().flat_map(|t| t.docs.iter().copied()).collect();
+                    union.sort_unstable();
+                    union.dedup();
+                    resolved.push(OClause::Prefix(terms, union.len()));
                 }
                 Clause::Phrase(parts) => {
                     let mut out = Vec::new();
@@ -1240,7 +1244,7 @@ impl Oracle {
         for c in &resolved {
             match c {
                 OClause::Term(t) => sets.push(t.docs.clone()),
-                OClause::Prefix(ts) => {
+                OClause::Prefix(ts, _) => {
                     let mut all: Vec<DocId> = ts.iter().flat_map(|t| t.docs.iter().copied()).collect();
                     all.sort_unstable();
                     all.dedup();
@@ -1274,10 +1278,11 @@ impl Oracle {
                 for c in &resolved {
                     score += match c {
                         OClause::Term(t) => self.bm25(self.idf(t.docs.len()), t.tf(d).unwrap_or(0), len),
-                        OClause::Prefix(ts) => ts
-                            .iter()
-                            .filter_map(|t| t.tf(d).map(|tf| self.bm25(self.idf(t.docs.len()), tf, len)))
-                            .fold(0.0, f64::max),
+                        // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
+                        OClause::Prefix(ts, df) => {
+                            let tf: u32 = ts.iter().filter_map(|t| t.tf(d)).sum();
+                            self.bm25(self.idf(*df), tf, len)
+                        }
                         OClause::Phrase(parts) => {
                             let idf: f64 = parts.iter().map(|(_, t, _)| self.idf(t.docs.len())).sum();
                             self.bm25(idf, Self::phrase_count(parts, d), len)

@@ -39,7 +39,7 @@ funcionalidade é só leitura e consulta (Fases B a D).
 | D5 | Como as posições contam | **Toda palavra do `tokenize` conta, inclusive stopwords**; tokens descartados por tamanho (> 64) não | preserva os buracos: `"casa de papel"` vira `casa@0 papel@2` |
 | D6 | Reindexar o mesmo ID | **A última gravação vence** (tf, posições e tamanho), e o total de documentos não conta duas vezes | mantém a idempotência que o `perf.py` já confere |
 | D7 | API | **`search` continua igual** (IDs em ordem, usado pelo oráculo); **novo `search_top(query, k) -> Vec<Hit>`** com `Hit { doc, score }` | não quebra quem usa; CLI e TUI passam a usar o ranqueado |
-| D8 | Prefixo no BM25 | **Nota do melhor termo expandido** que o documento contém (máximo, não soma) | no TUI a última palavra é sempre prefixo; nota constante deixaria tudo empatado. Máximo evita premiar quem tem muitas variações |
+| D8 | Prefixo no BM25 | ~~**Nota do melhor termo expandido** que o documento contém (máximo, não soma)~~ **Substituída pela R1 de [plano-relevancia.md](plano-relevancia.md):** o prefixo é um termo só (idf do conjunto, tf somado) | com o máximo, cada completação usava o próprio idf e uma completação rara ("nortel") passava na frente da palavra digitada ("norte") |
 | D9 | Parâmetros | `k1 = 1.2`, `b = 0.75` em `Config` | valores padrão do Lucene e do Elasticsearch |
 | D10 | Desempate | **Nota decrescente, depois ID crescente** | resultado determinístico, comparável pelo oráculo |
 | D11 | Semântica da consulta | **Continua E** (todos os termos obrigatórios); OR fica fora | o BM25 ordena o que o E já filtrou |
@@ -110,7 +110,7 @@ Para cada termo *t* da consulta e documento *d*:
 ```text
 idf(t)     = ln(1 + (N − df + 0,5) / (df + 0,5))
 nota(t, d) = idf(t) · tf · (k1 + 1) / (tf + k1 · (1 − b + b · |d| / média))
-nota(d)    = soma das notas dos termos (prefixo: máximo entre os expandidos, D8)
+nota(d)    = soma das notas dos termos (prefixo: um termo só, R1 de plano-relevancia.md)
 ```
 
 *N* = `meta:doc_count`; df = tamanho da lista do termo; média =

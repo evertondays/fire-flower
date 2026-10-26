@@ -676,8 +676,12 @@ documento (`norm:`) e a média é `total_len ÷ N`. `k1 = 1,2` e `b = 0,75`
 (`Config::bm25_k1`, `Config::bm25_b`). Um termo raro (idf alto) pesa mais; o
 tf ajuda, mas satura; e o mesmo tf vale mais num documento curto.
 
-- **Prefixo:** cada documento fica com a nota do **melhor** termo expandido
-  que ele contém (não a soma, para não premiar quem tem muitas variações).
+- **Prefixo:** conta como **um termo só**. O df é o número de documentos com
+  alguma completação, e o tf de um documento é a soma dos tf das completações
+  que ele contém. Assim uma completação rara não vale mais que a palavra que
+  se está digitando: com a regra antiga (a nota da melhor completação, cada
+  uma com o próprio idf), `coreia norte*` punha em 1º um artigo que cita a
+  Nortel ([plano-relevancia.md](plano-relevancia.md), R1).
 - **Frase:** entra na soma como um termo, com tf = quantas vezes a frase
   aparece no documento e idf = soma dos idfs dos termos (como o Lucene).
 - **Empate:** nota decrescente, depois ID crescente.

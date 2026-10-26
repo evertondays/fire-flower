@@ -579,14 +579,14 @@ fn bm25_matches_hand_computation() {
 }
 
 #[test]
-fn ties_break_by_id_and_prefix_takes_the_best_term() {
+fn ties_break_by_id_and_prefix_is_one_term() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
     let mut batch = engine.batch();
     for id in [30, 10, 20] {
         batch.add_document(id, "igual").unwrap();
     }
-    // D8: "carro carroca" tem dois termos do prefixo; vale o melhor, não a soma.
+    // R1: o prefixo é um termo só, com idf do conjunto e tf somado.
     batch.add_document(40, "carro carroca").unwrap();
     batch.add_document(41, "carro xis").unwrap();
     batch.add_document(42, "carroca xis").unwrap();
@@ -596,15 +596,42 @@ fn ties_break_by_id_and_prefix_takes_the_best_term() {
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [10, 20, 30]);
     assert!(got.windows(2).all(|w| w[0].1 == w[1].1));
 
+    // "carr*" casa 3 documentos: df = 3, e o 40 tem as duas completações (tf 2).
     let (n, avg) = (6.0, 9.0 / 6.0);
-    let carro = |tf: f64, len: f64| bm25(n, 2.0, tf, len, avg);
+    let carr = |tf: f64, len: f64| bm25(n, 3.0, tf, len, avg);
     let got: std::collections::HashMap<u64, f64> = ranked(&engine, "carr*").into_iter().collect();
     assert_eq!(got.len(), 3);
-    assert!(close(got[&40], carro(1.0, 2.0)), "máximo, não soma");
-    assert!(close(got[&41], carro(1.0, 2.0)));
-    assert!(close(got[&42], carro(1.0, 2.0)));
+    assert!(close(got[&40], carr(2.0, 2.0)), "tf somado");
+    assert!(close(got[&41], carr(1.0, 2.0)));
+    assert!(close(got[&42], carr(1.0, 2.0)));
+    assert!(got[&40] > got[&41]);
     let got = ranked(&engine, "carr* xis");
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [41, 42]);
+}
+
+/// O caso "nortel": uma completação rara não pode valer mais que a palavra
+/// que se está digitando. Com o máximo por completação (a regra antiga), o
+/// documento com "nortel" (df 1) ganhava dos que têm "norte" (df alto).
+#[test]
+fn rare_completion_does_not_beat_the_common_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_document(1, "coreia nortel empresa").unwrap();
+    for id in 2..12 {
+        batch.add_document(id, "coreia norte").unwrap();
+    }
+    for id in 12..40 {
+        batch.add_document(id, &format!("norte outro{id}")).unwrap();
+    }
+    batch.commit().unwrap();
+    let got = ranked(&engine, "coreia norte*");
+    assert_eq!(got.len(), 11);
+    assert_ne!(got[0].0, 1, "{got:?}");
+    assert_eq!(got.last().unwrap().0, 1, "documento só com a completação rara vem por último: {got:?}");
+    // Com só "norte" e "nortel" no índice, `norte*` tem o mesmo df de `norte` mais 1.
+    let exact = ranked(&engine, "coreia norte");
+    assert_eq!(exact.iter().map(|g| g.0).collect::<Vec<_>>(), got[..10].iter().map(|g| g.0).collect::<Vec<_>>());
 }
 
 /// Os cortes do top-k (limite superior e níveis de tf) não podem mudar o

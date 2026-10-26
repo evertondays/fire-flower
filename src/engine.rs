@@ -563,12 +563,9 @@ struct View<'a> {
 /// Uma parte da consulta já carregada, para o ranking. `weight` é
 /// idf · (k1 + 1), a parte da nota que não depende do documento.
 enum Scorer {
-    /// Termo exato: a lista `list` em `lists`.
+    /// Termo exato, ou prefixo tratado como um termo só (R1 do plano de
+    /// relevância): a lista `list` em `lists`.
     Term { weight: f64, list: usize, bound: Bound },
-    /// Prefixo: as listas dos termos expandidos, juntas e ordenadas por
-    /// documento (um documento aparece uma vez por termo que contém).
-    /// `term_of[i]` diz de qual termo é a entrada `i`; vale a maior nota (D8).
-    Prefix { list: usize, weights: Vec<f64>, term_of: Vec<u32>, bound: Bound },
     /// Frase: entra na nota como um termo, com tf = ocorrências da frase e
     /// idf = soma dos idfs dos termos (como o Lucene).
     Phrase { weight: f64, phrase: usize, bound: Bound },
@@ -645,21 +642,11 @@ impl Bound {
 /// Nota de `doc` (já posicionado em todas as listas): soma das partes, na
 /// ordem da consulta.
 #[inline]
-fn doc_score(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], doc: DocId, factor: f64) -> f64 {
+fn doc_score(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], factor: f64) -> f64 {
     let mut score = 0.0;
     for scorer in scorers {
         score += match scorer {
             Scorer::Term { weight, list, .. } => Bm25::score(*weight, lists[*list][at[*list]].tf, factor),
-            Scorer::Prefix { list, weights, term_of, .. } => {
-                let entries = &lists[*list];
-                let mut best = 0.0f64;
-                let mut e = at[*list];
-                while e < entries.len() && entries[e].doc == doc {
-                    best = best.max(Bm25::score(weights[term_of[e] as usize], entries[e].tf, factor));
-                    e += 1;
-                }
-                best
-            }
             Scorer::Phrase { weight, phrase, .. } => Bm25::score(*weight, counts[*phrase], factor),
         };
     }
@@ -670,21 +657,11 @@ fn doc_score(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &
 /// possível de cada parte. Soma de limites é limite da soma (arredondamento
 /// monótono de novo).
 #[inline]
-fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], doc: DocId) -> f64 {
+fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {
             Scorer::Term { list, bound, .. } => bound.get(lists[*list][at[*list]].tf),
-            Scorer::Prefix { list, bound, .. } => {
-                let entries = &lists[*list];
-                let mut best = 0.0f64;
-                let mut e = at[*list];
-                while e < entries.len() && entries[e].doc == doc {
-                    best = best.max(bound.get(entries[e].tf));
-                    e += 1;
-                }
-                best
-            }
             Scorer::Phrase { phrase, bound, .. } => bound.get(counts[*phrase]),
         };
     }
@@ -781,23 +758,17 @@ impl View<'_> {
                     lists.push(list);
                 }
                 Clause::Term(t) => {
-                    let words = self.words_with_prefix(&t.text, config.max_prefix_terms)?;
-                    let mut weights = Vec::with_capacity(words.len());
-                    let mut all: Vec<(DocId, u32, u32)> = Vec::new();
-                    for (term, (_, node)) in words.iter().enumerate() {
-                        let list = self.load_postings(*node)?;
-                        weights.push(bm25.weight(bm25.idf(list.len())));
-                        all.extend(list.into_iter().map(|p| (p.doc, term as u32, p.tf)));
-                    }
-                    if all.is_empty() {
+                    // Prefixo como um termo só: um documento por entrada, com o
+                    // tf somado das completações que ele contém, e o idf do
+                    // conjunto. Uma completação rara não vale mais que a
+                    // palavra comum (R1 do plano de relevância).
+                    let list = self.prefix_postings(&t.text)?;
+                    if list.is_empty() {
                         return Ok(TopHits::default());
                     }
-                    all.sort_unstable_by_key(|&(doc, term, _)| (doc, term));
-                    let term_of = all.iter().map(|e| e.1).collect();
-                    // Limite com o maior peso: vale para qualquer termo do prefixo.
-                    let bound = Bound::new(weights.iter().copied().fold(0.0, f64::max), bm25.base);
-                    scorers.push(Scorer::Prefix { list: lists.len(), weights, term_of, bound });
-                    lists.push(all.into_iter().map(|(doc, _, tf)| Posting { doc, tf }).collect());
+                    let weight = bm25.weight(bm25.idf(list.len()));
+                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, bm25.base) });
+                    lists.push(list);
                 }
                 Clause::Phrase(parts) => {
                     let mut idf = 0.0;
@@ -837,13 +808,8 @@ impl View<'_> {
         let mut norms = NormCursor::new(self);
         let mut top = TopK::new(k);
         let mut total = 0usize;
-        let mut prev: Option<DocId> = None;
         'docs: for i in 0..lists[driver].len() {
             let doc = lists[driver][i].doc;
-            if prev == Some(doc) {
-                continue; // prefixo: o mesmo documento por outro termo
-            }
-            prev = Some(doc);
             at[driver] = i;
             for (j, list) in lists.iter().enumerate() {
                 if j != driver && !seek(list, &mut at[j], doc) {
@@ -865,12 +831,12 @@ impl View<'_> {
             //    passaria do pior não precisa do tamanho (nem da nota exata).
             //    Empate também perde: os IDs chegam em ordem crescente.
             if let Some(worst) = top.threshold()
-                && doc_bound(&scorers, &lists, &at, &counts, doc) <= worst
+                && doc_bound(&scorers, &lists, &at, &counts) <= worst
             {
                 continue;
             }
             let factor = bm25.doc_factor(norms.len(doc)?);
-            top.push(Hit { doc, score: doc_score(&scorers, &lists, &at, &counts, doc, factor) });
+            top.push(Hit { doc, score: doc_score(&scorers, &lists, &at, &counts, factor) });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
     }
@@ -979,6 +945,24 @@ impl View<'_> {
             Some(node) => self.load_docs(node),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Listas das completações de `prefix` unidas por documento, com o tf
+    /// somado: o prefixo como se fosse um termo só.
+    fn prefix_postings(&self, prefix: &str) -> Result<Vec<Posting>> {
+        let mut all: Vec<Posting> = Vec::new();
+        for (_, node) in self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)? {
+            all.extend(self.load_postings(node)?);
+        }
+        all.sort_unstable_by_key(|p| p.doc);
+        let mut merged: Vec<Posting> = Vec::with_capacity(all.len());
+        for p in all {
+            match merged.last_mut() {
+                Some(last) if last.doc == p.doc => last.tf = last.tf.saturating_add(p.tf),
+                _ => merged.push(p),
+            }
+        }
+        Ok(merged)
     }
 
     fn prefix_docs(&self, prefix: &str) -> Result<Vec<DocId>> {

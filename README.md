@@ -228,8 +228,8 @@ python3 scripts/perf.py tudo --escala 10k
   com 1 leitura, e o autocompletar com um único scan.
 - **Prefixos muito curtos** (`a*`) expandem no máximo
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
-  ranking, um documento que casa com vários termos do prefixo fica com a nota
-  do melhor deles (não a soma).
+  ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
+  que têm alguma completação, e o tf é a soma das completações no documento.
 - **Sem stemming** ("casa" e "casas" são termos diferentes).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam

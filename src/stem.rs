@@ -190,27 +190,43 @@ fn plural_suffix(term: &str) -> Option<String> {
 /// ("virus", "lapis", "pais" ficam). Erra alguns ("chineses" ≠ "chines"),
 /// mas sempre do mesmo jeito no índice e na consulta.
 fn singular(term: &str, lang: Language) -> String {
+    match plural_cut(term, lang) {
+        Singular::Prefix(n) => term[..n].to_string(),
+        Singular::Owned(s) => s,
+    }
+}
+
+/// O singular de [`singular`]: quase sempre um começo da própria palavra
+/// ("casas" → "casa", "livre" → "livr"), sem alocar; só as regras que trocam
+/// o sufixo ("eleicoes" → "eleicao") montam um texto novo.
+enum Singular {
+    Prefix(usize),
+    Owned(String),
+}
+
+fn plural_cut(term: &str, lang: Language) -> Singular {
     let n = term.len();
     if n <= 3 || !term.is_ascii() {
-        return term.to_string();
+        return Singular::Prefix(n);
     }
-    let mut out = if !term.ends_with('s') {
-        term.to_string()
+    let mut len = if !term.ends_with('s') {
+        n
     } else if let Some(s) = (lang == Language::Portuguese).then(|| plural_rule(term)).flatten() {
-        return s;
+        return Singular::Owned(s);
     } else {
         match term.as_bytes()[n - 2] {
-            b's' | b'u' | b'i' => term.to_string(),
-            _ => term[..n - 1].to_string(),
+            b's' | b'u' | b'i' => n,
+            _ => n - 1,
         }
     };
     // "mercadores" → "mercadore" e "mercador" têm que dar o mesmo termo: o
     // "e" final depois de r ou z sai de toda palavra ("livre" e "livres"
     // viram "livr", "vez" e "vezes", "vez").
-    if lang == Language::Portuguese && out.len() > 3 && (out.ends_with("re") || out.ends_with("ze")) {
-        out.pop();
+    let cut = &term[..len];
+    if lang == Language::Portuguese && len > 3 && (cut.ends_with("re") || cut.ends_with("ze")) {
+        len -= 1;
     }
-    out
+    Singular::Prefix(len)
 }
 
 /// As regras de plural do português que trocam o fim da palavra.
@@ -225,7 +241,7 @@ fn plural_rule(term: &str) -> Option<String> {
     })
 }
 
-/// Radicais já calculados, por termo. O Snowball custa ~200 ns por termo,
+/// Radicais já calculados, por termo (só para o Snowball). O Snowball custa ~200 ns por termo,
 /// mais que o resto da tokenização; como poucos termos formam quase todo o
 /// texto, o cache acerta quase sempre (~40 ns por termo na Wikipédia).
 #[derive(Default)]
@@ -243,6 +259,16 @@ impl StemCache {
     pub fn get<'a>(&'a mut self, stemmer: &Stemmer, term: &'a str) -> &'a str {
         if !stemmer.is_on() {
             return term;
+        }
+        // O de plural é só comparar sufixos: mais barato calcular que procurar no mapa.
+        if let Stemming::Plural(lang) = stemmer.stemming() {
+            return match plural_cut(term, lang) {
+                Singular::Prefix(n) => &term[..n],
+                Singular::Owned(s) => {
+                    self.scratch = s;
+                    &self.scratch
+                }
+            };
         }
         if !self.map.contains_key(term) {
             if self.map.len() >= Self::LIMIT {

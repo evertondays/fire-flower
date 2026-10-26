@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -106,9 +106,14 @@ pub struct Config {
     pub writer_cache_nodes: usize,
     /// Até que profundidade da Trie as buscas guardam os nós já decodificados,
     /// compartilhados entre elas (0 = só a raiz). Toda busca começa pela raiz,
-    /// que tem um filho por caractere inicial e cresce com o índice (13 KB com
-    /// 100 mil artigos da Wikipédia): sem o cache, cada busca a decodificava
-    /// inteira. `None` desliga.
+    /// que tem um filho por caractere inicial e cresce com o índice (37 KB na
+    /// Wikipédia inteira): sem o cache, cada busca a decodificava inteira.
+    /// `None` desliga.
+    ///
+    /// O cache não descarta: guarda no máximo os nós até essa profundidade.
+    /// Na Wikipédia inteira são 365 mil nós (~48 MB) até a profundidade 4 (o
+    /// padrão; autocompletar de 2 letras de 44 para 11 µs), ~125 MB até a 5 e
+    /// ~260 MB até a 6 (prefixos curtos ~30% mais rápidos).
     pub reader_cache_depth: Option<usize>,
     /// Idiomas das stopwords (palavras comuns que não entram no índice).
     ///
@@ -170,7 +175,7 @@ impl Default for Config {
             max_prefix_terms: 256,
             statistics: false,
             writer_cache_nodes: 3_000_000,
-            reader_cache_depth: Some(2),
+            reader_cache_depth: Some(4),
             languages: None,
             positions: None,
             partition_filters: true,
@@ -342,7 +347,11 @@ impl Engine {
                 Error::Config(format!("banco de outro formato (merge operator {name}); recarregue o banco"))
             }));
         }
-        let db = match DB::open(&opts, path) {
+        // Com a família padrão explícita, `cf_handle("default")` existe (o
+        // `MultiGet` em lote do crate precisa dela). Para o RocksDB é o mesmo
+        // banco; o descritor leva as mesmas opções (merge operator, cache…).
+        let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
+        let db = match DB::open_cf_descriptors(&opts, path, [default_cf]) {
             Ok(db) => db,
             // Um banco antigo com merges pendentes no WAL falha já na
             // recuperação, porque o merge operator não entende o formato antigo.
@@ -1113,11 +1122,15 @@ impl View<'_> {
     /// Listas das completações de `prefix` unidas por documento, com o tf
     /// somado: o prefixo como se fosse um termo só.
     fn prefix_postings(&self, prefix: &str) -> Result<Vec<Posting>> {
+        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
         let mut all: Vec<Posting> = Vec::new();
-        for (_, node) in self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)? {
-            all.extend(self.load_postings(node)?);
+        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+            all.extend(codec::decode_postings(&value)?);
         }
-        all.sort_unstable_by_key(|p| p.doc);
+        // `all` é a concatenação de listas já ordenadas: a ordenação estável
+        // detecta os trechos ordenados e só os intercala (o `sort_unstable`
+        // ordenava tudo de novo).
+        all.sort_by_key(|p| p.doc);
         let mut merged: Vec<Posting> = Vec::with_capacity(all.len());
         for p in all {
             match merged.last_mut() {
@@ -1132,34 +1145,107 @@ impl View<'_> {
     }
 
     fn prefix_docs(&self, prefix: &str) -> Result<Vec<DocId>> {
+        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
         let mut all = Vec::new();
-        for (_, node_id) in self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)? {
-            all.extend(self.load_docs(node_id)?);
+        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+            all.extend(codec::decode_docs(&value)?);
         }
-        all.sort_unstable();
+        all.sort(); // trechos já ordenados: ver `prefix_postings`
         all.dedup();
         Ok(all)
     }
 
-    /// Busca em largura a partir do nó do prefixo. Retorna (palavra, id do nó).
+    /// Busca em largura a partir do nó do prefixo, até `limit` palavras, das
+    /// mais curtas para as mais longas e, no mesmo comprimento, em ordem
+    /// alfabética. Retorna (palavra, id do nó).
+    ///
+    /// Percorre nível a nível (a mesma ordem de uma fila) e lê os nós que não
+    /// estão no cache em lotes de até `WORDS_CHUNK` com um `MultiGet`: um
+    /// prefixo curto visita centenas de nós, e um `Get` por nó custava metade
+    /// do tempo de `p-2*` na Wikipédia inteira.
     fn words_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        const WORDS_CHUNK: usize = 64;
         let mut out = Vec::new();
-        let Some((start, _)) = self.find_node(prefix)? else { return Ok(out) };
-        let depth = prefix.chars().count();
-        let mut queue = VecDeque::from([(prefix.to_string(), start, depth)]);
-        while out.len() < limit {
-            let Some((word, id, depth)) = queue.pop_front() else { break };
-            let node = self.require_node(id, depth)?;
-            for (&ch, &child) in &node.children {
-                let mut next = word.clone();
-                next.push(ch);
-                queue.push_back((next, child, depth + 1));
+        let Some((start, start_node)) = self.find_node(prefix)? else { return Ok(out) };
+        let mut depth = prefix.chars().count();
+        let mut level: Vec<(String, u64)> = vec![(prefix.to_string(), start)];
+        let mut first = Some(start_node);
+        while !level.is_empty() && out.len() < limit {
+            let mut next = Vec::new();
+            let mut at = 0;
+            'level: while at < level.len() {
+                // Lote do tamanho do que ainda falta (o autocompletar pede 10
+                // palavras: ler 64 nós de uma vez desperdiçaria leituras).
+                let size = (2 * (limit - out.len())).clamp(4, WORDS_CHUNK);
+                let chunk = &level[at..(at + size).min(level.len())];
+                at += chunk.len();
+                let nodes = match first.take() {
+                    Some(node) => vec![node],
+                    None => self.nodes_many(chunk.iter().map(|(_, id)| *id), depth)?,
+                };
+                for ((word, id), node) in chunk.iter().zip(nodes) {
+                    if out.len() >= limit {
+                        break 'level;
+                    }
+                    for (&ch, &child) in &node.children {
+                        let mut w = String::with_capacity(word.len() + ch.len_utf8());
+                        w.push_str(word);
+                        w.push(ch);
+                        next.push((w, child));
+                    }
+                    if node.is_end_of_word {
+                        out.push((word.clone(), *id));
+                    }
+                }
             }
-            if node.is_end_of_word {
-                out.push((word, id));
-            }
+            level = next;
+            depth += 1;
         }
         Ok(out)
+    }
+
+    /// Vários nós à mesma `depth`, na ordem de `ids`: os rasos do cache, o
+    /// resto num `MultiGet` só.
+    fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
+        let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
+        let mut out: Vec<Option<Arc<TrieNode>>> = Vec::new();
+        let mut missing: Vec<(usize, u64)> = Vec::new();
+        for id in ids {
+            match cached.then(|| self.engine.nodes.get(id, self.epoch)).flatten() {
+                Some(node) => out.push(Some(node)),
+                None => {
+                    missing.push((out.len(), id));
+                    out.push(None);
+                }
+            }
+        }
+        let values = self.get_many(NODE, missing.iter().map(|&(_, id)| id))?;
+        for ((slot, id), value) in missing.into_iter().zip(values) {
+            let node = Arc::new(TrieNode::decode(&value.ok_or_else(|| missing_node(id))?)?);
+            if cached {
+                self.engine.nodes.offer(id, self.epoch, &node);
+            }
+            out[slot] = Some(node);
+        }
+        Ok(out.into_iter().map(|n| n.expect("todo nó foi preenchido")).collect())
+    }
+
+    /// `<prefixo><id>` para cada id, num `MultiGet` em lote sobre o snapshot,
+    /// na ordem de `ids`.
+    fn get_many(&self, prefix: &[u8], ids: impl Iterator<Item = u64>) -> Result<Vec<Option<rocksdb::DBPinnableSlice<'_>>>> {
+        let keys: Vec<Key> = ids.map(|id| Key::new(prefix, id)).collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        READS.with(|r| r.set(r.get() + keys.len() as u64));
+        let db = &self.engine.db;
+        let cf = db.cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_snapshot(&self.snap);
+        db.batched_multi_get_cf_opt(cf, keys.iter().map(|k| k.as_ref()), false, &opts)
+            .into_iter()
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
     /// Percorre a Trie caractere a caractere: um `Get` no RocksDB por nível,

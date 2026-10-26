@@ -7,14 +7,14 @@ português** (1,1 milhão de artigos) como carga principal.
 oráculo e as fases de medição rodam até a Wikipédia inteira. A carga completa
 leva **4 minutos** (1.112.246 artigos em 242 s, sem colapso), e o
 `perf.py tudo --escala full`, 31 minutos. A análise detalhada da última rodada
-está em [bench/ANALISE-full-vs-100k.md](../bench/ANALISE-full-vs-100k.md).
+está em [ANALISE-full-vs-100k.md](https://github.com/evertondays/fire-flower-bench/blob/main/ANALISE-full-vs-100k.md).
 
 **Progresso na branch `performance-issues-in-v3-version` (commit `ad63e51`,
 formato v5):** carga inteira em **116 s** (−52%), E de termo raro com frequente
 −93%, frases −38% a −72%, títulos −44%, 19,5 mil consultas/s com 12 threads,
 zero divergências. P1, P2 e P5 (saltos) feitos; P3 parcial; P4 encerrado (o
 limite é a máquina). Detalhes em
-[bench/PROGRESSO-performance.md](../bench/PROGRESSO-performance.md). O que
+[PROGRESSO-performance.md](https://github.com/evertondays/fire-flower-bench/blob/main/PROGRESSO-performance.md). O que
 falta tem uma causa comum: ler listas inteiras de termos muito frequentes
 (block-max no top-k, frases de termos frequentes, prefixos de 1–2 letras).
 
@@ -33,14 +33,18 @@ python3 scripts/perf.py pr --escala 100k         # checagem rápida contra a lin
 python3 scripts/perf.py carga-longa --reproduzir # cenário do colapso da carga (ver achado 5)
 python3 scripts/perf.py frases --escala 10k      # só frases e ranking
 python3 scripts/perf.py relevancia --escala 100k # consultas com resposta conhecida
-python3 scripts/perf.py relatorio --escala full  # regera bench/RESULTADOS.md
+python3 scripts/perf.py relatorio --escala full  # regera o RESULTADOS.md de fire-flower-bench
 ```
 
-- Resultados: um JSON por medição em `bench/results/` (com commit e data) e o
-  resumo legível em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
-- Linha de base do `pr`: `bench/baseline-pr-<escala>.json`. Ao salvar uma
-  nova, a anterior (de outro commit) fica como
-  `bench/baseline-pr-<escala>-<commit>.json`.
+- Resultados ficam no repositório separado
+  [fire-flower-bench](https://github.com/evertondays/fire-flower-bench), clonado ao lado deste
+  (`../fire-flower-bench`; `FF_BENCH_DIR` para mudar): um JSON por medição em
+  `results/` (com commit e data) e o resumo legível em
+  [`RESULTADOS.md`](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md). Depois de uma rodada, commite e suba
+  esse repositório.
+- Linha de base do `pr`: `baseline-pr-<escala>.json`, no mesmo repositório. Ao
+  salvar uma nova, a anterior (de outro commit) fica como
+  `baseline-pr-<escala>-<commit>.json`.
 - Para medir com cache frio, rode `sudo -v` antes: sem isso o `perf.py` pula
   essa parte.
 
@@ -155,7 +159,7 @@ O PerfContext é lido pelo relatório em texto: o enum `PerfMetric` do crate
 | 5 — concorrência | `misto` com 1–12 threads; leitura durante escrita | ✅ na full | análise seção 5 |
 | 6 — profiling | flamegraph de carga, busca e compactação | ❌ **nunca rodou** | seção 8 |
 | 7 — `db_bench` | RocksDB puro vs. o motor | descartada: o `Get` do RocksDB nunca apareceu como gargalo | — |
-| 8 — regressões | `pr`: oráculo 10k + carga + bench de 5 conjuntos | ✅ linhas de base de 100k e full | `bench/baseline-pr-*.json` |
+| 8 — regressões | `pr`: oráculo 10k + carga + bench de 5 conjuntos | ✅ linhas de base de 100k e full | `baseline-pr-*.json` (fire-flower-bench) |
 
 ### Fase 1 — o que o oráculo confere
 
@@ -365,7 +369,7 @@ Linha de base: rodada `tudo --escala full` de 26/10/2026, commit `d088f12`.
 - [x] Fase 1 (corretude) em 10k e 100k
 - [x] Fase 2 (escada) até 1,1M
 - [x] Fases 4 e 5 (latência quente e concorrência) na full
-- [x] Linha de base salva (`bench/baseline-pr-100k.json`, `bench/baseline-pr-full.json`)
+- [x] Linha de base salva (`baseline-pr-100k.json`, `baseline-pr-full.json`, em fire-flower-bench)
 - [x] Colapso da carga inteira corrigido e com cenário de teste
 - [ ] Latência com cache frio (H4)
 - [x] P1: divisão do tempo do commit (`CommitStats`, no monitor do `wiki load`)

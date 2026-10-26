@@ -2,7 +2,8 @@
 //!
 //! Todos os subcomandos leem o corpus JSONL da Wikipédia
 //! (`{"id", "title", "text"}` por linha) e gravam resultados em
-//! `bench/results/<data>-<commit>-<tipo>-<rótulo>.json`.
+//! `results/<data>-<commit>-<tipo>-<rótulo>.json` do repositório
+//! fire-flower-bench, clonado ao lado deste (`FF_BENCH_DIR` para mudar).
 //!
 //! ```text
 //! cargo run --release --example wiki -- load    --db D --corpus F [--batch N] [--skip K] [--take N] [--remap-ids]
@@ -387,6 +388,14 @@ fn project_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Repositório dos resultados: `FF_BENCH_DIR` ou `../fire-flower-bench`.
+fn bench_dir() -> PathBuf {
+    match std::env::var_os("FF_BENCH_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => project_dir().parent().map_or_else(project_dir, PathBuf::from).join("fire-flower-bench"),
+    }
+}
+
 fn git_commit() -> String {
     let run = |args: &[&str]| {
         std::process::Command::new("git")
@@ -482,9 +491,9 @@ fn config_json(config: &Config) -> Value {
     })
 }
 
-/// Grava o resultado em bench/results/ e devolve o caminho.
+/// Grava o resultado em `results/` do repositório de resultados e devolve o caminho.
 fn save_result(kind: &str, label: &str, mut value: Value) -> AnyResult<PathBuf> {
-    let dir = project_dir().join("bench").join("results");
+    let dir = bench_dir().join("results");
     std::fs::create_dir_all(&dir)?;
     let commit = git_commit();
     let ts = timestamp();

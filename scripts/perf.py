@@ -13,7 +13,7 @@
     python3 scripts/perf.py relevancia        # ordenação: consultas de resposta conhecida (docs/plano-relevancia.md)
     python3 scripts/perf.py carga-longa       # carga inteira janela a janela; falha se a velocidade colapsar
                                               #   [--reproduzir: roda antes o cenário que colapsava]
-    python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
+    python3 scripts/perf.py relatorio         # escreve RESULTADOS.md no repositório de resultados
     python3 scripts/perf.py comparar A.json B.json
 
 `--escala` (1k, 10k, 100k ou full; padrão 10k) define a maior fatia do corpus
@@ -24,8 +24,10 @@ a mediana: uma carga de 10k varia ±10% entre rodadas, e uma rodada só não
 separa uma melhoria pequena de sorte. Fatias maiores rodam uma vez.
 
 Bancos ficam em ~/bench-db/perf/ (FF_PERF_DB para mudar); o corpus em
-~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados em bench/results/, com a escala
-no rótulo, então escalas diferentes não se misturam.
+~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados, linhas de base e relatório
+ficam no repositório separado fire-flower-bench, clonado ao lado deste
+(FF_BENCH_DIR para mudar), em results/, com a escala no rótulo, então escalas
+diferentes não se misturam.
 
 Regras do plano: build release, nada pesado em paralelo durante as medições,
 compare só resultados da mesma máquina. Só usa a biblioteca padrão.
@@ -42,8 +44,12 @@ import sys
 import time
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS = os.path.join(PROJECT, "bench", "results")
-REPORT = os.path.join(PROJECT, "bench", "RESULTADOS.md")
+# Resultados ficam no repositório fire-flower-bench, clonado ao lado deste.
+BENCH_DIR = os.path.expanduser(os.environ.get("FF_BENCH_DIR", os.path.join(os.path.dirname(PROJECT), "fire-flower-bench")))
+RESULTS = os.path.join(BENCH_DIR, "results")
+REPORT = os.path.join(BENCH_DIR, "RESULTADOS.md")
+# O relatório mora em outro repositório: os links para a documentação são absolutos.
+DOCS_URL = "https://github.com/evertondays/fire-flower/blob/main/docs"
 WIKI = os.path.join(PROJECT, "target", "release", "examples", "wiki")
 FF = os.path.join(PROJECT, "target", "release", "fire-flower")
 
@@ -454,7 +460,7 @@ def fase_concorrencia(scale):
 def fase_pr(scale, salvar_baseline=False):
     """Fase 8: oráculo + carga + bench rápido, comparado com a linha de base salva."""
     small = smaller(scale, "10k")
-    baseline_path = os.path.join(PROJECT, "bench", f"baseline-pr-{scale}.json")
+    baseline_path = os.path.join(BENCH_DIR, f"baseline-pr-{scale}.json")
     tmp_small, tmp_big = db("tmp-pr-oraculo"), db("tmp-pr-carga")
     step(f"pr: oráculo {small}")
     fresh(tmp_small)
@@ -552,7 +558,7 @@ def relevancia_section(R, scale):
     base = latest(R, "relevancia", f"linha-de-base-{s}")
     before = {c["conjunto"]: c for c in base["conjuntos"]} if base else {}
     L = [f"## Relevância ({s})", "",
-         "Consultas com resposta conhecida ([docs/plano-relevancia.md](../docs/plano-relevancia.md)). "
+         f"Consultas com resposta conhecida ([docs/plano-relevancia.md]({DOCS_URL}/plano-relevancia.md)). "
          "Acerto: top-1 em título, digitando e hub; top-10 em corpo; top-3 nas consultas à mão. "
          "Entre parênteses, a linha de base (ranking antes do plano).", "",
          "| Conjunto | Consultas | top-1 | top-3 | top-10 | MRR | fora do top-1000 |", "|---|---|---|---|---|---|---|"]
@@ -726,15 +732,15 @@ def bench_table(r):
 def cmd_relatorio(scale):
     R = load_results()
     if not R:
-        sys.exit("nenhum resultado em bench/results/")
+        sys.exit(f"nenhum resultado em {RESULTS}")
     machine = next((r["maquina"] for r in reversed(R) if "maquina" in r), {})
     L = [
         f"# Resultados de performance (escala {scale})",
         "",
-        f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `bench/results/`. "
+        f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `results/`. "
         "Cada seção mostra o resultado **mais recente** daquele tipo; as cargas mostram a **mediana** das "
         f"últimas rodadas do mesmo commit (até {MEDIANA_DE}), com a faixa mín–máx entre parênteses. O plano está em "
-        "[docs/plano-performance.md](../docs/plano-performance.md).",
+        f"[docs/plano-performance.md]({DOCS_URL}/plano-performance.md).",
         "",
         f"- Último resultado: `{R[-1]['_arquivo']}`",
         f"- Máquina: {machine.get('nucleos', '?')} núcleos, {mb(machine.get('ram_total'))} MB de RAM, "
@@ -918,7 +924,7 @@ def frases_section(R, scale, post, oracles):
         return f" ({pct(r['docs_por_s'], v1['docs_por_s']):+.0f}%)" if r and v1 else ""
 
     L = ["## Frases e ranking (formato v2)", "",
-         "Plano em [docs/plano-frases-e-ranking.md](../docs/plano-frases-e-ranking.md). A linha de base é a última "
+         f"Plano em [docs/plano-frases-e-ranking.md]({DOCS_URL}/plano-frases-e-ranking.md). A linha de base é a última "
          "carga no formato v1 (sem tf nem posições) com o mesmo rótulo.", "",
          "| Métrica | Linha de base (v1) | Agora | Meta |", "|---|---|---|---|",
          f"| Carga {scale} com posições | {docs_s(v1) + ' docs/s' if v1 else '—'} | {docs_s(v2)} docs/s{delta(v2)} | queda ≤ 30% |"]
@@ -992,7 +998,7 @@ def main():
     for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
                         ("concorrencia", "Fase 5"), ("frases", "frases e ranking (Fase E do plano)"),
                         ("relevancia", "ordenação: consultas de resposta conhecida"),
-                        ("relatorio", "gera bench/RESULTADOS.md")):
+                        ("relatorio", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
     pr.add_argument("--salvar-baseline", action="store_true")

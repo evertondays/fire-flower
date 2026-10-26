@@ -240,7 +240,7 @@ oráculo e o `perf.py pr` passando.
 - [x] Fase C: oráculo de frases
 - [x] Fase D: frase na nota
 - [x] Fase E: conjuntos `frase-*` e `rank-*`; relatório com custo de espaço, carga e latência
-- [ ] Fase E: rodada completa do `perf.py` (10k) com os números no `bench/RESULTADOS.md`
+- [ ] Fase E: rodada completa do `perf.py` (10k) com os números no `RESULTADOS.md` (fire-flower-bench)
 - [x] README e `como-funciona.md` atualizados
 
 ## 12. Como ficou (25/10/2026)
@@ -271,7 +271,7 @@ oráculo e o `perf.py pr` passando.
   (número de commit por bloco; ver `NormCache` em `engine.rs`).
 
 **Primeiros números (10k, medições avulsas fora do `perf.py`; a rodada
-oficial vai para `bench/RESULTADOS.md`):**
+oficial vai para o `RESULTADOS.md` de fire-flower-bench):**
 
 | Métrica | v1 | v2 | Meta |
 |---|---|---|---|

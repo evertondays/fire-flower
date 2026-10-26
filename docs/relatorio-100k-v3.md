@@ -5,7 +5,7 @@ Rodada `python3 scripts/perf.py tudo --escala 100k` de 26/10/2026, no commit
 100k de 25/10, no commit `4fe734a` (formato v2, antes do cache de nós, do
 ranking sem reordenar, dos filtros particionados e do plano de relevância).
 
-- Números completos: [bench/RESULTADOS.md](../bench/RESULTADOS.md) (resultado
+- Números completos: [RESULTADOS.md](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md) em fire-flower-bench (resultado
   `2026-10-26T03-54-34-d088f12-bench-pr-100k.json`).
 - Máquina: WSL2, 12 núcleos (Ryzen 5 5600X, 6 físicos), 7,7 GB de RAM.
 - Duração: 12 min 25 s. Memória disponível nunca abaixo de 5,3 GB; sem swap.

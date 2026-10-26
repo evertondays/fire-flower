@@ -192,7 +192,10 @@ inteira, e o merge só concatena as tabelas dos pedaços.
 ## Performance
 
 O plano de medição está em [docs/plano-performance.md](docs/plano-performance.md)
-e os resultados mais recentes em [bench/RESULTADOS.md](bench/RESULTADOS.md).
+e os resultados ficam num repositório separado,
+[fire-flower-bench](https://github.com/evertondays/fire-flower-bench), que o `perf.py` espera clonado ao
+lado deste (`../fire-flower-bench`, ou `FF_BENCH_DIR`); os mais recentes estão em
+[RESULTADOS.md](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md).
 
 ```bash
 python3 scripts/perf.py tudo --escala 10k

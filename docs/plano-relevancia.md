@@ -79,7 +79,7 @@ nota    = idf(df) · tf~ · (k1 + 1) / (tf~ + k1)
 
 Sem isso, "melhorou" vira opinião. Um subcomando `wiki relevancia` gera os
 conjuntos do corpus (seed fixa), roda as consultas com `search_top` e grava
-top-1, top-3, top-10, MRR e "fora do top-1000" em `bench/results/`. O
+top-1, top-3, top-10, MRR e "fora do top-1000" em `results/` (fire-flower-bench). O
 relatório ganha uma seção "Relevância".
 
 | Conjunto | Consulta | Resposta esperada | O que mede |

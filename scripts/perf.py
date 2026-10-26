@@ -384,7 +384,8 @@ def bench(path, scale, sets, label, threads=1, extra=()):
     qdir = queries_dir(scale)
     files = [os.path.join(qdir, f"{s}.txt") for s in sets] if sets else [qdir]
     # Conjuntos novos (frases, ranking) aparecem quando o `wiki queries` muda.
-    if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) or not os.path.exists(os.path.join(qdir, "rank-freq.txt")):
+    if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) \
+            or not all(os.path.exists(os.path.join(qdir, f)) for f in ("rank-freq.txt", "t-flexao.txt")):
         fase_consultas(scale)
     wiki("bench", "--db", path, "--queries", *files, "--threads", threads, "--label", label, *extra)
 

@@ -1,0 +1,134 @@
+# Flexões escritas à mão (docs/plano-stemming.md, conjunto rel-flexao-manual).
+# consulta <TAB> títulos esperados (separados por |) <TAB> nota
+# A consulta usa outra flexão (em geral o plural) do título do artigo esperado, que tem que vir no top-3.
+planetas	Planeta	plural/flexão do título
+estrelas	Estrela	plural/flexão do título
+galáxias	Galáxia	plural/flexão do título
+vulcões	Vulcão	plural/flexão do título
+ilhas	Ilha	plural/flexão do título
+oceanos	Oceano	plural/flexão do título
+florestas	Floresta	plural/flexão do título
+desertos	Deserto	plural/flexão do título
+árvores	Árvore	plural/flexão do título
+flores	Flor	plural/flexão do título
+frutas	Fruta	plural/flexão do título
+peixes	Peixe	plural/flexão do título
+cães	Cão	plural/flexão do título
+gatos	Gato	plural/flexão do título
+cavalos	Cavalo	plural/flexão do título
+livros	Livro	plural/flexão do título
+instrumentos musicais	Instrumento musical	plural/flexão do título
+guitarras	Guitarra	plural/flexão do título
+pianos	Piano	plural/flexão do título
+violinos	Violino	plural/flexão do título
+pinturas	Pintura	plural/flexão do título
+esculturas	Escultura	plural/flexão do título
+igrejas	Igreja	plural/flexão do título
+castelos	Castelo	plural/flexão do título
+pontes	Ponte	plural/flexão do título
+estradas	Estrada	plural/flexão do título
+automóveis	Automóvel	plural/flexão do título
+aviões	Avião	plural/flexão do título
+navios	Navio	plural/flexão do título
+telefones	Telefone	plural/flexão do título
+eleições	Eleição	plural/flexão do título
+revoluções	Revolução	plural/flexão do título
+guerras	Guerra	plural/flexão do título
+impérios	Império	plural/flexão do título
+reinos	Reino	plural/flexão do título
+repúblicas	República	plural/flexão do título
+monarquias	Monarquia	plural/flexão do título
+democracias	Democracia	plural/flexão do título
+constituições	Constituição	plural/flexão do título
+leis	Lei	plural/flexão do título
+moedas	Moeda	plural/flexão do título
+bancos	Banco	plural/flexão do título
+empresas	Empresa	plural/flexão do título
+indústrias	Indústria	plural/flexão do título
+universidades	Universidade	plural/flexão do título
+escolas	Escola	plural/flexão do título
+hospitais	Hospital	plural/flexão do título
+doenças	Doença	plural/flexão do título
+vacinas	Vacina	plural/flexão do título
+medicamentos	Medicamento	plural/flexão do título
+bactérias	Bactéria	plural/flexão do título
+células	Célula	plural/flexão do título
+genes	Gene	plural/flexão do título
+proteínas	Proteína	plural/flexão do título
+átomos	Átomo	plural/flexão do título
+moléculas	Molécula	plural/flexão do título
+metais	Metal	plural/flexão do título
+cometas	Cometa	plural/flexão do título
+asteroides	Asteroide	plural/flexão do título
+números primos	Número primo	plural/flexão do título
+equações	Equação	plural/flexão do título
+triângulos	Triângulo	plural/flexão do título
+círculos	Círculo	plural/flexão do título
+buracos negros	Buraco negro	plural/flexão do título
+satélites naturais	Satélite natural	plural/flexão do título
+satélites artificiais	Satélite artificial	plural/flexão do título
+revoluções francesas	Revolução Francesa	plural/flexão do título
+guerras mundiais	Primeira Guerra Mundial|Segunda Guerra Mundial	plural/flexão do título
+descobrimento português	Descobrimentos portugueses	plural/flexão do título
+celta	Celtas	plural/flexão do título
+jogo olímpico	Jogos Olímpicos	plural/flexão do título
+olimpíadas	Olimpíada	plural/flexão do título
+prêmios nobel	Prêmio Nobel	plural/flexão do título
+reis	Rei	plural/flexão do título
+papas	Papa	plural/flexão do título
+imperadores	Imperador	plural/flexão do título
+faraós	Faraó	plural/flexão do título
+pirâmides	Pirâmide	plural/flexão do título
+templos	Templo	plural/flexão do título
+mosteiros	Mosteiro	plural/flexão do título
+catedrais	Catedral	plural/flexão do título
+museus	Museu	plural/flexão do título
+bibliotecas	Biblioteca	plural/flexão do título
+aeroportos	Aeroporto	plural/flexão do título
+faróis	Farol	plural/flexão do título
+vinhos	Vinho	plural/flexão do título
+cervejas	Cerveja	plural/flexão do título
+pães	Pão	plural/flexão do título
+batatas	Batata	plural/flexão do título
+tomates	Tomate	plural/flexão do título
+maçãs	Maçã	plural/flexão do título
+uvas	Uva	plural/flexão do título
+bananas	Banana	plural/flexão do título
+abelhas	Abelha	plural/flexão do título
+formigas	Formiga	plural/flexão do título
+borboletas	Borboleta	plural/flexão do título
+aranhas	Aranha	plural/flexão do título
+golfinhos	Golfinho	plural/flexão do título
+tubarões	Tubarão	plural/flexão do título
+leões	Leão	plural/flexão do título
+tigres	Tigre	plural/flexão do título
+elefantes	Elefante	plural/flexão do título
+raposas	Raposa	plural/flexão do título
+morcegos	Morcego	plural/flexão do título
+águias	Águia	plural/flexão do título
+pinguins	Pinguim	plural/flexão do título
+galinhas	Galinha	plural/flexão do título
+patos	Pato	plural/flexão do título
+crocodilos	Crocodilo	plural/flexão do título
+sapos	Sapo	plural/flexão do título
+diamantes	Diamante	plural/flexão do título
+sismos	Sismo	plural/flexão do título
+medalhas	Medalha	plural/flexão do título
+canções	Canção	plural/flexão do título
+óperas	Ópera	plural/flexão do título
+sinfonias	Sinfonia	plural/flexão do título
+danças	Dança	plural/flexão do título
+bicicletas	Bicicleta	plural/flexão do título
+motocicletas	Motocicleta	plural/flexão do título
+astronautas	Astronauta	plural/flexão do título
+telescópios	Telescópio	plural/flexão do título
+microscópios	Microscópio	plural/flexão do título
+relógios	Relógio	plural/flexão do título
+calendários	Calendário	plural/flexão do título
+energias nucleares	Energia nuclear	plural/flexão do título
+religiões	Religião	plural/flexão do título
+filosofias	Filosofia	plural/flexão do título
+teatros	Teatro	plural/flexão do título
+jornais	Jornal	plural/flexão do título
+revistas	Revista	plural/flexão do título
+romances	Romance	plural/flexão do título

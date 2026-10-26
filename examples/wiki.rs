@@ -1115,6 +1115,17 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     sets.insert("rank-and".into(), rank_and);
     sets.insert("rank-titulos".into(), sets["titulos"].clone());
 
+    // Palavras de frequência média cuja forma regular de plural ou singular
+    // também está no índice (para medir o custo de somar as flexões). Gerador
+    // próprio: os conjuntos acima não mudam.
+    let mut frng = Rng(seed ^ 0xf1e0_5eed);
+    let with_other: Vec<&str> = medio
+        .iter()
+        .copied()
+        .filter(|t| regular_inflections(t).iter().any(|v| df.get(v.as_str()).is_some_and(|&n| n >= 10)))
+        .collect();
+    sets.insert("t-flexao".into(), sample(&mut frng, &with_other));
+
     let out = out.unwrap_or_else(|| project_dir().join("bench/queries"));
     std::fs::create_dir_all(&out)?;
     for (name, list) in &sets {
@@ -1987,8 +1998,48 @@ struct RelCase {
 
 /// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
 /// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
-const REL_SETS: [(&str, usize); 5] =
-    [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10), ("rel-flexao", 10)];
+const REL_SETS: [(&str, usize); 6] = [
+    ("rel-titulo", 1),
+    ("rel-digitando", 1),
+    ("rel-hub", 1),
+    ("rel-corpo", 10),
+    ("rel-flexao", 10),
+    ("rel-plural", 10),
+];
+
+/// Plural e singular regulares de uma palavra normalizada (sem acentos),
+/// pelas regras do português, sem stemmer: "eleicoes" → "eleicao",
+/// "papel" → "papeis", "casa" → "casas". Os candidatos podem não existir; quem
+/// chama confere no vocabulário.
+fn regular_inflections(w: &str) -> Vec<String> {
+    let n = w.chars().count();
+    if n < 4 || !w.chars().all(|c| c.is_ascii_lowercase()) {
+        return Vec::new();
+    }
+    let swap = |from: &str, to: &str| w.strip_suffix(from).map(|stem| format!("{stem}{to}"));
+    let mut out: Vec<String> = Vec::new();
+    if w.ends_with('s') {
+        let rules: &[(&str, &str)] = &[
+            ("coes", "cao"), ("oes", "ao"), ("aes", "ao"), ("ais", "al"), ("eis", "el"), ("ois", "ol"),
+            ("uis", "ul"), ("ns", "m"), ("res", "r"), ("zes", "z"), ("s", ""),
+        ];
+        out.extend(rules.iter().filter_map(|(f, t)| swap(f, t)));
+    } else {
+        let rules: &[(&str, &str)] = &[
+            ("cao", "coes"), ("ao", "oes"), ("ao", "aes"), ("ao", "aos"), ("al", "ais"), ("el", "eis"),
+            ("ol", "ois"), ("ul", "uis"), ("m", "ns"),
+        ];
+        out.extend(rules.iter().filter_map(|(f, t)| swap(f, t)));
+        match w.chars().last() {
+            Some('r' | 'z') => out.push(format!("{w}es")),
+            Some('a' | 'e' | 'i' | 'o' | 'u') => out.push(format!("{w}s")),
+            _ => {}
+        }
+    }
+    out.retain(|v| v != w && v.chars().count() >= 3);
+    out.dedup();
+    out
+}
 
 fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
     let mut w = BufWriter::new(File::create(path)?);
@@ -2040,6 +2091,9 @@ fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usize, item: i
 ///   tem que vir em 1º, acima dos derivados.
 /// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
 ///   artigo no top-10. Segura o exagero do peso do título.
+/// - `rel-plural`: como o `rel-flexao`, mas com o plural ou o singular
+///   regular (`regular_inflections`), sem depender do Snowball: o artigo no
+///   top-10.
 /// - `rel-flexao`: as consultas do `rel-corpo` com cada palavra trocada pela
 ///   flexão mais comum do mesmo radical (Snowball do português) que não está
 ///   no artigo ("eleitos" → "eleito"): o artigo no top-10. Sem stemming não
@@ -2176,12 +2230,41 @@ fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, se
         }
         inflected.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
     }
+    // Plural/singular regular: a outra forma mais comum que o artigo não tem.
+    let mut plural: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if plural.len() >= per_set {
+            break;
+        }
+        let title_terms = index_terms(title, stopwords);
+        let absent = |w: &str| terms.binary_search_by(|t| t.as_str().cmp(w)).is_err() && !title_terms.iter().any(|t| t == w);
+        let other = |t: &str| -> Option<String> {
+            regular_inflections(t)
+                .into_iter()
+                .filter(|v| df.get(v).is_some_and(|&n| n >= 3) && !stopwords.contains(v) && absent(v))
+                .max_by(|a, b| df[a].cmp(&df[b]).then(b.cmp(a)))
+        };
+        let pairs: Vec<String> = terms.iter().filter(|t| (20..=2000).contains(&df[*t])).filter_map(|t| other(t)).collect();
+        if pairs.len() < 2 {
+            continue;
+        }
+        let a = rng.below(pairs.len());
+        let mut b = rng.below(pairs.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        if pairs[a] == pairs[b] {
+            continue;
+        }
+        plural.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
+    }
     Ok(vec![
         ("rel-titulo", by_title),
         ("rel-digitando", typing),
         ("rel-hub", hubs),
         ("rel-corpo", body_cases),
         ("rel-flexao", inflected),
+        ("rel-plural", plural),
     ])
 }
 
@@ -2261,6 +2344,11 @@ fn relevancia(
         sets.push((name.to_string(), hit_at, read_rel_set(&sets_dir.join(format!("{name}.tsv")))?));
     }
     sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
+    // Flexões escritas à mão, ao lado do `manual.tsv`.
+    let flexao_manual = manual.with_file_name("flexao-manual.tsv");
+    if flexao_manual.exists() {
+        sets.push(("rel-flexao-manual".into(), 3, read_manual(&flexao_manual, corpus, take)?));
+    }
 
     let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
     let mut results = Vec::new();

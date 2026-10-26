@@ -155,7 +155,7 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 ### Chaves no RocksDB
 
-Formato v4 (`meta:format = 4`). Um banco de formato anterior não abre: o
+Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 `open` diz em que formato ele está e pede para recarregar.
 
 | Chave | Valor |
@@ -173,8 +173,9 @@ Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
 em chaves separadas para que a busca comum não leia posições. Listas com mais
 de 256 documentos têm, antes das entradas, uma tabela de saltos (último
-documento e tamanho de cada bloco de 128): o E e as frases vão direto ao
-bloco de um documento, sem decodificar a lista inteira.
+documento, tamanho e quantidade de entradas de cada bloco, 128 na gravação):
+o E e as frases vão direto ao bloco de um documento, sem decodificar a lista
+inteira, e o merge só concatena as tabelas dos pedaços.
 
 ### Configuração do RocksDB
 

@@ -349,15 +349,22 @@ mais um número: quantas das ocorrências estão no título. Um documento com
 título). Entradas sem o termo no título, que são quase todas, não pagam nada
 a mais.
 
-**Tabela de saltos (formato v4).** O segundo número é a quantidade de
-entradas de uma tabela de saltos, que só listas com mais de 256 documentos
-têm: para cada bloco de 128 documentos, o último documento do bloco (em
-delta) e o tamanho do bloco em bytes. As entradas vêm logo depois e são as
+**Tabela de saltos (formato v5).** O segundo número é a quantidade de
+blocos de uma tabela de saltos, que só listas com mais de 256 documentos
+têm: para cada bloco, o último documento (em delta), o tamanho em bytes e
+quantas entradas ele tem (menos 1). As entradas vêm logo depois e são as
 mesmas de uma lista sem tabela (os deltas continuam de um bloco para o
 outro). Decodificar a lista inteira só pula a tabela; para achar um
 documento numa lista de 145 mil, a busca vai direto ao bloco certo e
-decodifica no máximo 128 entradas (seção 6.2). A tabela custa ~3% do
-tamanho da lista.
+decodifica só as entradas dele (seção 6.2). A tabela custa ~2% do tamanho
+da lista.
+
+O lote grava blocos de 128 entradas, mas a tabela aceita blocos de qualquer
+tamanho, e isso existe por causa do merge (5.5): unir pedaços é só
+concatenar as tabelas deles. No formato v4 os blocos tinham sempre 128
+entradas, e o merge na leitura de um termo frequente com pedaços pendentes
+recalculava a tabela percorrendo a lista inteira: antes de compactar,
+`t-freq` ficava 43% mais lento que no v3. Com a v5 ficou 41% mais rápido.
 
 ### Lendo as posições: `pos:11`
 
@@ -589,9 +596,12 @@ mais novo vence (é assim que reindexar troca o tf e as posições). Essa regra 
 associativa, então o RocksDB pode juntar pedaços consecutivos em qualquer
 agrupamento; um teste confere isso com pedaços aleatórios. O caso comum, uma
 carga com IDs crescentes, tem um atalho: cada pedaço começa depois do fim do
-anterior, e o merge só concatena os bytes, refazendo um delta por pedaço, sem
-decodificar as listas. Pedaços que se sobrepõem passam pelo caminho completo
-(decodifica, ordena de forma estável, fica com o último de cada documento).
+anterior, e o merge só concatena os bytes, refazendo um delta por pedaço, e
+concatena as tabelas de saltos (um pedaço pequeno vira um bloco). Uma lista
+com tabela nem é percorrida: o último documento vem da tabela e o primeiro,
+da primeira entrada. Pedaços que se sobrepõem passam pelo caminho completo
+(decodifica, ordena de forma estável, fica com o último de cada documento, e
+regrava em blocos de 128).
 
 Enquanto a compactação não roda, uma leitura de `post:<id>` une os pedaços na
 hora. Por isso listas muito disputadas podem ficar mais lentas logo depois de

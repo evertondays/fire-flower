@@ -1,4 +1,4 @@
-//! Serialização compacta dos valores gravados no RocksDB (formato v4).
+//! Serialização compacta dos valores gravados no RocksDB (formato v5).
 //!
 //! Inteiros usam varint (LEB128): números pequenos ocupam 1–2 bytes em vez de
 //! 8. Listas são ordenadas por documento e gravam a diferença (delta) entre IDs
@@ -10,14 +10,19 @@
 //! | `post:<nó>` | `n`, saltos, `n × (Δdoc, tf << 1 \| tem título, [tf do título])` |
 //! | `pos:<nó>` | `n`, saltos, `n × (Δdoc, k, k × Δposição)` (a primeira posição é absoluta) |
 //!
-//! **Saltos (v4):** listas com mais de `2 × SKIP_BLOCK` entradas guardam,
-//! antes das entradas, uma tabela com o último documento e o tamanho em bytes
-//! de cada bloco de `SKIP_BLOCK` entradas: `s`, `s × (Δúltimo doc, bytes)`.
-//! Listas menores gravam `s = 0`. As entradas são exatamente as do v3 (os
-//! deltas continuam de um bloco para o outro), então decodificar a lista
-//! inteira só pula a tabela; os cursores ([`PostingsCursor`],
+//! **Saltos (v5):** listas com mais de `2 × SKIP_BLOCK` entradas guardam,
+//! antes das entradas, uma tabela de blocos: `s`, `s × (Δúltimo doc, bytes,
+//! entradas − 1)`. Listas menores gravam `s = 0`. As entradas são exatamente as
+//! do v3 (os deltas continuam de um bloco para o outro), então decodificar a
+//! lista inteira só pula a tabela; os cursores ([`PostingsCursor`],
 //! [`PositionsCursor`]) a usam para ir direto ao bloco de um documento sem
 //! decodificar os anteriores.
+//!
+//! O lote grava blocos de `SKIP_BLOCK` entradas, mas a tabela aceita blocos
+//! de qualquer tamanho: assim o merge só concatena as tabelas dos pedaços (um
+//! pedaço pequeno vira um bloco), sem percorrer a lista unida. No v4 os blocos
+//! tinham tamanho fixo e o merge recalculava a tabela a cada leitura de uma
+//! lista com pedaços pendentes (termo frequente antes de compactar: +43%).
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
 
 use crate::{DocId, Error, Posting};
@@ -168,30 +173,57 @@ fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Vec<u8>, &mut
         return;
     }
     let mut body = Vec::with_capacity(n * 3);
-    let mut blocks = Vec::with_capacity(n.div_ceil(SKIP_BLOCK));
-    write(&mut body, &mut blocks);
+    let mut ends = Vec::with_capacity(n.div_ceil(SKIP_BLOCK));
+    write(&mut body, &mut ends);
+    let mut blocks = Vec::with_capacity(ends.len());
+    let mut start = 0;
+    for (i, &(last, end)) in ends.iter().enumerate() {
+        let count = if i + 1 == ends.len() { n - i * SKIP_BLOCK } else { SKIP_BLOCK };
+        blocks.push(SkipEntry { last, bytes: end - start, count: count as u64 });
+        start = end;
+    }
     put_skips(buf, &blocks);
     buf.extend_from_slice(&body);
 }
 
-/// `s`, depois `(Δúltimo doc, bytes)` de cada bloco. `blocks` traz o último
-/// documento e o fim de cada bloco, acumulados.
-fn put_skips(buf: &mut Vec<u8>, blocks: &[(DocId, usize)]) {
+/// Um bloco da tabela de saltos, como é gravado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkipEntry {
+    /// Último documento do bloco (absoluto).
+    last: DocId,
+    /// Tamanho do bloco em bytes.
+    bytes: usize,
+    /// Entradas no bloco.
+    count: u64,
+}
+
+/// `s`, depois `(Δúltimo doc, bytes, entradas − 1)` de cada bloco.
+fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry]) {
     put_varint(buf, blocks.len() as u64);
-    let (mut last, mut end) = (0, 0);
-    for &(doc, block_end) in blocks {
-        put_varint(buf, doc - last);
-        put_varint(buf, (block_end - end) as u64);
-        (last, end) = (doc, block_end);
+    let mut last = 0;
+    for b in blocks {
+        put_varint(buf, b.last - last);
+        put_varint(buf, b.bytes as u64);
+        put_varint(buf, b.count - 1); // 128 entradas cabem em 1 byte
+        last = b.last;
     }
 }
 
-/// Cabeçalho de uma lista: quantas entradas, os blocos da tabela de saltos
-/// (último documento e início do bloco, relativo às entradas) e onde as
+/// Um bloco já localizado: último documento, onde começa (relativo às
+/// entradas) e o índice da sua primeira entrada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Block {
+    last: DocId,
+    start: usize,
+    first: u64,
+}
+
+/// Cabeçalho de uma lista: quantas entradas, a tabela de saltos e onde as
 /// entradas começam.
 struct ListHeader {
     n: u64,
-    blocks: Vec<(DocId, usize)>,
+    blocks: Vec<Block>,
+    entries: Vec<SkipEntry>,
     body: usize,
 }
 
@@ -201,24 +233,35 @@ impl ListHeader {
         let mut r = Reader::new(bytes);
         let n = r.varint()?;
         let s = r.varint()?;
-        let expected = if n as usize > 2 * SKIP_BLOCK { (n as usize).div_ceil(SKIP_BLOCK) } else { 0 };
-        if s as usize != expected {
-            return Err(corrupt("tabela de saltos com tamanho errado"));
+        // Tabela se e só se a lista for grande; cada bloco tem ao menos 3 bytes.
+        if (s > 0) != (n as usize > 2 * SKIP_BLOCK) || s > n || s as usize > bytes.len() / 3 {
+            return Err(corrupt("tabela de saltos inválida"));
         }
         let mut blocks = Vec::new();
+        let mut entries = Vec::new();
         if parse_skips {
             blocks.reserve(s as usize);
-            let (mut last, mut start) = (0u64, 0usize);
+            entries.reserve(s as usize);
+            let (mut last, mut start, mut first) = (0u64, 0usize, 0u64);
             for _ in 0..s {
                 last = last.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
                 let len = usize::try_from(r.varint()?).map_err(|_| corrupt("bloco grande demais"))?;
-                blocks.push((last, start));
+                let count = r.varint()?.checked_add(1).ok_or_else(|| corrupt("bloco grande demais"))?;
+                if len == 0 {
+                    return Err(corrupt("bloco vazio na tabela de saltos"));
+                }
+                blocks.push(Block { last, start, first });
+                entries.push(SkipEntry { last, bytes: len, count });
                 start = start.checked_add(len).ok_or_else(|| corrupt("bloco grande demais"))?;
+                first = first.checked_add(count).ok_or_else(|| corrupt("bloco grande demais"))?;
+            }
+            if s > 0 && (first != n || start != bytes.len() - r.pos) {
+                return Err(corrupt("tabela de saltos não bate com as entradas"));
             }
         } else {
-            r.skip_varints(2 * s)?;
+            r.skip_varints(3 * s)?;
         }
-        Ok(Self { n, blocks, body: r.pos })
+        Ok(Self { n, blocks, entries, body: r.pos })
     }
 }
 
@@ -289,7 +332,9 @@ pub struct PostingsCursor<'a> {
     r: Reader<'a>,
     body: usize,
     n: u64,
-    blocks: Vec<(DocId, usize)>,
+    blocks: Vec<Block>,
+    /// Bloco da próxima entrada a ler.
+    block: usize,
     /// Entradas já lidas.
     read: u64,
     prev: DocId,
@@ -299,8 +344,8 @@ pub struct PostingsCursor<'a> {
 
 impl<'a> PostingsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let ListHeader { n, blocks, body } = ListHeader::parse(bytes, true)?;
-        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, read: 0, prev: 0, current: None })
+        let ListHeader { n, blocks, body, .. } = ListHeader::parse(bytes, true)?;
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, read: 0, prev: 0, current: None })
     }
 
     /// Quantas entradas a lista tem.
@@ -321,23 +366,26 @@ impl<'a> PostingsCursor<'a> {
             return Ok(Some(c));
         }
         // O bloco da próxima entrada termina antes do alvo: salta.
-        let next_block = (self.read as usize) / SKIP_BLOCK;
-        if next_block < self.blocks.len() && self.blocks[next_block].0 < target {
-            let b = next_block + self.blocks[next_block..].partition_point(|&(last, _)| last < target);
+        if self.block < self.blocks.len() && self.blocks[self.block].last < target {
+            let b = self.block + self.blocks[self.block..].partition_point(|blk| blk.last < target);
             if b == self.blocks.len() {
                 self.read = self.n;
                 self.current = None;
                 return Ok(None);
             }
-            self.r.pos = self.body + self.blocks[b].1;
-            self.prev = if b > 0 { self.blocks[b - 1].0 } else { 0 };
-            self.read = (b * SKIP_BLOCK) as u64;
+            self.r.pos = self.body + self.blocks[b].start;
+            self.prev = if b > 0 { self.blocks[b - 1].last } else { 0 };
+            self.read = self.blocks[b].first;
+            self.block = b;
         }
         while self.read < self.n {
             let doc = self.prev.checked_add(self.r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
             let (tf, title_tf) = read_tfs(&mut self.r)?;
             self.read += 1;
             self.prev = doc;
+            if self.block + 1 < self.blocks.len() && self.read >= self.blocks[self.block + 1].first {
+                self.block += 1;
+            }
             if doc >= target {
                 let p = Posting { doc, tf, title_tf };
                 self.current = Some(p);
@@ -408,7 +456,9 @@ pub struct PositionsCursor<'a> {
     r: Reader<'a>,
     body: usize,
     n: u64,
-    blocks: Vec<(DocId, usize)>,
+    blocks: Vec<Block>,
+    /// Bloco da próxima entrada a ler (a de `head` já foi lida).
+    block: usize,
     remaining: u64,
     prev: DocId,
     /// Cabeçalho (doc, k) já lido, com as posições ainda por ler.
@@ -417,28 +467,34 @@ pub struct PositionsCursor<'a> {
 
 impl<'a> PositionsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let ListHeader { n, blocks, body } = ListHeader::parse(bytes, true)?;
-        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, remaining: n, prev: 0, head: None })
+        let ListHeader { n, blocks, body, .. } = ListHeader::parse(bytes, true)?;
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None })
     }
 
     /// Se o bloco da próxima entrada termina antes de `target`, vai direto
     /// ao primeiro bloco que pode conter `target`.
     fn jump(&mut self, target: DocId) {
-        let next = (self.n - self.remaining) as usize;
-        let block = next / SKIP_BLOCK;
-        // A entrada em `head` já foi contada: se ela é o alvo ou além, fica.
-        if self.head.is_some_and(|(doc, _)| doc >= target) || block >= self.blocks.len() || self.blocks[block].0 >= target {
+        if self.blocks.is_empty() || self.remaining == 0 {
             return;
         }
-        let b = block + self.blocks[block..].partition_point(|&(last, _)| last < target);
+        // Se `head` é o alvo ou além, ou o bloco da próxima entrada ainda pode
+        // ter o alvo, fica. (O bloco é acompanhado a cada entrada lida: uma
+        // busca binária aqui, por documento conferido, deixava frases de
+        // termos frequentes 2× mais lentas no p99.)
+        let block = self.block;
+        if self.head.is_some_and(|(doc, _)| doc >= target) || self.blocks[block].last >= target {
+            return;
+        }
+        let b = block + self.blocks[block..].partition_point(|blk| blk.last < target);
         self.head = None;
         if b == self.blocks.len() {
             self.remaining = 0;
             return;
         }
-        self.r.pos = self.body + self.blocks[b].1;
-        self.prev = if b > 0 { self.blocks[b - 1].0 } else { 0 };
-        self.remaining = self.n - (b * SKIP_BLOCK) as u64;
+        self.r.pos = self.body + self.blocks[b].start;
+        self.prev = if b > 0 { self.blocks[b - 1].last } else { 0 };
+        self.remaining = self.n - self.blocks[b].first;
+        self.block = b;
     }
 
     /// Próximo documento da lista (sem consumir as posições dele).
@@ -450,6 +506,9 @@ impl<'a> PositionsCursor<'a> {
             return Ok(None);
         }
         self.remaining -= 1;
+        if self.block + 1 < self.blocks.len() && self.n - self.remaining >= self.blocks[self.block + 1].first {
+            self.block += 1;
+        }
         let doc = self.prev.checked_add(self.r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
         let k = self.r.varint()?;
         if k == 0 {
@@ -502,22 +561,32 @@ impl<'a> PositionsCursor<'a> {
 
 // ------------------------------------------------------------------ merge
 
-/// Uma lista codificada, já percorrida e validada.
+/// Uma lista codificada, pronta para o merge.
 struct Scan {
     n: u64,
     first: DocId,
     last: DocId,
-    /// Onde começa a primeira entrada (depois do `n`).
+    /// Onde começa a primeira entrada (depois da tabela).
     body: usize,
     /// Onde termina o Δdoc da primeira entrada.
     after_first_delta: usize,
+    /// Tabela de saltos (vazia numa lista pequena).
+    skips: Vec<SkipEntry>,
 }
 
+/// Lista grande: o último documento vem da tabela e o primeiro da primeira
+/// entrada, sem percorrer o resto (o merge na leitura de um termo frequente
+/// com pedaços pendentes fazia isso a cada leitura). Lista pequena: percorre
+/// e valida.
 fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
-    let header = ListHeader::parse(bytes, false)?;
+    let header = ListHeader::parse(bytes, true)?;
     let n = header.n;
     let mut r = Reader { buf: bytes, pos: header.body };
     let body = r.pos;
+    if let Some(last) = header.entries.last() {
+        let first = r.varint()?;
+        return Ok(Scan { n, first, last: last.last, body, after_first_delta: r.pos, skips: header.entries });
+    }
     let (mut first, mut doc, mut after_first_delta) = (0, 0u64, body);
     for i in 0..n {
         doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
@@ -533,7 +602,7 @@ fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
         }
     }
     r.finish()?;
-    Ok(Scan { n, first, last: doc, body, after_first_delta })
+    Ok(Scan { n, first, last: doc, body, after_first_delta, skips: Vec::new() })
 }
 
 /// Merge operator de `post:`: une as listas por documento; para o mesmo
@@ -562,46 +631,39 @@ fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions: bool) -> O
     if lists.windows(2).all(|w| w[0].1.last < w[1].1.first) {
         let total: u64 = lists.iter().map(|(_, s)| s.n).sum();
         let mut body = Vec::with_capacity(lists.iter().map(|(b, _)| b.len()).sum::<usize>());
+        // A tabela da lista unida é a concatenação das tabelas dos pedaços
+        // (um pedaço pequeno vira um bloco). Só o primeiro bloco de cada
+        // pedaço muda de tamanho: o delta da primeira entrada é refeito.
+        let mut blocks: Vec<SkipEntry> = Vec::new();
         let mut prev_last = 0;
         for (i, (bytes, s)) in lists.iter().enumerate() {
+            let before = body.len();
             if i == 0 {
                 body.extend_from_slice(&bytes[s.body..]);
             } else {
                 put_varint(&mut body, s.first - prev_last);
                 body.extend_from_slice(&bytes[s.after_first_delta..]);
             }
+            let grown = (body.len() - before) as isize - (bytes.len() - s.body) as isize;
+            if s.skips.is_empty() {
+                blocks.push(SkipEntry { last: s.last, bytes: bytes.len() - s.body, count: s.n });
+            } else {
+                blocks.extend_from_slice(&s.skips[..]);
+            }
+            let first_block = blocks.len() - s.skips.len().max(1);
+            blocks[first_block].bytes = (blocks[first_block].bytes as isize + grown) as usize;
             prev_last = s.last;
         }
-        // A tabela de saltos da lista unida sai de uma passada pelas entradas.
-        let blocks = if total as usize > 2 * SKIP_BLOCK { blocks_of(&body, total, positions).ok()? } else { Vec::new() };
-        let mut out = Vec::with_capacity(16 + blocks.len() * 4 + body.len());
+        if total as usize <= 2 * SKIP_BLOCK {
+            blocks.clear();
+        }
+        let mut out = Vec::with_capacity(16 + blocks.len() * 5 + body.len());
         put_varint(&mut out, total);
         put_skips(&mut out, &blocks);
         out.extend_from_slice(&body);
         return Some(out);
     }
     if positions { merge_positions_slow(&lists) } else { merge_postings_slow(&lists) }.ok()
-}
-
-/// Último documento e fim (em bytes) de cada bloco de `SKIP_BLOCK` entradas.
-fn blocks_of(body: &[u8], n: u64, positions: bool) -> Result<Vec<(DocId, usize)>, Error> {
-    let mut r = Reader::new(body);
-    let mut blocks = Vec::with_capacity((n as usize).div_ceil(SKIP_BLOCK));
-    let mut doc = 0u64;
-    for i in 0..n {
-        doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
-        let k = r.varint()?;
-        if positions {
-            r.skip_varints(k)?;
-        } else if k & 1 == 1 {
-            r.skip_varints(1)?;
-        }
-        if (i + 1) % SKIP_BLOCK as u64 == 0 || i + 1 == n {
-            blocks.push((doc, r.pos));
-        }
-    }
-    r.finish()?;
-    Ok(blocks)
 }
 
 /// Ordenação estável por doc: entre entradas do mesmo doc, a ordem dos
@@ -908,8 +970,8 @@ mod tests {
     fn postings_roundtrip_and_size() {
         let list: Vec<Posting> = (1000..2000).map(|d| p(d, 1 + (d % 3) as u32)).collect();
         let bytes = encode_postings(&list);
-        // ~1 byte por delta e por tf, mais a tabela de saltos (8 blocos, ~25 bytes).
-        assert!(bytes.len() < 2040, "delta e tf pequenos devem ocupar ~1 byte cada: {}", bytes.len());
+        // ~1 byte por delta e por tf, mais a tabela de saltos (8 blocos, ~40 bytes).
+        assert!(bytes.len() < 2050, "delta e tf pequenos devem ocupar ~1 byte cada: {}", bytes.len());
         assert_eq!(decode_postings(&bytes).unwrap(), list);
         assert_eq!(decode_docs(&bytes).unwrap(), (1000..2000).collect::<Vec<_>>());
         let edge = [p(0, 1), p(u64::MAX, u32::MAX)];
@@ -1102,12 +1164,15 @@ mod tests {
             let header = ListHeader::parse(&bytes, true).unwrap();
             let expected = if n > 2 * SKIP_BLOCK { n.div_ceil(SKIP_BLOCK) } else { 0 };
             assert_eq!(header.blocks.len(), expected, "n = {n}");
+            for (b, blk) in header.blocks.iter().enumerate() {
+                assert_eq!(blk.first, (b * SKIP_BLOCK) as u64);
+            }
             assert_eq!(list_len(&bytes).unwrap(), n as u64);
             assert_eq!(decode_postings(&bytes).unwrap(), list, "n = {n}");
             assert_eq!(decode_docs(&bytes).unwrap(), list.iter().map(|p| p.doc).collect::<Vec<_>>());
             // Cada bloco termina no documento certo.
-            for (b, &(last, _)) in header.blocks.iter().enumerate() {
-                assert_eq!(last, list[((b + 1) * SKIP_BLOCK).min(n) - 1].doc);
+            for (b, blk) in header.blocks.iter().enumerate() {
+                assert_eq!(blk.last, list[((b + 1) * SKIP_BLOCK).min(n) - 1].doc);
             }
         }
     }
@@ -1181,9 +1246,29 @@ mod tests {
         let pieces: Vec<&[Posting]> = vec![&full[..100], &full[100..250], &full[250..900], &full[900..]];
         let encoded: Vec<Vec<u8>> = pieces.iter().map(|p| encode_postings(p)).collect();
         let merged = merge_postings(encoded.iter().map(Vec::as_slice)).unwrap();
-        assert_eq!(merged, encode_postings(&full), "caminho rápido: mesmos bytes do lote único");
+        assert_eq!(decode_postings(&merged).unwrap(), full, "caminho rápido");
+        // A tabela é a dos pedaços: 100 e 150 viram um bloco cada; os grandes
+        // trazem os seus blocos de 128.
+        let header = ListHeader::parse(&merged, true).unwrap();
+        let counts: Vec<u64> = header.entries.iter().map(|e| e.count).collect();
+        assert_eq!(&counts[..3], [100, 150, 128]);
+        assert_eq!(counts.iter().sum::<u64>(), 1200);
+        for (i, p) in full.iter().enumerate().step_by(7) {
+            let mut cursor = PostingsCursor::new(&merged).unwrap();
+            assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p), "entrada {i}");
+        }
         let mut cursor = PostingsCursor::new(&merged).unwrap();
-        assert_eq!(cursor.seek(full[1000].doc).unwrap(), Some(full[1000]));
+        for p in full.iter().step_by(13) {
+            assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p));
+        }
+        // Unir de novo uma lista já unida com mais um pedaço continua certo.
+        let extra = sample_list(300, 77).into_iter().map(|p| Posting { doc: p.doc + full.last().unwrap().doc, ..p }).collect::<Vec<_>>();
+        let again = merge_postings([merged.as_slice(), encode_postings(&extra).as_slice()].into_iter()).unwrap();
+        let mut want_all = full.clone();
+        want_all.extend(extra.iter().copied());
+        assert_eq!(decode_postings(&again).unwrap(), want_all);
+        let mut cursor = PostingsCursor::new(&again).unwrap();
+        assert_eq!(cursor.seek(extra[150].doc).unwrap(), Some(extra[150]));
         // Sobreposição: o pedaço mais novo troca o tf de documentos do meio.
         let newer: Vec<Posting> = full[500..520].iter().map(|p| Posting { tf: p.tf + 10, ..*p }).collect();
         let merged2 = merge_postings([merged.as_slice(), encode_postings(&newer).as_slice()].into_iter()).unwrap();
@@ -1198,7 +1283,35 @@ mod tests {
             .map(|e| pos_bytes(&e.iter().map(|(d, ps)| (*d, ps.as_slice())).collect::<Vec<_>>()))
             .collect();
         let merged = merge_positions(pieces.iter().map(Vec::as_slice)).unwrap();
-        assert_eq!(merged, pos_bytes(&entries.iter().map(|(d, ps)| (*d, ps.as_slice())).collect::<Vec<_>>()));
+        assert_eq!(decode_positions(&merged).unwrap(), entries);
+        let mut cursor = PositionsCursor::new(&merged).unwrap();
+        let mut out = Vec::new();
+        assert!(cursor.seek(entries[700].0, &mut out).unwrap());
+        assert_eq!(out, [1, 5]);
+    }
+
+    /// Com tabelas: unir em agrupamentos diferentes dá tabelas diferentes
+    /// (blocos de tamanhos diferentes), mas o mesmo conteúdo, e os cursores
+    /// acham tudo em qualquer uma delas.
+    #[test]
+    fn merge_with_skip_tables_is_associative_in_content() {
+        let full = sample_list(3000, 11);
+        let cuts = [0, 90, 400, 410, 1300, 2999, 3000];
+        let pieces: Vec<Vec<u8>> = cuts.windows(2).map(|w| encode_postings(&full[w[0]..w[1]])).collect();
+        let slices: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+        let all = merge_postings(slices.iter().copied()).unwrap();
+        for split in 1..slices.len() {
+            let left = merge_postings(slices[..split].iter().copied()).unwrap();
+            let right = merge_postings(slices[split..].iter().copied()).unwrap();
+            let grouped = merge_postings([left.as_slice(), right.as_slice()].into_iter()).unwrap();
+            for list in [&all, &grouped] {
+                assert_eq!(decode_postings(list).unwrap(), full, "split {split}");
+                let mut cursor = PostingsCursor::new(list).unwrap();
+                for p in full.iter().step_by(17) {
+                    assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p), "split {split}");
+                }
+            }
+        }
     }
 
     #[test]

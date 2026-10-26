@@ -27,11 +27,11 @@ use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 4;
+pub const FORMAT_VERSION: u64 = 5;
 /// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
 /// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
 /// ser aberto para escrita.
-const MERGE_OPERATOR: &str = "fire_flower_v4";
+const MERGE_OPERATOR: &str = "fire_flower_v5";
 
 const META_FORMAT: &[u8] = b"meta:format";
 /// `1` se o banco grava posições (`pos:`), `0` se não.

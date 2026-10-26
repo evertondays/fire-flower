@@ -1,0 +1,171 @@
+{
+  "commit": "4d22de8",
+  "db": "/home/evertondays/bench-db/perf-v4-full/ptwiki-10k",
+  "espacos": [
+    {
+      "bytes_chaves": 84626,
+      "bytes_valores": 146629,
+      "chaves": 10000,
+      "espaco": "doc"
+    },
+    {
+      "bytes_chaves": 120,
+      "bytes_valores": 22,
+      "chaves": 8,
+      "espaco": "meta"
+    },
+    {
+      "bytes_chaves": 7902335,
+      "bytes_valores": 4367493,
+      "chaves": 728495,
+      "espaco": "node"
+    },
+    {
+      "bytes_chaves": 123,
+      "bytes_valores": 46901,
+      "chaves": 19,
+      "espaco": "norm"
+    },
+    {
+      "bytes_chaves": 2833890,
+      "bytes_valores": 28127684,
+      "chaves": 288203,
+      "espaco": "pos"
+    },
+    {
+      "bytes_chaves": 3122093,
+      "bytes_valores": 11994678,
+      "chaves": 288203,
+      "espaco": "post"
+    }
+  ],
+  "listas": {
+    "anos": 8589,
+    "area": 10435,
+    "historia": 9040,
+    "parte": 8624,
+    "populacao": 10238
+  },
+  "listas_pos": {
+    "anos": 44580,
+    "area": 26631,
+    "historia": 28992,
+    "parte": 37159,
+    "populacao": 33456
+  },
+  "maiores": [
+    {
+      "bytes": 96770,
+      "chave": "pos:588255",
+      "termo": "sao"
+    },
+    {
+      "bytes": 56206,
+      "chave": "pos:600808",
+      "termo": "ser"
+    },
+    {
+      "bytes": 45527,
+      "chave": "pos:237579",
+      "termo": "era"
+    },
+    {
+      "bytes": 44580,
+      "chave": "pos:51379",
+      "termo": "anos"
+    },
+    {
+      "bytes": 40510,
+      "chave": "pos:299500",
+      "termo": "grande"
+    },
+    {
+      "bytes": 37159,
+      "chave": "pos:501008",
+      "termo": "parte"
+    },
+    {
+      "bytes": 36018,
+      "chave": "pos:491633",
+      "termo": "outros"
+    },
+    {
+      "bytes": 35577,
+      "chave": "pos:413715",
+      "termo": "maior"
+    },
+    {
+      "bytes": 35501,
+      "chave": "pos:614184",
+      "termo": "sobre"
+    },
+    {
+      "bytes": 35418,
+      "chave": "pos:599546",
+      "termo": "sendo"
+    },
+    {
+      "bytes": 34099,
+      "chave": "pos:409053",
+      "termo": "m"
+    },
+    {
+      "bytes": 33456,
+      "chave": "pos:526309",
+      "termo": "populacao"
+    },
+    {
+      "bytes": 33286,
+      "chave": "pos:2029",
+      "termo": "1"
+    },
+    {
+      "bytes": 32918,
+      "chave": "pos:494488",
+      "termo": "pais"
+    },
+    {
+      "bytes": 32402,
+      "chave": "pos:595810",
+      "termo": "seculo"
+    },
+    {
+      "bytes": 32383,
+      "chave": "pos:146597",
+      "termo": "cidade"
+    },
+    {
+      "bytes": 32182,
+      "chave": "pos:216625",
+      "termo": "durante"
+    },
+    {
+      "bytes": 31891,
+      "chave": "pos:473427",
+      "termo": "norte"
+    },
+    {
+      "bytes": 31729,
+      "chave": "pos:33753",
+      "termo": "ainda"
+    },
+    {
+      "bytes": 31654,
+      "chave": "pos:245207",
+      "termo": "estado"
+    }
+  ],
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 6990995456,
+    "ram_total": 8266141696,
+    "swap_usado": 49053696
+  },
+  "nos_trie": 728495,
+  "posicoes": true,
+  "quando": "2026-10-26T14-04-28",
+  "raiz_bytes": 4992,
+  "rotulo": "ptwiki-10k",
+  "tipo": "sizes"
+}

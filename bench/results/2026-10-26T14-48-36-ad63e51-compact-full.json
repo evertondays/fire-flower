@@ -1,0 +1,21 @@
+{
+  "segundos": 5.253156661987305,
+  "banco_antes": 1515666167,
+  "banco_depois": 1503693097,
+  "abertura_antes": {
+    "mediana_s": 0.04178905487060547,
+    "min_s": 0.038424015045166016,
+    "max_s": 1.271719217300415,
+    "execucoes": 5
+  },
+  "abertura_depois": {
+    "mediana_s": 0.027714252471923828,
+    "min_s": 0.027330636978149414,
+    "max_s": 0.030623912811279297,
+    "execucoes": 5
+  },
+  "tipo": "compact",
+  "rotulo": "full",
+  "commit": "ad63e51",
+  "quando": "2026-10-26T14-48-36"
+}

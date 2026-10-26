@@ -2,7 +2,7 @@
 
 Gerado por `python3 scripts/perf.py relatorio --escala full` a partir de `bench/results/`. Cada seção mostra o resultado **mais recente** daquele tipo; as cargas mostram a **mediana** das últimas rodadas do mesmo commit (até 5), com a faixa mín–máx entre parênteses. O plano está em [docs/plano-performance.md](../docs/plano-performance.md).
 
-- Último resultado: `2026-10-26T04-44-21-d088f12-bench-pr-full.json`
+- Último resultado: `2026-10-26T14-56-59-ad63e51-bench-pr-full.json`
 - Máquina: 12 núcleos, 7.883,2 MB de RAM, kernel `6.6.87.2-microsoft-standard-WSL2`
 
 ## Fase 1: corretude
@@ -15,7 +15,7 @@ Gerado por `python3 scripts/perf.py relatorio --escala full` a partir de `bench/
 | `oraculo_100k` | ✅ ok |
 | `reabrir` | ✅ ok |
 
-Idempotência (10k): banco de 55,9 MB após uma carga, 50,6 MB após duas e 50,6 MB depois de compactar.
+Idempotência (10k): banco de 51,4 MB após uma carga, 97,3 MB após duas e 51,5 MB depois de compactar.
 
 **Oráculo `10k-todos`** (10.000 docs, 288.203 termos): zero divergências
 
@@ -89,26 +89,27 @@ Relevância (título → artigo, 1.000 consultas): top-1 99,3%, top-10 100,0%, M
 
 | Fatia | Commit | Rodadas | Tempo | docs/s | MB/s | Pico RSS | Banco | Banco ÷ texto | Nós da Trie | Termos | Write amp | Stalls |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1k | `d088f12` | 5 | 0.7s | 1.415 (1.380–1.445) | 28,6 | 139,3 MB | 16,0 MB | 0,79 | 294.199 | 114.201 | 0,00 | 0,0s |
-| 10k | `d088f12` | 5 | 3.7s | 2.682 (2.514–2.702) | 24,9 | 284,1 MB | 67,7 MB | 0,73 | 728.495 | 288.203 | 0,38 | 0,0s |
-| 100k | `d088f12` | 4 | 27.3s | 3.658 (3.463–3.807) | 17,2 | 472,0 MB | 260,9 MB | 0,55 | 2.118.236 | 870.885 | 1,38 | 0,0s |
-| full | `d088f12` | 2 | 4min02s | 4.590 (4.590–4.609) | 11,1 | 837,5 MB | 1.468,0 MB | 0,54 | 7.295.494 | 3.055.342 | 3,06 | 0,0s |
+| 1k | `ad63e51` | 3 | 0.7s | 1.368 (1.346–1.396) | 27,6 | 138,6 MB | 16,2 MB | 0,80 | 294.199 | 114.201 | 0,00 | 0,0s |
+| 10k | `ad63e51` | 3 | 2.7s | 3.758 (3.711–3.823) | 34,8 | 422,1 MB | 59,8 MB | 0,65 | 728.495 | 288.203 | 0,00 | 0,0s |
+| 100k | `ad63e51` | 1 | 15.4s | 6.481 | 30,5 | 734,8 MB | 267,4 MB | 0,57 | 2.118.236 | 870.885 | 1,28 | 0,0s |
+| full | `ad63e51` | 2 | 1min57s | 9.509 (9.509–9.570) | 23,0 | 1.375,0 MB | 1.494,9 MB | 0,55 | 7.295.494 | 3.055.342 | 3,03 | 0,0s |
 
 ### Experimentos (100k)
 
 | Experimento | docs/s | vs. padrão | Pico RSS | Banco |
 |---|---|---|---|---|
-| padrão (lote 1000) | 3.658 (3.463–3.807) | — | 472,0 MB | 260,9 MB |
-| lote-100 | 1.936 (1.936–2.061) | -47% | 472,8 MB | 257,0 MB |
-| lote-5000 | 5.169 (5.169–5.362) | +41% | 525,7 MB | 283,2 MB |
-| lote-10000 | 5.622 (5.622–5.980) | +54% | 696,4 MB | 479,8 MB |
-| lote-50000 | 6.839 (6.839–7.339) | +87% | 1.332,2 MB | 268,8 MB |
-| ids-remapeados | 3.438 (3.438–3.755) | -6% | 470,1 MB | 252,4 MB |
-| cache-64mb | 3.426 (3.426–3.562) | -6% | 474,0 MB | 260,9 MB |
-| cache-1024mb | 3.480 (3.480–3.590) | -5% | 470,2 MB | 260,9 MB |
-| sem-cache-de-nos | 1.827 (1.827–1.949) | -50% | 305,3 MB | 260,9 MB |
-| sem-posicoes | 4.365 (4.365–4.835) | +19% | 429,3 MB | 111,8 MB |
-| streaming-10k | 494 (494–519) | — | 249,6 MB | 64,7 MB |
+| padrão (lote 10000) | 6.481 | — | 734,8 MB | 267,4 MB |
+| lote-100 | 2.255 | -65% | 618,7 MB | 270,7 MB |
+| lote-5000 | 5.880 | -9% | 731,5 MB | 283,6 MB |
+| lote-10000 | 5.622 (5.622–5.980) | -13% | 696,4 MB | 479,8 MB |
+| lote-50000 | 7.666 | +18% | 1.328,8 MB | 290,2 MB |
+| ids-remapeados | 6.525 | +1% | 733,3 MB | 259,0 MB |
+| cache-64mb | 6.612 | +2% | 735,2 MB | 267,4 MB |
+| cache-1024mb | 6.533 | +1% | 734,1 MB | 267,4 MB |
+| sem-cache-de-nos | 4.857 | -25% | 545,1 MB | 269,4 MB |
+| sem-posicoes | 8.475 | +31% | 717,2 MB | 123,1 MB |
+| streaming-10k | 623 | — | 221,2 MB | 80,7 MB |
+| lote-1000 | 4.283 | -34% | 660,1 MB | 266,5 MB |
 
 ### Tamanhos (full)
 
@@ -118,60 +119,60 @@ Relevância (título → artigo, 1.000 consultas): top-1 99,3%, top-10 100,0%, M
 | `meta:` | 8 | 0,0 | 0,0 |
 | `node:` | 7.295.494 | 82,4 | 47,0 |
 | `norm:` | 7.025 | 0,1 | 4,7 |
-| `pos:` | 3.055.342 | 31,5 | 846,6 |
-| `post:` | 3.055.342 | 34,4 | 422,0 |
+| `pos:` | 3.055.342 | 31,5 | 857,5 |
+| `post:` | 3.055.342 | 34,4 | 432,7 |
 
-Raiz (`node:0`): 37.485 bytes. Listas: "anos" 465,4 KB, "area" 361,9 KB, "historia" 395,3 KB, "parte" 368,4 KB, "populacao" 243,2 KB
+Raiz (`node:0`): 37.494 bytes. Listas: "anos" 474,6 KB, "area" 368,9 KB, "historia" 403,0 KB, "parte" 375,6 KB, "populacao" 248,0 KB
 
 ## Fase 4: latência de busca (full, cache quente, 1 thread)
 
 | Conjunto | p50 | p95 | p99 | máx | qps | resultados (média) | Gets/consulta | block reads/consulta |
 |---|---|---|---|---|---|---|---|---|
-| `and-2` | 44 µs | 75 µs | 93 µs | 150 µs | 20.560 | 3,4 | 13,1 | 0,00 |
-| `and-3` | 65 µs | 98 µs | 124 µs | 197 µs | 14.394 | 0,0 | 19,7 | 0,00 |
-| `and-5` | 110 µs | 146 µs | 165 µs | 297 µs | 8.719 | 0,0 | 33,1 | 0,00 |
-| `and-freq` | 1,9 ms | 2,8 ms | 3,9 ms | 6,4 ms | 518 | 27.692,5 | 10,2 | 0,00 |
-| `and-raro-freq` | 410 µs | 566 µs | 995 µs | 1,1 ms | 2.274 | 0,5 | 11,1 | 0,00 |
-| `frase-2` | 928 µs | 5,4 ms | 10,7 ms | 20,3 ms | 626 | 6.420,9 | 13,2 | 3,69 |
-| `frase-3` | 1,1 ms | 5,9 ms | 10,1 ms | 14,1 ms | 572 | 736,8 | 19,5 | 6,45 |
-| `frase-freq` | 4,1 ms | 17,0 ms | 17,4 ms | 24,7 ms | 180 | 46.443,2 | 12,0 | 0,76 |
-| `frase-miss` | 947 µs | 5,3 ms | 9,1 ms | 17,9 ms | 631 | 37,7 | 13,3 | 4,04 |
-| `frase-stop` | 1,3 ms | 4,8 ms | 6,9 ms | 10,7 ms | 592 | 1.749,4 | 13,6 | 4,33 |
-| `misto` | 55 µs | 1,9 ms | 4,2 ms | 12,0 ms | 2.665 | 2.847,8 | 62,3 | 0,34 |
-| `p-1` | 5,1 ms | 12,5 ms | 30,5 ms | 31,5 ms | 175 | 160.037,6 | 504,9 | 0,00 |
-| `p-2` | 4,4 ms | 8,1 ms | 10,3 ms | 13,4 ms | 212 | 78.483,4 | 797,0 | 112,15 |
-| `p-4` | 1,0 ms | 5,5 ms | 8,5 ms | 11,5 ms | 538 | 21.832,8 | 421,4 | 44,69 |
-| `p-raro` | 29 µs | 63 µs | 81 µs | 118 µs | 28.409 | 22,2 | 12,0 | 0,00 |
-| `rank-and` | 542 µs | 2,4 ms | 3,9 ms | 9,0 ms | 1.235 | 4.296,9 | 16,9 | 0,06 |
-| `rank-freq` | 976 µs | 2,5 ms | 3,6 ms | 4,2 ms | 845 | 149.212,6 | 7,1 | 0,00 |
-| `rank-titulos` | 107 µs | 1,1 ms | 1,9 ms | 2,9 ms | 3.341 | 374,1 | 16,8 | 0,00 |
-| `s-1` | 29 µs | 40 µs | 49 µs | 169 µs | 32.705 | 10,0 | 0,0 | 0,00 |
-| `s-2` | 52 µs | 79 µs | 97 µs | 135 µs | 17.856 | 10,0 | 13,8 | 0,00 |
-| `s-4` | 71 µs | 138 µs | 263 µs | 525 µs | 12.402 | 9,3 | 26,6 | 0,00 |
-| `s-raro` | 22 µs | 48 µs | 68 µs | 98 µs | 37.114 | 2,3 | 9,8 | 0,00 |
-| `t-freq` | 329 µs | 445 µs | 722 µs | 745 µs | 2.816 | 144.573,2 | 4,0 | 0,00 |
-| `t-len-15` | 34 µs | 48 µs | 63 µs | 89 µs | 25.972 | 586,4 | 14,0 | 0,00 |
-| `t-len-3` | 11 µs | 23 µs | 38 µs | 69 µs | 69.944 | 903,3 | 2,0 | 0,00 |
-| `t-len-8` | 23 µs | 40 µs | 55 µs | 72 µs | 36.625 | 931,1 | 7,0 | 0,00 |
-| `t-medio` | 23 µs | 41 µs | 55 µs | 79 µs | 38.372 | 880,9 | 6,6 | 0,00 |
-| `t-miss` | 7 µs | 23 µs | 29 µs | 55 µs | 87.627 | 0,0 | 3,4 | 0,00 |
-| `t-raro` | 18 µs | 33 µs | 45 µs | 70 µs | 45.547 | 1,7 | 6,9 | 0,00 |
-| `titulos` | 93 µs | 1,1 ms | 1,8 ms | 2,3 ms | 3.610 | 374,1 | 13,8 | 0,00 |
+| `and-2` | 33 µs | 59 µs | 84 µs | 130 µs | 26.844 | 3,4 | 9,3 | 0,00 |
+| `and-3` | 48 µs | 74 µs | 93 µs | 137 µs | 19.200 | 0,0 | 13,9 | 0,00 |
+| `and-5` | 81 µs | 112 µs | 125 µs | 234 µs | 11.726 | 0,0 | 23,5 | 0,00 |
+| `and-freq` | 2,0 ms | 2,7 ms | 3,3 ms | 4,8 ms | 509 | 27.692,5 | 6,2 | 0,00 |
+| `and-raro-freq` | 28 µs | 45 µs | 58 µs | 109 µs | 32.344 | 0,5 | 7,5 | 0,00 |
+| `frase-2` | 496 µs | 5,4 ms | 10,9 ms | 20,2 ms | 733 | 6.420,9 | 9,6 | 3,19 |
+| `frase-3` | 313 µs | 4,4 ms | 10,0 ms | 14,3 ms | 1.008 | 736,8 | 14,3 | 5,82 |
+| `frase-freq` | 4,1 ms | 19,1 ms | 19,4 ms | 21,8 ms | 175 | 46.443,2 | 8,7 | 0,82 |
+| `frase-miss` | 504 µs | 5,4 ms | 9,6 ms | 17,2 ms | 758 | 37,7 | 9,7 | 3,33 |
+| `frase-stop` | 785 µs | 4,9 ms | 7,0 ms | 11,3 ms | 696 | 1.749,4 | 9,8 | 3,83 |
+| `misto` | 36 µs | 1,6 ms | 3,1 ms | 6,5 ms | 4.196 | 2.847,8 | 58,8 | 0,05 |
+| `p-1` | 3,4 ms | 8,7 ms | 26,6 ms | 26,9 ms | 253 | 160.037,6 | 256,0 | 0,00 |
+| `p-2` | 3,2 ms | 6,0 ms | 7,1 ms | 10,5 ms | 308 | 78.483,4 | 596,9 | 61,91 |
+| `p-4` | 834 µs | 4,4 ms | 6,3 ms | 9,1 ms | 692 | 21.832,8 | 419,1 | 20,05 |
+| `p-raro` | 25 µs | 60 µs | 78 µs | 121 µs | 31.683 | 22,2 | 9,0 | 0,00 |
+| `rank-and` | 412 µs | 2,3 ms | 4,0 ms | 9,4 ms | 1.391 | 4.296,9 | 12,4 | 0,03 |
+| `rank-freq` | 917 µs | 2,4 ms | 3,5 ms | 4,3 ms | 896 | 149.212,6 | 5,5 | 0,00 |
+| `rank-titulos` | 63 µs | 960 µs | 1,9 ms | 2,9 ms | 4.833 | 374,1 | 12,2 | 0,00 |
+| `s-1` | 23 µs | 32 µs | 39 µs | 56 µs | 40.856 | 10,0 | 0,0 | 0,00 |
+| `s-2` | 12 µs | 22 µs | 52 µs | 110 µs | 67.109 | 10,0 | 0,5 | 0,00 |
+| `s-4` | 63 µs | 123 µs | 224 µs | 471 µs | 13.727 | 9,3 | 25,6 | 0,00 |
+| `s-raro` | 17 µs | 43 µs | 62 µs | 133 µs | 46.048 | 2,3 | 6,7 | 0,00 |
+| `t-freq` | 328 µs | 443 µs | 725 µs | 750 µs | 2.824 | 144.573,2 | 2,4 | 0,00 |
+| `t-len-15` | 28 µs | 40 µs | 49 µs | 69 µs | 31.394 | 586,4 | 12,0 | 0,00 |
+| `t-len-3` | 8 µs | 18 µs | 33 µs | 68 µs | 90.150 | 903,3 | 1,0 | 0,00 |
+| `t-len-8` | 17 µs | 34 µs | 50 µs | 64 µs | 45.893 | 931,1 | 5,0 | 0,00 |
+| `t-medio` | 18 µs | 35 µs | 53 µs | 67 µs | 46.661 | 880,9 | 4,7 | 0,00 |
+| `t-miss` | 1 µs | 20 µs | 26 µs | 47 µs | 131.679 | 0,0 | 1,9 | 0,00 |
+| `t-raro` | 14 µs | 26 µs | 37 µs | 59 µs | 59.221 | 1,7 | 5,0 | 0,00 |
+| `titulos` | 51 µs | 802 µs | 1,5 ms | 1,9 ms | 5.866 | 374,1 | 9,2 | 0,00 |
 
-<sub>2026-10-26T04-32-45-d088f12-bench-full-t1.json</sub>
+<sub>2026-10-26T14-49-45-ad63e51-bench-full-t1.json</sub>
 
 ### Merge pendente vs. compactado
 
 | Conjunto | p50 antes | p50 depois | p99 antes | p99 depois | merges/consulta antes |
 |---|---|---|---|---|---|
-| `t-freq` | 677 µs | 329 µs | 1,5 ms | 722 µs | 5,0 |
-| `titulos` | 168 µs | 93 µs | 3,2 ms | 1,8 ms | 10,0 |
-| `and-freq` | 2,3 ms | 1,9 ms | 5,2 ms | 3,9 ms | 1,3 |
-| `rank-freq` | 1,1 ms | 976 µs | 4,1 ms | 3,6 ms | 0,5 |
-| `frase-2` | 1,5 ms | 928 µs | 14,6 ms | 10,7 ms | 2,8 |
-| `frase-freq` | 6,2 ms | 4,1 ms | 25,3 ms | 17,4 ms | 3,1 |
+| `t-freq` | 399 µs | 328 µs | 902 µs | 725 µs | 4,5 |
+| `titulos` | 95 µs | 51 µs | 1,7 ms | 1,5 ms | 9,0 |
+| `and-freq` | 2,1 ms | 2,0 ms | 5,3 ms | 3,3 ms | 1,9 |
+| `rank-freq` | 950 µs | 917 µs | 3,7 ms | 3,5 ms | 0,7 |
+| `frase-2` | 640 µs | 496 µs | 12,1 ms | 10,9 ms | 3,0 |
+| `frase-freq` | 4,5 ms | 4,1 ms | 25,7 ms | 19,4 ms | 3,2 |
 
-Compactação: 8.7s, banco de 1.433,7 MB → 1.411,4 MB. Abrir o banco + 1 busca: 38 ms antes, 29 ms depois (mediana de 5).
+Compactação: 5.3s, banco de 1.445,5 MB → 1.434,0 MB. Abrir o banco + 1 busca: 42 ms antes, 28 ms depois (mediana de 5).
 
 ### Block cache (p50)
 
@@ -179,10 +180,10 @@ O cache LRU se divide em 64 partes. Um bloco maior que uma parte (cache ÷ 64) n
 
 | Conjunto | 64 MB | 256 MB | 1024 MB |
 |---|---|---|---|
-| `t-medio` | 20 µs | 23 µs | 20 µs |
-| `titulos` | 105 µs | 93 µs | 83 µs |
-| `misto` | 72 µs | 55 µs | 48 µs |
-| `p-2` | 5,0 ms | 4,4 ms | 3,7 ms |
+| `t-medio` | 15 µs | 18 µs | 15 µs |
+| `titulos` | 63 µs | 51 µs | 43 µs |
+| `misto` | 52 µs | 36 µs | 32 µs |
+| `p-2` | 3,4 ms | 3,2 ms | 2,5 ms |
 
 ## Fase 5: concorrência
 
@@ -190,19 +191,19 @@ O cache LRU se divide em 64 partes. Um bloco maior que uma parte (cache ÷ 64) n
 
 | Threads | qps | ganho vs. 1 | p50 | p99 |
 |---|---|---|---|---|
-| 1 | 2.731 | 1,0× | 52 µs | 3,9 ms |
-| 2 | 3.283 | 1,2× | 62 µs | 5,0 ms |
-| 4 | 6.209 | 2,3× | 58 µs | 4,3 ms |
-| 8 | 10.377 | 3,8× | 74 µs | 4,8 ms |
-| 12 | 11.873 | 4,3× | 85 µs | 6,7 ms |
+| 1 | 4.512 | 1,0× | 31 µs | 2,8 ms |
+| 2 | 5.445 | 1,2× | 31 µs | 2,7 ms |
+| 4 | 9.608 | 2,1× | 32 µs | 2,9 ms |
+| 8 | 15.386 | 3,4× | 39 µs | 3,5 ms |
+| 12 | 19.521 | 4,3× | 52 µs | 4,5 ms |
 
 ### Leitura durante escrita (carga dos últimos 10% da fatia)
 
 | Leitores | p50 sem escrita | p50 com escrita | p99 sem escrita | p99 com escrita | indexação docs/s | stalls |
 |---|---|---|---|---|---|---|
-| 1 | 79 µs | 139 µs | 5,9 ms | 8,6 ms | 3.767 | 0,0s |
-| 4 | 81 µs | 132 µs | 5,4 ms | 7,6 ms | 3.203 | 0,0s |
-| 8 | 105 µs | 168 µs | 7,2 ms | 10,0 ms | 2.427 | 0,0s |
+| 1 | 48 µs | 96 µs | 3,8 ms | 5,7 ms | 4.392 | 0,0s |
+| 4 | 46 µs | 88 µs | 2,9 ms | 4,2 ms | 3.442 | 0,0s |
+| 8 | 66 µs | 116 µs | 3,7 ms | 5,5 ms | 2.584 | 0,0s |
 
 ## Frases e ranking (formato v2)
 
@@ -210,12 +211,12 @@ Plano em [docs/plano-frases-e-ranking.md](../docs/plano-frases-e-ranking.md). A 
 
 | Métrica | Linha de base (v1) | Agora | Meta |
 |---|---|---|---|
-| Carga full com posições | — | 4.590 (4.590–4.609) docs/s | queda ≤ 30% |
-| Banco ÷ texto logo após a carga, com posições | — | 0,54 | registrar |
-| Banco compactado ÷ texto, com posições | — | 0,52 (1.411,4 MB) | registrar |
-| Pico de RSS na carga, com posições | — | 837,5 MB | |
-| p50 de `rank-freq` ÷ p50 de `t-freq` | — | 2,97× | ≤ 2× |
-| p50 de `frase-2` | — | 928 µs | registrar |
+| Carga full com posições | — | 9.509 (9.509–9.570) docs/s | queda ≤ 30% |
+| Banco ÷ texto logo após a carga, com posições | — | 0,55 | registrar |
+| Banco compactado ÷ texto, com posições | — | 0,53 (1.434,0 MB) | registrar |
+| Pico de RSS na carga, com posições | — | 1.375,0 MB | |
+| p50 de `rank-freq` ÷ p50 de `t-freq` | — | 2,80× | ≤ 2× |
+| p50 de `frase-2` | — | 496 µs | registrar |
 | Título → artigo (MRR) | — | 0,996 (top-1 99,3%, top-10 100,0%) | registrar e acompanhar |
 
 ### Espaço por tipo de chave (full, valores lógicos)
@@ -226,26 +227,26 @@ Plano em [docs/plano-frases-e-ranking.md](../docs/plano-frases-e-ranking.md). A 
 | `meta:` | 0,0 | 0,0 |
 | `node:` | 129,5 | 35,4 |
 | `norm:` | 4,7 | 0,4 |
-| `pos:` | 878,1 | — |
-| `post:` | 456,5 | 70,8 |
+| `pos:` | 889,0 | — |
+| `post:` | 467,1 | 72,5 |
 
 ### Ranking: top 10 vs. todos os IDs (full, p50)
 
 | Consulta | Sem ranking | Top 10 (BM25) | Razão |
 |---|---|---|---|
-| `t-freq` / `rank-freq` | 329 µs | 976 µs | 2,97× |
-| `and-2` / `rank-and` | 44 µs | 542 µs | 12,42× |
-| `titulos` / `rank-titulos` | 93 µs | 107 µs | 1,15× |
+| `t-freq` / `rank-freq` | 328 µs | 917 µs | 2,80× |
+| `and-2` / `rank-and` | 33 µs | 412 µs | 12,51× |
+| `titulos` / `rank-titulos` | 51 µs | 63 µs | 1,23× |
 
 ### Frases (full)
 
 | Conjunto | p50 | p95 | p99 | resultados (média) | Gets/consulta |
 |---|---|---|---|---|---|
-| `frase-2` | 928 µs | 5,4 ms | 10,7 ms | 6.420,9 | 13,2 |
-| `frase-3` | 1,1 ms | 5,9 ms | 10,1 ms | 736,8 | 19,5 |
-| `frase-stop` | 1,3 ms | 4,8 ms | 6,9 ms | 1.749,4 | 13,6 |
-| `frase-freq` | 4,1 ms | 17,0 ms | 17,4 ms | 46.443,2 | 12,0 |
-| `frase-miss` | 947 µs | 5,3 ms | 9,1 ms | 37,7 | 13,3 |
+| `frase-2` | 496 µs | 5,4 ms | 10,9 ms | 6.420,9 | 9,6 |
+| `frase-3` | 313 µs | 4,4 ms | 10,0 ms | 736,8 | 14,3 |
+| `frase-stop` | 785 µs | 4,9 ms | 7,0 ms | 1.749,4 | 9,8 |
+| `frase-freq` | 4,1 ms | 19,1 ms | 19,4 ms | 46.443,2 | 8,7 |
+| `frase-miss` | 504 µs | 5,4 ms | 9,6 ms | 37,7 | 9,7 |
 
 ## Relevância (100k)
 
@@ -278,7 +279,7 @@ Exemplos de erro (até 3 por conjunto):
 | `rel-manual` | `brasi*` | Brasil | 5º | Brasileiros · Brasiguaios · Brasília |
 | `rel-manual` | `lula` | Luiz Inácio Lula da Silva | 6º | Lula (desambiguação) · Lula-colossal · Lula-gigante |
 
-<sub>2026-10-26T04-25-37-d088f12-relevancia-100k.json</sub>
+<sub>2026-10-26T14-45-03-ad63e51-relevancia-100k.json</sub>
 
 ## Metas (linha de base em full)
 
@@ -286,11 +287,11 @@ Exemplos de erro (até 3 por conjunto):
 |---|---|---|
 | Divergências do oráculo | 0 | **0** |
 | Carga sem swap (aumento < 64 MB) | sim | **sim** |
-| docs/s na carga de full | 4.590 | |
-| Banco ÷ texto bruto | 0,54 | |
-| p99 de `titulos` (quente) | 1,8 ms | |
-| p99 de `t-freq` (quente) | 722 µs | |
-| p99 de `misto` com indexação em paralelo | 7,6 ms | |
-| Abrir o banco + 1 busca (após a carga) | 38 ms | |
-| p50 de `rank-freq` ÷ p50 de `t-freq` | 2,97× | **≤ 2×** |
-| p50 de `frase-2` | 928 µs | |
+| docs/s na carga de full | 9.509 | |
+| Banco ÷ texto bruto | 0,55 | |
+| p99 de `titulos` (quente) | 1,5 ms | |
+| p99 de `t-freq` (quente) | 725 µs | |
+| p99 de `misto` com indexação em paralelo | 4,2 ms | |
+| Abrir o banco + 1 busca (após a carga) | 42 ms | |
+| p50 de `rank-freq` ÷ p50 de `t-freq` | 2,80× | **≤ 2×** |
+| p50 de `frase-2` | 496 µs | |

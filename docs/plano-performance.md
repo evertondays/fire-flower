@@ -9,8 +9,14 @@ leva **4 minutos** (1.112.246 artigos em 242 s, sem colapso), e o
 `perf.py tudo --escala full`, 31 minutos. A análise detalhada da última rodada
 está em [bench/ANALISE-full-vs-100k.md](../bench/ANALISE-full-vs-100k.md).
 
-O que falta é a parte de **otimização dirigida por profiling** (seção 8): as
-medições já mostram onde está o custo, mas ainda não o que dentro dele.
+**Progresso na branch `performance-issues-in-v3-version` (commit `ad63e51`,
+formato v5):** carga inteira em **116 s** (−52%), E de termo raro com frequente
+−93%, frases −38% a −72%, títulos −44%, 19,5 mil consultas/s com 12 threads,
+zero divergências. P1, P2 e P5 (saltos) feitos; P3 parcial; P4 encerrado (o
+limite é a máquina). Detalhes em
+[bench/PROGRESSO-performance.md](../bench/PROGRESSO-performance.md). O que
+falta tem uma causa comum: ler listas inteiras de termos muito frequentes
+(block-max no top-k, frases de termos frequentes, prefixos de 1–2 letras).
 
 ---
 
@@ -217,18 +223,18 @@ demais com `search` (todos os IDs).
 | # | Achado | Situação |
 |---|---|---|
 | 1 | Corretude: zero divergências em todos os oráculos, em todas as rodadas | mantido a cada PR |
-| 2 | Prefixo incompleto é a regra: metade dos prefixos sorteados casa mais de 256 termos | aberto (por projeto); P3 resolveria |
-| 3 | Custo por letra confirmado (~1 µs por letra); prefixos curtos fazem 500–800 leituras | aberto; P3 |
-| 4 | Merge pendente pesa: sem compactar, termo frequente, títulos e frases ficam 30–50% mais lentos (full: `t-freq` 677 → 329 µs); compactar a full leva 8,7 s | aberto; P2 (compactar no fim da carga) |
+| 2 | Prefixo incompleto é a regra: metade dos prefixos sorteados casa mais de 256 termos | aberto (por projeto); o índice ordenado mudaria a ordem (mais curtos primeiro) |
+| 3 | Custo por letra confirmado (~1 µs por letra); prefixos curtos fazem 500–800 leituras | parcial: `MultiGet` por nível e cache até a profundidade 4 (`p-2` −28%) |
+| 4 | Merge pendente pesa: sem compactar, termo frequente, títulos e frases ficam 30–50% mais lentos (full: `t-freq` 677 → 329 µs); compactar a full leva 8,7 s | ✅ compactar no fim por padrão; v5 deixou o merge pendente mais barato que o do v3 (`t-freq` antes de compactar 677 → 399 µs); compactar leva 5,3 s |
 | 5 | **Colapso da carga inteira** (de ~5.000 para ~200 artigos/s em 200k, 500k ou 600k): filtro de Bloom de ~6 MB num bloco só, maior que uma parte do block cache, relido a cada leitura (22 TB contados) | ✅ resolvido com filtros particionados (`a9009c7`); vigiado por `perf.py carga-longa` e pelo teste `bloom_filters_larger_than_a_cache_shard_...` |
-| 6 | Lotes maiores indexam muito mais rápido (lote de 10 mil: +63% no 100k) | aberto; P2 |
-| 7 | A carga perde velocidade até ~400k e depois fica plana em ~10 MB/s; o commit sobe de 63% para 80% do tempo e as leituras do escritor, de 7 para 15–18 por artigo (Trie com 7,3 M nós, cache do escritor com 1 M) | aberto; P1, P2 |
-| 8 | A concorrência escala pouco: 4,3× com 12 threads (era 6,3× no 10k do formato v2) | aberto; P4 |
-| 9 | Na full, o banco (1,4 GB) não cabe no block cache de 256 MB: frases leem 4–6 blocos de fora do cache por consulta e `p-2`, 112 | aberto; P6 |
-| 10 | Listas longas custam ~2 ns por documento em qualquer escala (termo frequente, frases, ranking) | aberto; P5 |
+| 6 | Lotes maiores indexam muito mais rápido (lote de 10 mil: +63% no 100k) | ✅ lote padrão de 10 mil |
+| 7 | A carga perde velocidade até ~400k e depois fica plana em ~10 MB/s; o commit sobe de 63% para 80% do tempo e as leituras do escritor, de 7 para 15–18 por artigo (Trie com 7,3 M nós, cache do escritor com 1 M) | ✅ descarte por recência + cache de 3 M nós: carga plana, 116 s |
+| 8 | A concorrência escala pouco: 4,3× com 12 threads (era 6,3× no 10k do formato v2) | encerrado: o RocksDB puro escala 5,5× nesta máquina; 19,5 mil qps (4,3×) |
+| 9 | Na full, o banco (1,4 GB) não cabe no block cache de 256 MB: frases leem 4–6 blocos de fora do cache por consulta e `p-2`, 112 | registrado: 1 GB tira mais 10–20%; padrão mantido em 256 MB |
+| 10 | Listas longas custam ~2 ns por documento em qualquer escala (termo frequente, frases, ranking) | parcial: E e frases saltam blocos; listas inteiras (`t-freq`, `frase-freq`) iguais |
 | 11 | Indexar em paralelo sobe o p50 das buscas em 60–75% na full; a indexação perde 18–47% de velocidade com leitores | registrar |
 | 12 | Posições são 58% do banco (`pos:` 878 MB de 1,5 GB); o banco compactado tem 0,52× o texto | registrar |
-| 13 | O detector de colapso dá falso positivo com lotes maiores que a janela (lote de 50 mil) | aberto; H1 |
+| 13 | O detector de colapso dá falso positivo com lotes maiores que a janela (lote de 50 mil) | ✅ janelas agrupadas por lote |
 
 ---
 
@@ -330,22 +336,22 @@ razão piora quando a busca simples melhora. No lugar, latência absoluta:
 
 Linha de base: rodada `tudo --escala full` de 26/10/2026, commit `d088f12`.
 
-| Métrica | Linha de base (full) | Meta |
-|---|---|---|
-| Divergências do oráculo | 0 | **0** (fixa) |
-| Carga total sem swap e sem colapso | sim | **sim** (fixa) |
-| Tempo da carga total | 242 s (11,1 MB/s) | ≤ 180 s (P2) |
-| Pico de RSS na carga total | 838 MB | ≤ 1,5 GB |
-| Banco compactado ÷ texto | 0,52 | ≤ 0,55 |
-| p50 / p99 de `titulos` | 93 µs / 1,8 ms | p99 ≤ 1 ms |
-| p50 / p99 de `rank-titulos` | 107 µs / 1,9 ms | p99 ≤ 1 ms |
-| p50 / p99 de `t-freq` | 329 / 722 µs | registrar (P5) |
-| p50 de `rank-freq` | 976 µs | ≤ 300 µs (P5) |
-| p50 / p99 de `p-2` | 4,4 / 10,3 ms | ≤ 1 / 5 ms (P3) |
-| p50 / p99 de `frase-freq` | 4,1 / 17,4 ms | p50 ≤ 1 ms (P5) |
-| `misto` com 12 threads | 11.873 qps (4,3×) | ≥ 7× (P4) |
-| p99 de `misto` com indexação em paralelo (4 leitores) | 7,6 ms | ≤ 5 ms |
-| Abrir o banco + 1 busca | 38 ms (29 ms compactado) | registrar |
+| Métrica | Linha de base (full) | Meta | `ad63e51` |
+|---|---|---|---|
+| Divergências do oráculo | 0 | **0** (fixa) | 0 ✅ |
+| Carga total sem swap e sem colapso | sim | **sim** (fixa) | sim ✅ |
+| Tempo da carga total | 242 s (11,1 MB/s) | ≤ 180 s (P2) | 116 s ✅ |
+| Pico de RSS na carga total | 838 MB | ≤ 1,5 GB | 1.370 MB ✅ |
+| Banco compactado ÷ texto | 0,52 | ≤ 0,55 | 0,53 ✅ |
+| p50 / p99 de `titulos` | 93 µs / 1,8 ms | p99 ≤ 1 ms | 51 µs / 1,5 ms ❌ |
+| p50 / p99 de `rank-titulos` | 107 µs / 1,9 ms | p99 ≤ 1 ms | 63 µs / 1,9 ms ❌ |
+| p50 / p99 de `t-freq` | 329 / 722 µs | registrar (P5) | 328 / 725 µs |
+| p50 de `rank-freq` | 976 µs | ≤ 300 µs (P5) | 917 µs ❌ |
+| p50 / p99 de `p-2` | 4,4 / 10,3 ms | ≤ 1 / 5 ms (P3) | 3,2 / 7,1 ms ❌ |
+| p50 / p99 de `frase-freq` | 4,1 / 17,4 ms | p50 ≤ 1 ms (P5) | 4,1 / 19,4 ms ❌ |
+| `misto` com 12 threads | 11.873 qps (4,3×) | ≥ 7× (P4) | 19.521 qps (4,3×); inviável aqui |
+| p99 de `misto` com indexação em paralelo (4 leitores) | 7,6 ms | ≤ 5 ms | 4,2 ms ✅ |
+| Abrir o banco + 1 busca | 38 ms (29 ms compactado) | registrar | 28 ms compactado |
 
 ---
 
@@ -362,9 +368,11 @@ Linha de base: rodada `tudo --escala full` de 26/10/2026, commit `d088f12`.
 - [x] Linha de base salva (`bench/baseline-pr-100k.json`, `bench/baseline-pr-full.json`)
 - [x] Colapso da carga inteira corrigido e com cenário de teste
 - [ ] Latência com cache frio (H4)
-- [ ] P1: divisão do tempo do commit + flamegraph de carga e busca
-- [ ] P2: lote, cache de nós e compactação no fim
-- [ ] P3: índice ordenado de termos para prefixos
-- [ ] P4: concorrência ≥ 7× com 12 threads
-- [ ] P5: listas em blocos com saltos
-- [ ] H1–H3: detector, conjunto fixo, oráculo e relevância na full
+- [x] P1: divisão do tempo do commit (`CommitStats`, no monitor do `wiki load`)
+- [x] P2: lote, cache de nós e compactação no fim
+- [ ] P3: prefixos curtos (parcial: `MultiGet` e cache até a profundidade 4)
+- [x] P4: concorrência medida; limite é a máquina (RocksDB puro 5,5×)
+- [x] P5: listas em blocos com saltos (formato v5)
+- [ ] Block-max no top-k e frases de termos frequentes
+- [x] H1: detector de colapso por lote
+- [ ] H2–H3: conjunto fixo, oráculo e relevância na full

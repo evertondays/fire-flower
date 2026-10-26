@@ -1,0 +1,83 @@
+{
+  "batch": 1000,
+  "commit": "4d22de8-modificado",
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki.jsonl",
+  "db": "/home/evertondays/bench-db/perf-v4-full/tmp-concorrencia",
+  "escrita_antes": {
+    "block_cache_hit": 14233344,
+    "block_cache_miss": 142784,
+    "bloom_util": 8250850,
+    "bytes_compactacao": 734775990,
+    "bytes_escritos_usuario": 0,
+    "bytes_flush": 0,
+    "stall_micros": 0,
+    "write_amp": 0.0
+  },
+  "escrita_depois": {
+    "block_cache_hit": 39038364,
+    "block_cache_miss": 384397,
+    "bloom_util": 28643426,
+    "bytes_compactacao": 1564929755,
+    "bytes_escritos_usuario": 311886603,
+    "bytes_flush": 183010833,
+    "stall_micros": 0,
+    "write_amp": 5.604410613302297
+  },
+  "indexacao": {
+    "bytes": 301448081,
+    "docs": 111225,
+    "docs_por_s": 3767.3021573337815,
+    "segundos": 29.523779977
+  },
+  "leitura_com_escrita": {
+    "block_reads_por_consulta": 0.12095652934828052,
+    "bloom_util_por_consulta": 85.57986796433676,
+    "cache_hits_por_consulta": 97.30307921167514,
+    "conjunto": "misto",
+    "consultas": 205702,
+    "gets_por_consulta": 38.541817775228246,
+    "max_us": 19112.391,
+    "media_us": 569.5670476222886,
+    "merge_us_por_consulta": 0.0,
+    "merges_por_consulta": 17.54749589211578,
+    "modo": "com escrita",
+    "p50_us": 113.999,
+    "p95_us": 2359.214,
+    "p99_us": 6079.131,
+    "qps": 6967.332779212169,
+    "resultados_media": 1811.9637388066233,
+    "threads": 4
+  },
+  "leitura_sem_escrita": {
+    "block_reads_por_consulta": 0.230369085954917,
+    "bloom_util_por_consulta": 55.237927548554254,
+    "cache_hits_por_consulta": 95.19143865192912,
+    "conjunto": "misto",
+    "consultas": 149369,
+    "gets_por_consulta": 38.28540058512811,
+    "max_us": 23002.97,
+    "media_us": 397.8628101948865,
+    "merge_us_por_consulta": 0.0,
+    "merges_por_consulta": 6.072545173362612,
+    "modo": "sem escrita",
+    "p50_us": 59.42,
+    "p95_us": 1769.89,
+    "p99_us": 4314.231,
+    "qps": 9957.933333333332,
+    "resultados_media": 1753.66741425597,
+    "threads": 4
+  },
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 6504292352,
+    "ram_total": 8266141696,
+    "swap_usado": 246382592
+  },
+  "quando": "2026-10-26T14-21-35",
+  "rotulo": "full-misto-t4",
+  "skip": 1001021,
+  "take": null,
+  "threads": 4,
+  "tipo": "concurrent"
+}

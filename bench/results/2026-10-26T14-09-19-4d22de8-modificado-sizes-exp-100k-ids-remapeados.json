@@ -1,0 +1,171 @@
+{
+  "commit": "4d22de8-modificado",
+  "db": "/home/evertondays/bench-db/perf-v4-full/exp-100k-ids-remapeados",
+  "espacos": [
+    {
+      "bytes_chaves": 888895,
+      "bytes_valores": 1482652,
+      "chaves": 100000,
+      "espaco": "doc"
+    },
+    {
+      "bytes_chaves": 120,
+      "bytes_valores": 24,
+      "chaves": 8,
+      "espaco": "meta"
+    },
+    {
+      "bytes_chaves": 24307722,
+      "bytes_valores": 12771263,
+      "chaves": 2118236,
+      "espaco": "node"
+    },
+    {
+      "bytes_chaves": 676,
+      "bytes_valores": 446320,
+      "chaves": 98,
+      "espaco": "norm"
+    },
+    {
+      "bytes_chaves": 9088449,
+      "bytes_valores": 142634132,
+      "chaves": 870885,
+      "espaco": "pos"
+    },
+    {
+      "bytes_chaves": 9959334,
+      "bytes_valores": 62212507,
+      "chaves": 870885,
+      "espaco": "post"
+    }
+  ],
+  "listas": {
+    "anos": 56721,
+    "area": 93604,
+    "historia": 55259,
+    "parte": 53296,
+    "populacao": 50536
+  },
+  "listas_pos": {
+    "anos": 241541,
+    "area": 191989,
+    "historia": 163262,
+    "parte": 182168,
+    "populacao": 136212
+  },
+  "maiores": [
+    {
+      "bytes": 436277,
+      "chave": "pos:588255",
+      "termo": "sao"
+    },
+    {
+      "bytes": 300555,
+      "chave": "pos:600808",
+      "termo": "ser"
+    },
+    {
+      "bytes": 254752,
+      "chave": "pos:237579",
+      "termo": "era"
+    },
+    {
+      "bytes": 241541,
+      "chave": "pos:51379",
+      "termo": "anos"
+    },
+    {
+      "bytes": 207646,
+      "chave": "pos:2029",
+      "termo": "1"
+    },
+    {
+      "bytes": 207093,
+      "chave": "pos:299500",
+      "termo": "grande"
+    },
+    {
+      "bytes": 203419,
+      "chave": "pos:146597",
+      "termo": "cidade"
+    },
+    {
+      "bytes": 191989,
+      "chave": "pos:62448",
+      "termo": "area"
+    },
+    {
+      "bytes": 186350,
+      "chave": "pos:599546",
+      "termo": "sendo"
+    },
+    {
+      "bytes": 186045,
+      "chave": "pos:614184",
+      "termo": "sobre"
+    },
+    {
+      "bytes": 182168,
+      "chave": "pos:501008",
+      "termo": "parte"
+    },
+    {
+      "bytes": 181029,
+      "chave": "pos:561573",
+      "termo": "regiao"
+    },
+    {
+      "bytes": 180240,
+      "chave": "pos:484014",
+      "termo": "onde"
+    },
+    {
+      "bytes": 175588,
+      "chave": "pos:491633",
+      "termo": "outros"
+    },
+    {
+      "bytes": 174921,
+      "chave": "pos:216625",
+      "termo": "durante"
+    },
+    {
+      "bytes": 171556,
+      "chave": "pos:5994",
+      "termo": "2"
+    },
+    {
+      "bytes": 171256,
+      "chave": "pos:472369",
+      "termo": "nome"
+    },
+    {
+      "bytes": 168258,
+      "chave": "pos:245207",
+      "termo": "estado"
+    },
+    {
+      "bytes": 166768,
+      "chave": "pos:413715",
+      "termo": "maior"
+    },
+    {
+      "bytes": 165055,
+      "chave": "pos:58373",
+      "termo": "apos"
+    }
+  ],
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 6860234752,
+    "ram_total": 8266141696,
+    "swap_usado": 88870912
+  },
+  "nos_trie": 2118236,
+  "posicoes": true,
+  "quando": "2026-10-26T14-09-19",
+  "raiz_bytes": 13259,
+  "rotulo": "exp-100k-ids-remapeados",
+  "tipo": "sizes"
+}

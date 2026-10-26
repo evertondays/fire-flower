@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fire_flower::text::Clause;
-use fire_flower::{Config, Engine, Language, Stemming};
+use fire_flower::{Config, Engine, InflectionMode, Language, Stemming};
 
 fn open(dir: &tempfile::TempDir) -> Engine {
     Engine::open(dir.path(), Config::default()).unwrap()
@@ -1391,4 +1391,99 @@ fn stem_cache_across_batches_does_not_change_results() {
     assert_eq!(digest(7), one);
     assert!(one.iter().any(|(t, _)| t == "corr"));
     assert!(one.iter().all(|(t, _)| t != "correndo"));
+}
+
+fn inflected(mode: InflectionMode) -> Config {
+    Config { inflections: Some(Stemming::Plural(Language::Portuguese)), inflection_mode: mode, ..Config::default() }
+}
+
+fn inflection_sample(engine: &Engine) {
+    let mut batch = engine.batch();
+    batch.add_titled(1, "Torre", "A torre do castelo").unwrap();
+    batch.add_titled(2, "Torres", "Torres é uma cidade com torres altas").unwrap();
+    batch.commit().unwrap();
+    // Outro lote: o radical `eleicao` ganha palavras em dois commits.
+    let mut batch = engine.batch();
+    batch.add_titled(3, "Eleições", "As eleições de 2018").unwrap();
+    batch.add_titled(4, "Castelos", "Castelos medievais").unwrap();
+    batch.commit().unwrap();
+    let mut batch = engine.batch();
+    batch.add_titled(5, "Votação", "Uma eleição indireta").unwrap();
+    batch.commit().unwrap();
+}
+
+#[test]
+fn inflections_match_other_forms_but_prefer_the_exact_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), inflected(InflectionMode::Always)).unwrap();
+    inflection_sample(&engine);
+    assert_eq!(engine.search("torre").unwrap(), [1, 2]);
+    assert_eq!(engine.search("castelo").unwrap(), [1, 4]);
+    // Palavras de lotes diferentes com o mesmo radical.
+    assert_eq!(engine.search("eleicao").unwrap(), [3, 5]);
+    assert_eq!(engine.search("eleições").unwrap(), [3, 5]);
+    // A palavra exata vale mais: "Torre" à frente de "Torres", e vice-versa.
+    let top = |q: &str| engine.search_top(q, 10).unwrap().iter().map(|h| h.doc).collect::<Vec<_>>();
+    assert_eq!(top("torre"), [1, 2]);
+    assert_eq!(top("torres"), [2, 1]);
+    assert_eq!(engine.search_ranked("castelos", 10).unwrap().total, 2);
+    // E entre partes: as duas formas contam.
+    assert_eq!(engine.search("castelo torres").unwrap(), [1]);
+    // Uma palavra que só aparece flexionada ainda acha.
+    assert_eq!(engine.search("votacoes").unwrap(), [5]);
+    // Frases e prefixos continuam exatos; as APIs por palavra também.
+    assert_eq!(engine.search("\"torres altas\"").unwrap(), [2]);
+    assert!(engine.search("\"torre altas\"").unwrap().is_empty());
+    assert_eq!(engine.search("torre*").unwrap(), [1, 2]);
+    assert_eq!(engine.postings("torre").unwrap(), [1]);
+    assert_eq!(engine.suggest("torr", 10).unwrap(), ["torre", "torres"]);
+    assert!(engine.inflector().is_on());
+    assert!(!engine.stemmer().is_on());
+}
+
+#[test]
+fn inflections_only_when_the_exact_search_finds_too_little() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), inflected(InflectionMode::IfFewer(2))).unwrap();
+        inflection_sample(&engine);
+        // "torre" sozinha acha 1 documento (< 2): soma as flexões.
+        assert_eq!(engine.search("torre").unwrap(), [1, 2]);
+        assert_eq!(engine.search_ranked("torre", 10).unwrap().total, 2);
+        // "torres" já acha 1 também (só o 2 tem a palavra exata)…
+        assert_eq!(engine.search("torres").unwrap(), [1, 2]);
+    }
+    // O modo vale por busca: o mesmo banco, com limiar 1, fica exato.
+    let engine = Engine::open(dir.path(), inflected(InflectionMode::IfFewer(1))).unwrap();
+    assert_eq!(engine.search("torre").unwrap(), [1]);
+    assert_eq!(engine.search_ranked("torre", 10).unwrap().total, 1);
+    assert_eq!(engine.search("votacoes").unwrap(), [5], "nenhum exato: soma");
+}
+
+#[test]
+fn inflections_are_stored_on_creation_and_exclude_stemming() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), inflected(InflectionMode::Always)).unwrap();
+        inflection_sample(&engine);
+        engine.compact(); // o merge de `stem:` também passa pela compactação
+    }
+    let engine = Engine::open(dir.path(), Config::default()).unwrap();
+    assert!(engine.inflector().is_on());
+    assert_eq!(engine.search("eleicao").unwrap(), [3, 5]);
+    drop(engine);
+    let other = Config { inflections: Some(Stemming::Snowball(Language::Portuguese)), ..Config::default() };
+    assert!(Engine::open(dir.path(), other).is_err());
+
+    let both = Config { stemming: Some(Stemming::Snowball(Language::Portuguese)), ..inflected(InflectionMode::Always) };
+    let err = Engine::open(tempfile::tempdir().unwrap().path(), both).err().unwrap();
+    assert!(err.to_string().contains("não combinam"), "{err}");
+    // Sem flexões, a mesma consulta é exata.
+    let plain = tempfile::tempdir().unwrap();
+    let engine = open(&plain);
+    inflection_sample(&engine);
+    assert_eq!(engine.search("torre").unwrap(), [1]);
+    assert!(!engine.inflector().is_on());
+    let bad = Config { inflection_weight: 1.5, ..Config::default() };
+    assert!(Engine::open(tempfile::tempdir().unwrap().path(), bad).is_err());
 }

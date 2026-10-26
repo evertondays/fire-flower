@@ -81,6 +81,10 @@ enum Cmd {
         /// usa o que está gravado no banco (ou nenhum)
         #[arg(long)]
         stemming: Option<String>,
+        /// Flexões na consulta num banco novo: o stemmer do mapa `stem:` ("pt",
+        /// "pt-plural" ou "nenhum"). Sem a opção, usa o que está gravado
+        #[arg(long)]
+        flexoes: Option<String>,
         /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
         /// colapso da carga quando o filtro passa de uma parte do block cache
         #[arg(long)]
@@ -144,6 +148,8 @@ enum Cmd {
         rank_queries: usize,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -178,6 +184,8 @@ enum Cmd {
         /// Não imprime as consultas à mão (para a grade)
         #[arg(long)]
         resumo: bool,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -204,6 +212,8 @@ enum Cmd {
         cache_leitura: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -243,17 +253,18 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, filtro_inteiro, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, flexoes, filtro_inteiro, label } => {
             let languages = idiomas.as_deref().map(parse_languages).transpose()?;
-            let stemming = stemming
-                .map(|s| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)")))
-                .transpose()?;
+            let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)"));
+            let stemming = stemming.map(code).transpose()?;
+            let inflections = flexoes.map(code).transpose()?;
             let config = Config {
                 block_cache_bytes: cache_mb << 20,
                 writer_cache_nodes: cache_nos.unwrap_or(Config::default().writer_cache_nodes),
                 languages,
                 positions: sem_posicoes.then_some(false),
                 stemming,
+                inflections,
                 partition_filters: !filtro_inteiro,
                 statistics: true,
                 ..Config::default()
@@ -264,21 +275,22 @@ fn main() -> AnyResult {
         Cmd::Queries { vocab, corpus, idiomas, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&idiomas)?), seed, per_set, out)
         }
-        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label } => {
-            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label })
+        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, flexoes, label } => {
+            let config = flexoes.apply(Config::default())?;
+            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, label })
         }
-        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, label } => {
+        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, flexoes, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
             let defaults = Config::default();
-            let config = Config {
+            let config = flexoes.apply(Config {
                 title_weight: peso_titulo.unwrap_or(defaults.title_weight),
                 title_b: b_titulo.unwrap_or(defaults.title_b),
                 ..defaults
-            };
+            })?;
             relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, label } => {
-            let mut config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
+        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, flexoes, label } => {
+            let mut config = flexoes.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = cache_leitura {
                 config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
             }
@@ -289,6 +301,33 @@ fn main() -> AnyResult {
         Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, label } => {
             concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, label)
         }
+    }
+}
+
+/// Peso e modo das flexões na consulta (valem por busca; o banco precisa ter
+/// sido criado com `--flexoes`).
+#[derive(clap::Args)]
+struct FlexoesArgs {
+    /// α: quanto as flexões valem perto da palavra exata (0 a 1)
+    #[arg(long)]
+    peso_flexoes: Option<f64>,
+    /// "sempre" ou N: só quando a busca exata acha menos de N documentos
+    #[arg(long)]
+    modo_flexoes: Option<String>,
+}
+
+impl FlexoesArgs {
+    fn apply(&self, mut config: Config) -> AnyResult<Config> {
+        if let Some(w) = self.peso_flexoes {
+            config.inflection_weight = w;
+        }
+        if let Some(m) = &self.modo_flexoes {
+            config.inflection_mode = match m.as_str() {
+                "sempre" => fire_flower::InflectionMode::Always,
+                n => fire_flower::InflectionMode::IfFewer(n.parse().map_err(|_| format!("modo das flexões: {m:?} (use sempre ou um número)"))?),
+            };
+        }
+        Ok(config)
     }
 }
 
@@ -496,6 +535,11 @@ fn config_json(config: &Config) -> Value {
         "partition_filters": config.partition_filters,
         "bm25_k1": config.bm25_k1,
         "bm25_b": config.bm25_b,
+        "inflection_weight": config.inflection_weight,
+        "inflection_mode": match config.inflection_mode {
+            fire_flower::InflectionMode::Always => json!("sempre"),
+            fire_flower::InflectionMode::IfFewer(n) => json!(n),
+        },
     })
 }
 
@@ -614,6 +658,7 @@ fn load(
         "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
         "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
         "stemming": engine.stemmer().stemming().code(),
+        "flexoes": engine.inflector().stemming().code(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,
@@ -1144,6 +1189,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
 
 struct OracleArgs {
     db: PathBuf,
+    config: Config,
     corpus: PathBuf,
     take: Option<u64>,
     remap_ids: bool,
@@ -1318,11 +1364,19 @@ struct Oracle {
     title_weight: f64,
     title_b: f64,
     max_prefix: usize,
+    /// Flexões na consulta: radical -> palavras do vocabulário com ele, o
+    /// peso α e o modo (vazio sem flexões).
+    by_root: HashMap<String, Vec<String>>,
+    inflector: Option<fire_flower::Stemmer>,
+    alpha: f64,
+    mode: fire_flower::InflectionMode,
 }
 
 /// Uma parte da consulta resolvida no oráculo.
 enum OClause<'a> {
     Term(&'a OTerm),
+    /// Palavra com flexões: a exata (se existe), as outras e o df da união delas.
+    Group(Option<&'a OTerm>, Vec<&'a OTerm>, usize),
     /// As completações e o df do conjunto (documentos com alguma delas).
     Prefix(Vec<&'a OTerm>, usize),
     Phrase(Vec<(u32, &'a OTerm, &'a OPos)>),
@@ -1378,17 +1432,53 @@ impl Oracle {
         (count, in_title)
     }
 
-    /// Documentos que casam com a consulta, em ordem. `None` se alguma frase
-    /// precisaria de posições que o oráculo não coletou.
+    /// As outras palavras do vocabulário com o radical de `word`.
+    fn variants(&self, word: &str) -> Vec<&OTerm> {
+        let Some(inflector) = &self.inflector else { return Vec::new() };
+        self.by_root
+            .get(&inflector.stem(word))
+            .map(|ws| ws.iter().filter(|w| *w != word).map(|w| &self.terms[w]).collect())
+            .unwrap_or_default()
+    }
+
+    /// Se a consulta soma as flexões, pelo modo: com `IfFewer(n)`, só quando
+    /// a busca exata acha menos de `n` documentos.
+    fn should_expand(&self, vocab: &[&str], clauses: &[Clause]) -> Option<bool> {
+        Some(match (&self.inflector, self.mode) {
+            (None, _) => false,
+            (Some(_), fire_flower::InflectionMode::Always) => true,
+            (Some(_), fire_flower::InflectionMode::IfFewer(n)) => self.resolve_with(vocab, clauses, false)?.1.len() < n,
+        })
+    }
+
+    /// Documentos que casam com a consulta, em ordem (com as flexões, se o
+    /// modo pedir). `None` se alguma frase precisaria de posições que o
+    /// oráculo não coletou.
     fn resolve<'s>(&'s self, vocab: &[&str], clauses: &[Clause]) -> Option<(Vec<OClause<'s>>, Vec<DocId>)> {
+        let expand = self.should_expand(vocab, clauses)?;
+        self.resolve_with(vocab, clauses, expand)
+    }
+
+    fn resolve_with<'s>(&'s self, vocab: &[&str], clauses: &[Clause], expand: bool) -> Option<(Vec<OClause<'s>>, Vec<DocId>)> {
         let empty = || Some((Vec::new(), Vec::new()));
         let mut resolved = Vec::new();
         for clause in clauses {
             match clause {
-                Clause::Term(t) if !t.prefix => match self.terms.get(&t.text) {
-                    Some(term) => resolved.push(OClause::Term(term)),
-                    None => return empty(),
-                },
+                Clause::Term(t) if !t.prefix => {
+                    let exact = self.terms.get(&t.text);
+                    let others = if expand { self.variants(&t.text) } else { Vec::new() };
+                    if others.is_empty() {
+                        match exact {
+                            Some(term) => resolved.push(OClause::Term(term)),
+                            None => return empty(),
+                        }
+                    } else {
+                        let mut union: Vec<DocId> = others.iter().flat_map(|t| t.docs.iter().copied()).collect();
+                        union.sort_unstable();
+                        union.dedup();
+                        resolved.push(OClause::Group(exact, others, union.len()));
+                    }
+                }
                 Clause::Term(t) => {
                     let mut words = self.expand(vocab, &t.text);
                     // Com stemming, o radical do prefixo também vale (depois do limite).
@@ -1423,6 +1513,12 @@ impl Oracle {
         for c in &resolved {
             match c {
                 OClause::Term(t) => sets.push(t.docs.clone()),
+                OClause::Group(exact, others, _) => {
+                    let mut all: Vec<DocId> = exact.iter().chain(others).flat_map(|t| t.docs.iter().copied()).collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    sets.push(all);
+                }
                 OClause::Prefix(ts, _) => {
                     let mut all: Vec<DocId> = ts.iter().flat_map(|t| t.docs.iter().copied()).collect();
                     all.sort_unstable();
@@ -1458,6 +1554,16 @@ impl Oracle {
                         OClause::Term(t) => {
                             let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
                             self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
+                        }
+                        // BM25(exata) + α · BM25(flexões), cada parte com o seu idf.
+                        OClause::Group(exact, others, df) => {
+                            let exact_part = exact.map_or(0.0, |t| match t.tfs_of(d) {
+                                Some((tf, title_tf)) => self.bm25(self.idf(t.docs.len()), tf, title_tf, d),
+                                None => 0.0,
+                            });
+                            let (tf, title_tf) = others.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                            let others_part = if tf == 0 { 0.0 } else { self.bm25(self.idf(*df), tf, title_tf, d) };
+                            exact_part + self.alpha * others_part
                         }
                         // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
                         OClause::Prefix(ts, df) => {
@@ -1498,7 +1604,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
     let started = Instant::now();
     let mut rng = Rng(args.seed);
     // Aberto antes: o oráculo descarta as mesmas stopwords que estão gravadas no banco.
-    let engine = Engine::open(&args.db, Config::default())?;
+    let engine = Engine::open(&args.db, args.config.clone())?;
     let stopwords = engine.stopwords().clone();
     // E o mesmo stemming: o termo de um token é o radical dele.
     let stemmer = engine.stemmer().clone();
@@ -1523,6 +1629,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
         title_weight: engine.config().title_weight,
         title_b: engine.config().title_b,
         max_prefix: engine.config().max_prefix_terms,
+        by_root: HashMap::default(),
+        inflector: engine.inflector().is_on().then(|| engine.inflector().clone()),
+        alpha: engine.config().inflection_weight,
+        mode: engine.config().inflection_mode,
     };
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
     let mut phrase_docs: Vec<Vec<String>> = Vec::new();
@@ -1600,6 +1710,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
     }
     for t in o.terms.values_mut() {
         t.finish();
+    }
+    if let Some(inflector) = &o.inflector {
+        let mut by_root: HashMap<String, Vec<String>> = HashMap::default();
+        for word in o.terms.keys() {
+            by_root.entry(inflector.stem(word)).or_default().push(word.clone());
+        }
+        o.by_root = by_root;
     }
     let mut vocab: Vec<&str> = o.terms.keys().map(String::as_str).collect();
     vocab.sort_unstable();
@@ -1812,11 +1929,16 @@ fn oracle(args: OracleArgs) -> AnyResult {
             }
             (0..k).map(|_| rng.pick(&frequent).to_string()).collect()
         };
-        let mut expected = o.terms[&terms[0]].docs.clone();
-        for t in &terms[1..] {
-            expected = fire_flower::internals::intersect(&expected, &o.terms[t].docs);
-        }
         let query = terms.iter().map(|t| word(t)).collect::<Vec<_>>().join(" ");
+        let expected = if o.inflector.is_some() {
+            o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default()
+        } else {
+            let mut expected = o.terms[&terms[0]].docs.clone();
+            for t in &terms[1..] {
+                expected = fire_flower::internals::intersect(&expected, &o.terms[t].docs);
+            }
+            expected
+        };
         and.compare(&query, &engine.search(&query)?, &expected);
     }
     checks.push(and);
@@ -1913,6 +2035,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         }
         let expected: Vec<DocId> = match kept.len() {
             0 => Vec::new(),
+            1 if o.inflector.is_some() => o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default(),
             1 => o.terms.get(&kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
             _ => {
                 let parts: Option<Vec<(u32, &OTerm, &OPos)>> =
@@ -1978,6 +2101,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         json!({ "db": args.db, "corpus": args.corpus, "take": args.take, "remap_ids": args.remap_ids,
                 "docs": docs, "termos_oraculo": vocab.len(), "divergencias": total, "posicoes": has_positions,
                 "stemming": stemmer.stemming().code(),
+                "flexoes": engine.inflector().stemming().code(),
                 "verificacoes": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevancia": relevance }),
     )?;
     if total > 0 {

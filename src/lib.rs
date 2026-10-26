@@ -33,7 +33,7 @@ pub mod stem;
 pub mod stopwords;
 pub mod text;
 
-pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch};
+pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode};
 pub use stem::{Stemmer, Stemming};
 pub use stopwords::{Language, Stopwords};
 

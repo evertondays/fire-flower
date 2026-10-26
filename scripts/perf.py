@@ -544,37 +544,54 @@ def fase_frases(scale):
 
 
 # Conjuntos medidos antes da compactação (merge pendente), como na Fase 4.
-PRE_SETS = ["t-freq", "titulos", "and-freq", "rank-freq", "frase-2", "frase-freq"]
-STEM_MODES = ("nenhum", "pt")
+PRE_SETS = ["t-freq", "titulos", "and-freq", "rank-freq", "frase-2", "frase-freq", "t-flexao"]
+# Bancos comparados pelo `stemming` (docs/plano-stemming.md): o primeiro é a referência.
+STEM_MODES = {
+    "nenhum": ["--stemming", "nenhum"],
+    "pt": ["--stemming", "pt"],
+    "pt-plural": ["--stemming", "pt-plural"],
+    "flexoes": ["--flexoes", "pt-plural"],
+}
+STEM_TITLES = {"nenhum": "sem stemming", "pt": "Snowball na indexação", "pt-plural": "plural na indexação",
+               "flexoes": "flexões na consulta (pt-plural)"}
+# Acerto de cada conjunto de relevância: top-1, top-3 ou top-10.
+REL_HIT = {"rel-titulo": "top1", "rel-digitando": "top1", "rel-hub": "top1", "rel-corpo": "top10",
+           "rel-flexao": "top10", "rel-plural": "top10", "rel-manual": "top3", "rel-flexao-manual": "top3"}
 
 
 def fase_stemming(scale):
-    """Stemming ligado vs. desligado, no mesmo binário: oráculo com stemming,
-    carga, tamanho, latência antes e depois de compactar e relevância. As
-    consultas são as mesmas (palavras do vocabulário sem stemming): com
-    stemming, cada uma casa a união das flexões, que é o custo real dele."""
+    """Stemming e flexões, no mesmo binário: sem stemming, Snowball e plural na
+    indexação e flexões na consulta. Oráculo de cada modo, carga, tamanho,
+    latência antes e depois de compactar e relevância. As consultas são as
+    mesmas para todos (palavras sem stemming): com stemming, cada uma casa a
+    união das flexões, que é o custo real dele."""
     small = smaller(scale, "10k")
-    oracle_db = db(f"stemming-{small}-oraculo")
-    step(f"oráculo {small} com stemming (tf, posições, frases, prefixos, ranking)")
-    fresh(oracle_db)
-    wiki("load", "--db", oracle_db, "--corpus", corpus(small), "--batch", LOTE, "--stemming", "pt",
-         "--label", f"stemming-{small}-oraculo")
-    ok = wiki("oracle", "--db", oracle_db, "--corpus", corpus(small), "--label", f"{small}-stemming", check=False) == 0
-    shutil.rmtree(oracle_db, ignore_errors=True)
+    ok = True
+    for mode, flags in STEM_MODES.items():
+        if mode == "nenhum":
+            continue
+        oracle_db = db(f"stemming-{small}-oraculo")
+        step(f"oráculo {small}, {STEM_TITLES[mode]}")
+        fresh(oracle_db)
+        wiki("load", "--db", oracle_db, "--corpus", corpus(small), "--batch", LOTE, *flags,
+             "--label", f"stemming-{small}-{mode}-oraculo")
+        ok &= wiki("oracle", "--db", oracle_db, "--corpus", corpus(small), "--label", f"{small}-stemming-{mode}",
+                   check=False) == 0
+        shutil.rmtree(oracle_db, ignore_errors=True)
 
     paths = {mode: db(f"stemming-{scale}-{mode}") for mode in STEM_MODES}
     for mode, path in paths.items():
-        step(f"carga {scale}, stemming {mode}")
-        load_rounds(path, scale, f"stemming-{scale}-{mode}", "--batch", LOTE, "--stemming", mode)
+        step(f"carga {scale}, {STEM_TITLES[mode]}")
+        load_rounds(path, scale, f"stemming-{scale}-{mode}", "--batch", LOTE, *STEM_MODES[mode])
     for mode, path in paths.items():
-        step(f"antes da compactação, stemming {mode}")
+        step(f"antes da compactação, {STEM_TITLES[mode]}")
         bench(path, scale, PRE_SETS, f"stemming-{scale}-{mode}-pre-compactacao")
     for mode, path in paths.items():
-        step(f"compactação, stemming {mode}")
+        step(f"compactação, {STEM_TITLES[mode]}")
         compact_and_save(path, f"stemming-{scale}-{mode}")
         sizes_of(path, f"stemming-{scale}-{mode}-compactado")
     for mode, path in paths.items():
-        step(f"latência de todos os conjuntos, stemming {mode}")
+        step(f"latência de todos os conjuntos, {STEM_TITLES[mode]}")
         bench(path, scale, None, f"stemming-{scale}-{mode}-t1")
 
     rel = smaller(scale, "100k")
@@ -582,78 +599,80 @@ def fase_stemming(scale):
     for mode in STEM_MODES:
         path = paths[mode] if rel == scale else db(f"stemming-{rel}-{mode}")
         if rel != scale:
-            step(f"carga {rel} para a relevância, stemming {mode}")
+            step(f"carga {rel} para a relevância, {STEM_TITLES[mode]}")
             fresh(path)
-            wiki("load", "--db", path, "--corpus", corpus(rel), "--batch", LOTE, "--stemming", mode,
+            wiki("load", "--db", path, "--corpus", corpus(rel), "--batch", LOTE, *STEM_MODES[mode],
                  "--label", f"stemming-{rel}-{mode}-relevancia")
-        step(f"relevância {rel}, stemming {mode}")
+        step(f"relevância {rel}, {STEM_TITLES[mode]}")
         wiki("relevancia", "--db", path, "--corpus", corpus(rel), "--sets", sets, "--label", f"{rel}-stemming-{mode}")
     return ok
 
 
 def stemming_section(R, scale):
-    loads = {m: median_load(R, f"stemming-{scale}-{m}") for m in STEM_MODES}
-    if not all(loads.values()):
+    modes = [m for m in STEM_MODES if median_load(R, f"stemming-{scale}-{m}")]
+    if "nenhum" not in modes or len(modes) < 2:
         return []
-    sizes = {m: latest(R, "sizes", f"stemming-{scale}-{m}-compactado") for m in STEM_MODES}
-    comps = {m: latest(R, "compact", f"stemming-{scale}-{m}") for m in STEM_MODES}
-    oracle = latest(R, "oracle", f"{smaller(scale, '10k')}-stemming")
+    base = "nenhum"
+    loads = {m: median_load(R, f"stemming-{scale}-{m}") for m in modes}
+    sizes = {m: latest(R, "sizes", f"stemming-{scale}-{m}-compactado") for m in modes}
+    comps = {m: latest(R, "compact", f"stemming-{scale}-{m}") for m in modes}
+    small = smaller(scale, "10k")
     keys = lambda r, space: next((e["chaves"] for e in (r or {}).get("espacos", []) if e["espaco"] == space), None)
     space_bytes = lambda r, space: next((e["bytes_chaves"] + e["bytes_valores"] for e in (r or {}).get("espacos", [])
                                          if e["espaco"] == space), None)
-    off, on = loads["nenhum"], loads["pt"]
 
-    def row(name, a, b, f=fmt, lower_better=True):
-        delta = f" ({pct(b, a):+.0f}%)" if a and b else ""
-        return f"| {name} | {f(a) if a is not None else '—'} | {f(b) if b is not None else '—'}{delta} |"
+    def cells(values, f=fmt):
+        out = []
+        for m in modes:
+            v, b = values.get(m), values.get(base)
+            txt = f(v) if v is not None else "—"
+            if m != base and v is not None and b:
+                txt += f" ({pct(v, b):+.0f}%)"
+            out.append(txt)
+        return " | ".join(out)
 
-    L = [f"## Stemming ({scale})", "",
-         "Stemming Snowball (`--stemming pt`) contra o mesmo binário sem stemming, com as mesmas consultas "
-         "(palavras do vocabulário sem stemming: com stemming, cada uma casa a união das flexões).", ""]
-    if oracle:
-        L += [f"- Oráculo com stemming ({oracle.get('docs')} docs, {fmt(oracle.get('termos_oraculo'))} termos): "
-              f"**{oracle['divergencias']} divergências**.", ""]
-    L += ["| | sem stemming | com stemming |", "|---|---|---|",
-          row("Carga (s)", off["segundos"], on["segundos"], lambda v: fmt(v, 1)),
-          row("docs/s", off["docs_por_s"], on["docs_por_s"]),
-          row("Pico de RSS (MB)", off["pico_rss"], on["pico_rss"], mb),
-          row("Termos distintos", keys(sizes["nenhum"], "post"), keys(sizes["pt"], "post")),
-          row("Nós da Trie", off.get("nos_trie"), on.get("nos_trie")),
-          row("Banco compactado (MB)", (comps["nenhum"] or {}).get("banco_depois"), (comps["pt"] or {}).get("banco_depois"), mb),
-          row("`post:` (MB)", space_bytes(sizes["nenhum"], "post"), space_bytes(sizes["pt"], "post"), mb),
-          row("`pos:` (MB)", space_bytes(sizes["nenhum"], "pos"), space_bytes(sizes["pt"], "pos"), mb),
-          row("Compactação (s)", (comps["nenhum"] or {}).get("segundos"), (comps["pt"] or {}).get("segundos"), lambda v: fmt(v, 1)),
+    head = "| | " + " | ".join(STEM_TITLES[m] for m in modes) + " |"
+    sep = "|---" * (len(modes) + 1) + "|"
+    L = [f"## Stemming e flexões ({scale})", "",
+         "Os mesmos dados e consultas em bancos criados de jeitos diferentes "
+         "([docs/plano-stemming.md](" + DOCS_URL + "/plano-stemming.md)). As consultas são palavras do vocabulário "
+         "sem stemming; com stemming, cada uma casa a união das flexões.", ""]
+    oracles = [(m, latest(R, "oracle", f"{small}-stemming-{m}")) for m in modes if m != base]
+    if any(o for _, o in oracles):
+        L += ["- Oráculo de " + small + ": " + ", ".join(
+            f"{STEM_TITLES[m]} **{o['divergencias']} divergências**" for m, o in oracles if o) + ".", ""]
+    L += [head, sep,
+          "| Carga (s) | " + cells({m: loads[m]["segundos"] for m in modes}, lambda v: fmt(v, 1)) + " |",
+          "| Pico de RSS (MB) | " + cells({m: loads[m]["pico_rss"] for m in modes}, mb) + " |",
+          "| Termos distintos | " + cells({m: keys(sizes[m], "post") for m in modes}) + " |",
+          "| Banco compactado (MB) | " + cells({m: (comps[m] or {}).get("banco_depois") for m in modes}, mb) + " |",
+          "| `pos:` (MB) | " + cells({m: space_bytes(sizes[m], "pos") for m in modes}, mb) + " |",
+          "| `stem:` (MB) | " + cells({m: space_bytes(sizes[m], "stem") for m in modes}, mb) + " |",
           ""]
-    for title, suffix in (("Latência (cache quente, compactado)", "t1"), ("Antes da compactação", "pre-compactacao")):
-        a, b = (latest(R, "bench", f"stemming-{scale}-{m}-{suffix}") for m in STEM_MODES)
-        if not (a and b):
+    for title, suffix in (("Latência p50 (cache quente, compactado)", "t1"), ("Antes da compactação (p50)", "pre-compactacao")):
+        benches = {m: latest(R, "bench", f"stemming-{scale}-{m}-{suffix}") for m in modes}
+        if not all(benches.values()):
             continue
-        sets_a = {x["conjunto"]: x for x in a["conjuntos"]}
-        L += [f"### {title}", "",
-              "| Conjunto | p50 sem | p50 com | Δ | p99 sem | p99 com | Δ | resultados sem → com |",
-              "|---|---|---|---|---|---|---|---|"]
-        for x in b["conjuntos"]:
-            o = sets_a.get(x["conjunto"])
-            if not o:
-                continue
-            L.append(f"| `{x['conjunto']}` | {us(o['p50_us'])} | {us(x['p50_us'])} | {pct(x['p50_us'], o['p50_us']):+.0f}% | "
-                     f"{us(o['p99_us'])} | {us(x['p99_us'])} | {pct(x['p99_us'], o['p99_us']):+.0f}% | "
-                     f"{fmt(o['resultados_media'], 1)} → {fmt(x['resultados_media'], 1)} |")
-        L += ["", f"<sub>{a['_arquivo']} · {b['_arquivo']}</sub>", ""]
+        by = {m: {x["conjunto"]: x for x in benches[m]["conjuntos"]} for m in modes}
+        L += [f"### {title}", "", "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+        for name in by[base]:
+            L.append(f"| `{name}` | " + cells({m: by[m].get(name, {}).get("p50_us") for m in modes}, us) + " |")
+        if suffix == "t1":
+            L += ["", "p99:", "", "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+            for name in by[base]:
+                L.append(f"| `{name}` | " + cells({m: by[m].get(name, {}).get("p99_us") for m in modes}, us) + " |")
+        L.append("")
     rel = smaller(scale, "100k")
-    ra, rb = (latest(R, "relevancia", f"{rel}-stemming-{m}") for m in STEM_MODES)
-    if ra and rb:
-        sets_a = {c["conjunto"]: c for c in ra["conjuntos"]}
-        L += [f"### Relevância ({rel})", "",
-              "| Conjunto | top-1 sem → com | top-3 sem → com | top-10 sem → com | MRR sem → com |", "|---|---|---|---|---|"]
-        for c in rb["conjuntos"]:
-            o = sets_a.get(c["conjunto"])
-            if not o:
-                continue
-            cell = lambda k: f"{fmt(o[k] * 100, 1)}% → {fmt(c[k] * 100, 1)}%"
-            L.append(f"| `{c['conjunto']}` | {cell('top1')} | {cell('top3')} | {cell('top10')} | "
-                     f"{fmt(o['mrr'], 3)} → {fmt(c['mrr'], 3)} |")
-        L += ["", f"<sub>{ra['_arquivo']} · {rb['_arquivo']}</sub>", ""]
+    rels = {m: latest(R, "relevancia", f"{rel}-stemming-{m}") for m in modes}
+    if all(rels.values()):
+        by = {m: {c["conjunto"]: c for c in rels[m]["conjuntos"]} for m in modes}
+        L += [f"### Relevância ({rel})", "", "Acerto: top-1 em título, digitando e hub; top-3 nas consultas à mão; top-10 no resto.", "",
+              "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+        for name in by[base]:
+            hit = REL_HIT.get(name, "top10")
+            row = " | ".join(f"{fmt(by[m][name][hit] * 100, 1)}%" if name in by[m] else "—" for m in modes)
+            L.append(f"| `{name}` ({hit.replace('top', 'top-')}) | {row} |")
+        L.append("")
     return L
 
 

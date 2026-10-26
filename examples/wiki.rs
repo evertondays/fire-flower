@@ -1375,7 +1375,7 @@ struct Oracle {
 /// Uma parte da consulta resolvida no oráculo.
 enum OClause<'a> {
     Term(&'a OTerm),
-    /// Palavra com flexões: a exata (se existe), as outras e o df da união delas.
+    /// Palavra com flexões: a exata (se existe), as outras e o maior df entre elas.
     Group(Option<&'a OTerm>, Vec<&'a OTerm>, usize),
     /// As completações e o df do conjunto (documentos com alguma delas).
     Prefix(Vec<&'a OTerm>, usize),
@@ -1392,6 +1392,16 @@ impl Oracle {
     /// BM25F do plano de relevância (seção 1), escrito de novo aqui (não usa
     /// a conta do motor): `tf~ = tf_texto / B_texto + w · tf_título / B_título`.
     fn bm25(&self, idf: f64, tf: u32, title_tf: u32, doc: DocId) -> f64 {
+        self.saturate(idf, self.pseudo_tf(tf, title_tf, doc))
+    }
+
+    /// idf · tf~ · (k1 + 1) / (tf~ + k1).
+    fn saturate(&self, idf: f64, ptf: f64) -> f64 {
+        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
+    }
+
+    /// tf~ do BM25F (seção 1 do plano de relevância).
+    fn pseudo_tf(&self, tf: u32, title_tf: u32, doc: DocId) -> f64 {
         let n = self.lens.len().max(1) as f64;
         let (len, title_len) = self.lens[&doc];
         let body_len = f64::from(len - title_len);
@@ -1400,8 +1410,7 @@ impl Oracle {
         let norm = |b: f64, l: f64, avg: f64| if avg > 0.0 { 1.0 - b + b * l / avg } else { 1.0 - b };
         let (b_body, b_title) = (norm(self.b, body_len, avg_body), norm(self.title_b, f64::from(title_len), avg_title));
         let part = |tf: u32, weight: f64, b: f64| if tf == 0 || b <= 0.0 { 0.0 } else { weight * f64::from(tf) / b };
-        let ptf = part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title);
-        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
+        part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title)
     }
 
     /// Termos com o prefixo, na ordem da Trie, até o limite do motor.
@@ -1473,10 +1482,9 @@ impl Oracle {
                             None => return empty(),
                         }
                     } else {
-                        let mut union: Vec<DocId> = others.iter().flat_map(|t| t.docs.iter().copied()).collect();
-                        union.sort_unstable();
-                        union.dedup();
-                        resolved.push(OClause::Group(exact, others, union.len()));
+                        // idf do maior df entre as palavras (como o motor e o `SynonymQuery` do Lucene).
+                        let df = exact.iter().chain(&others).map(|t| t.docs.len()).max().unwrap_or(0);
+                        resolved.push(OClause::Group(exact, others, df));
                     }
                 }
                 Clause::Term(t) => {
@@ -1555,15 +1563,12 @@ impl Oracle {
                             let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
                             self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
                         }
-                        // BM25(exata) + α · BM25(flexões), cada parte com o seu idf.
+                        // Um termo só: tf~ = tf~_exata + α · tf~_flexões, idf do maior df.
                         OClause::Group(exact, others, df) => {
-                            let exact_part = exact.map_or(0.0, |t| match t.tfs_of(d) {
-                                Some((tf, title_tf)) => self.bm25(self.idf(t.docs.len()), tf, title_tf, d),
-                                None => 0.0,
-                            });
-                            let (tf, title_tf) = others.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-                            let others_part = if tf == 0 { 0.0 } else { self.bm25(self.idf(*df), tf, title_tf, d) };
-                            exact_part + self.alpha * others_part
+                            let (tf, title_tf) = exact.and_then(|t| t.tfs_of(d)).unwrap_or((0, 0));
+                            let (vtf, vtitle) = others.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                            let ptf = self.pseudo_tf(tf, title_tf, d) + self.alpha * self.pseudo_tf(vtf, vtitle, d);
+                            self.saturate(self.idf(*df), ptf)
                         }
                         // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
                         OClause::Prefix(ts, df) => {

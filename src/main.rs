@@ -106,6 +106,12 @@ struct Posicoes {
 
 #[derive(clap::Args)]
 struct Radicais {
+    /// Flexões na consulta num banco novo (o recomendado para achar plurais):
+    /// "pt-plural" ("planetas" acha "Planeta", com a palavra exata valendo
+    /// mais), "pt" (Snowball) ou "nenhum" (o padrão). Não combina com
+    /// --stemming. Num banco existente, precisa combinar com a criação.
+    #[arg(long, value_parser = parse_stemming)]
+    flexoes: Option<Stemming>,
     /// Stemming de um banco novo: "pt" (Snowball do português, "correndo"
     /// acha "corrida"), "pt-plural" (só o plural: "casas" acha "casa"), "en",
     /// "en-plural" ou "nenhum" (o padrão). Num banco existente, precisa
@@ -151,15 +157,15 @@ fn main() -> ExitCode {
             tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
         }),
         Command::Index { banco, caminhos, idiomas, posicoes, radicais } => {
-            index(&banco, &caminhos, idiomas.idiomas, posicoes.config(), radicais.stemming)
+            index(&banco, &caminhos, idiomas.idiomas, posicoes.config(), radicais)
         }
         Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas, posicoes, radicais } => {
             let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
-            open(&banco, idiomas.idiomas, posicoes.config(), radicais.stemming).and_then(|engine| {
+            open(&banco, idiomas.idiomas, posicoes.config(), Some(radicais)).and_then(|engine| {
                 if !progresso_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
-                    eprintln!("stemming: {}", engine.stemmer().stemming());
+                    eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
                 }
                 jsonl::index(&engine, &arquivo, &opts)
             })
@@ -181,15 +187,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `idiomas`, `posicoes` e `stemming` só importam na criação;
+/// Abre o banco. `idiomas`, `posicoes` e `radicais` só importam na criação;
 /// `None` usa o que está gravado.
 fn open(
     db: &Path,
     idiomas: Option<ListaIdiomas>,
     posicoes: Option<bool>,
-    stemming: Option<Stemming>,
+    radicais: Option<Radicais>,
 ) -> Result<Engine, Box<dyn std::error::Error>> {
-    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, stemming, ..Config::default() };
+    let (stemming, inflections) = radicais.map_or((None, None), |r| (r.stemming, r.flexoes));
+    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, stemming, inflections, ..Config::default() };
     Ok(Engine::open(db, config)?)
 }
 
@@ -198,11 +205,11 @@ fn index(
     paths: &[PathBuf],
     idiomas: Option<ListaIdiomas>,
     posicoes: Option<bool>,
-    stemming: Option<Stemming>,
+    radicais: Radicais,
 ) -> AnyResult {
-    let engine = open(db, idiomas, posicoes, stemming)?;
+    let engine = open(db, idiomas, posicoes, Some(radicais))?;
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
-    eprintln!("stemming: {}", engine.stemmer().stemming());
+    eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
     let started = Instant::now();
     let mut files = Vec::new();
     for p in paths {

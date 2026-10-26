@@ -107,14 +107,15 @@ struct Posicoes {
 #[derive(clap::Args)]
 struct Radicais {
     /// Stemming de um banco novo: "pt" (Snowball do português, "correndo"
-    /// acha "corrida"), "en" ou "nenhum" (o padrão). Num banco existente,
-    /// precisa combinar com o que foi gravado na criação.
+    /// acha "corrida"), "pt-plural" (só o plural: "casas" acha "casa"), "en",
+    /// "en-plural" ou "nenhum" (o padrão). Num banco existente, precisa
+    /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_stemming)]
     stemming: Option<Stemming>,
 }
 
 fn parse_stemming(s: &str) -> Result<Stemming, String> {
-    Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, en ou \"nenhum\""))
+    Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, pt-plural, en, en-plural ou \"nenhum\""))
 }
 
 impl Posicoes {

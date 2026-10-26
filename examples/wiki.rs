@@ -77,7 +77,7 @@ enum Cmd {
         /// Cria o banco sem posições (sem busca por frase)
         #[arg(long)]
         sem_posicoes: bool,
-        /// Stemming de um banco novo ("pt", "en" ou "nenhum"). Sem a opção,
+        /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "nenhum"). Sem a opção,
         /// usa o que está gravado no banco (ou nenhum)
         #[arg(long)]
         stemming: Option<String>,
@@ -246,7 +246,7 @@ fn main() -> AnyResult {
         Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, filtro_inteiro, label } => {
             let languages = idiomas.as_deref().map(parse_languages).transpose()?;
             let stemming = stemming
-                .map(|s| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, en ou nenhum)")))
+                .map(|s| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)")))
                 .transpose()?;
             let config = Config {
                 block_cache_bytes: cache_mb << 20,

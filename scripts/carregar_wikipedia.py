@@ -276,8 +276,8 @@ def main():
     parser.add_argument("--idiomas", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
     parser.add_argument("--sem-posicoes", action="store_true",
                         help="cria o banco sem posições: menor e mais rápido, mas sem busca por frase")
-    parser.add_argument("--stemming", choices=["pt", "en", "nenhum"],
-                        help="stemming de um banco novo (padrão: nenhum); \"correndo\" acha \"corrida\"")
+    parser.add_argument("--stemming", choices=["pt", "pt-plural", "en", "en-plural", "nenhum"],
+                        help="stemming de um banco novo (padrão: nenhum): pt (Snowball, \"correndo\" acha \"corrida\") ou pt-plural (só o plural)")
     args = parser.parse_args()
 
     corpus = os.path.expanduser(args.corpus)

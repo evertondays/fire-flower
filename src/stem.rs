@@ -29,21 +29,29 @@ pub enum Stemming {
     Off,
     /// Snowball do idioma.
     Snowball(Language),
+    /// Só o plural vira singular, por regras ("eleicoes" → "eleicao",
+    /// "casas" → "casa"): agrupa bem menos que o Snowball.
+    Plural(Language),
 }
 
 impl Stemming {
-    /// Como é gravado no banco: "nenhum", "pt", "en".
+    /// Como é gravado no banco: "nenhum", "pt", "en", "pt-plural", "en-plural".
     pub fn code(self) -> &'static str {
         match self {
             Stemming::Off => "nenhum",
             Stemming::Snowball(lang) => lang.code(),
+            Stemming::Plural(Language::Portuguese) => "pt-plural",
+            Stemming::Plural(Language::English) => "en-plural",
         }
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
         match code.trim() {
             "nenhum" | "" => Some(Stemming::Off),
-            other => Language::from_code(other).map(Stemming::Snowball),
+            other => match other.strip_suffix("-plural") {
+                Some(lang) => Language::from_code(lang).map(Stemming::Plural),
+                None => Language::from_code(other).map(Stemming::Snowball),
+            },
         }
     }
 }
@@ -81,11 +89,11 @@ impl Clone for Stemmer {
 impl Stemmer {
     pub fn new(stemming: Stemming) -> Self {
         let snowball = match stemming {
-            Stemming::Off => None,
             Stemming::Snowball(lang) => Some(rust_stemmers::Stemmer::create(match lang {
                 Language::Portuguese => rust_stemmers::Algorithm::Portuguese,
                 Language::English => rust_stemmers::Algorithm::English,
             })),
+            _ => None,
         };
         Self { stemming, snowball }
     }
@@ -95,26 +103,28 @@ impl Stemmer {
     }
 
     pub fn is_on(&self) -> bool {
-        self.snowball.is_some()
+        self.stemming != Stemming::Off
     }
 
     /// Escreve em `out` o radical de `term`, um token já normalizado (ver
     /// [`for_each_token`]). Sem stemming, o próprio `term`.
     pub fn stem_into(&self, term: &str, out: &mut String) {
         out.clear();
+        if let Stemming::Plural(lang) = self.stemming {
+            out.push_str(&singular(term, lang));
+            return;
+        }
         let Some(snowball) = &self.snowball else {
             out.push_str(term);
             return;
         };
-        let accented;
-        let input = match self.stemming {
-            Stemming::Snowball(Language::Portuguese) => {
-                accented = reaccent(term);
-                accented.as_deref().unwrap_or(term)
-            }
-            _ => term,
-        };
-        let stem = snowball.stem(input);
+        // Português: o plural irregular vira singular (o Snowball deixa
+        // "eleicoes" e "eleicao" separados) e o sufixo ganha o acento de volta.
+        let portuguese = self.stemming == Stemming::Snowball(Language::Portuguese);
+        let singular_form = if portuguese { plural_suffix(term) } else { None };
+        let term_in = singular_form.as_deref().unwrap_or(term);
+        let accented = if portuguese { reaccent(term_in) } else { None };
+        let stem = snowball.stem(accented.as_deref().unwrap_or(term_in));
         if stem.is_empty() {
             out.push_str(term);
         } else if stem.is_ascii() {
@@ -161,6 +171,58 @@ const SUFFIXES: &[(&str, &str)] = &[
 fn reaccent(term: &str) -> Option<String> {
     let (from, to) = SUFFIXES.iter().find(|(from, _)| term.len() >= from.len() + 2 && term.ends_with(from))?;
     Some(format!("{}{to}", &term[..term.len() - from.len()]))
+}
+
+/// Os plurais irregulares mais comuns do português, que o Snowball não
+/// junta ao singular (`-ções`/`-ção`, `-ões`/`-ão`, `-ães`/`-ão`), já sem
+/// acentos. `None` se o termo não termina num deles.
+fn plural_suffix(term: &str) -> Option<String> {
+    let rules: &[(&str, &str)] = &[("coes", "cao"), ("oes", "ao"), ("aes", "ao")];
+    rules
+        .iter()
+        .find(|(from, _)| term.len() >= from.len() + 2 && term.ends_with(from))
+        .map(|(from, to)| format!("{}{to}", &term[..term.len() - from.len()]))
+}
+
+/// Singular de um termo sem acentos, por regras conservadoras (`pt-plural`):
+/// os plurais irregulares de [`plural_suffix`], `-ais` → `-al`, `-eis` →
+/// `-el`, `-ns` → `-m` e o `s` final, menos depois de `s`, `u` e `i`
+/// ("virus", "lapis", "pais" ficam). Erra alguns ("chineses" ≠ "chines"),
+/// mas sempre do mesmo jeito no índice e na consulta.
+fn singular(term: &str, lang: Language) -> String {
+    let n = term.len();
+    if n <= 3 || !term.is_ascii() {
+        return term.to_string();
+    }
+    let mut out = if !term.ends_with('s') {
+        term.to_string()
+    } else if let Some(s) = (lang == Language::Portuguese).then(|| plural_rule(term)).flatten() {
+        return s;
+    } else {
+        match term.as_bytes()[n - 2] {
+            b's' | b'u' | b'i' => term.to_string(),
+            _ => term[..n - 1].to_string(),
+        }
+    };
+    // "mercadores" → "mercadore" e "mercador" têm que dar o mesmo termo: o
+    // "e" final depois de r ou z sai de toda palavra ("livre" e "livres"
+    // viram "livr", "vez" e "vezes", "vez").
+    if lang == Language::Portuguese && out.len() > 3 && (out.ends_with("re") || out.ends_with("ze")) {
+        out.pop();
+    }
+    out
+}
+
+/// As regras de plural do português que trocam o fim da palavra.
+fn plural_rule(term: &str) -> Option<String> {
+    if let Some(s) = plural_suffix(term) {
+        return Some(s);
+    }
+    let rules: &[(&str, &str, usize)] = &[("ais", "al", 3), ("eis", "el", 3), ("ns", "m", 2)];
+    rules.iter().find_map(|(from, to, min)| {
+        let stem = term.strip_suffix(from)?;
+        (stem.len() >= *min).then(|| format!("{stem}{to}"))
+    })
 }
 
 /// Radicais já calculados, por termo. O Snowball custa ~200 ns por termo,
@@ -237,6 +299,33 @@ mod tests {
         assert_eq!(stems("francês francesa"), ["frances", "frances"]);
     }
 
+    /// O Snowball sozinho deixa singular e plural de -ção/-ão separados.
+    #[test]
+    fn irregular_plurals_join_the_singular() {
+        assert_eq!(stems("eleição eleições"), ["eleica", "eleica"]);
+        assert_eq!(stems("coração corações região regiões"), ["coraca", "coraca", "regia", "regia"]);
+    }
+
+    fn plural(text: &str) -> Vec<String> {
+        let stemmer = Stemmer::new(Stemming::Plural(Language::Portuguese));
+        tokenize(text).iter().map(|t| stemmer.stem(t)).collect()
+    }
+
+    #[test]
+    fn plural_stemmer_only_removes_the_plural() {
+        assert_eq!(plural("casas casa eleições eleição"), ["casa", "casa", "eleicao", "eleicao"]);
+        assert_eq!(plural("jornais jornal papéis papel homens homem"), ["jornal", "jornal", "papel", "papel", "homem", "homem"]);
+        assert_eq!(plural("mercadores mercador vezes vez livres livre"), ["mercador", "mercador", "vez", "vez", "livr", "livr"]);
+        // Verbos e derivados ficam: só o plural sai.
+        assert_eq!(plural("correndo corrida"), ["correndo", "corrida"]);
+        // Singulares terminados em s (depois de s, u, i) ficam.
+        assert_eq!(plural("vírus lápis país"), ["virus", "lapis", "pais"]);
+        assert_eq!(plural("cão"), ["cao"], "três letras ou menos: como está");
+        let stemmer = Stemmer::new(Stemming::Plural(Language::Portuguese));
+        assert!(stemmer.is_on());
+        assert_eq!(Stemming::from_code("pt-plural"), Some(Stemming::Plural(Language::Portuguese)));
+    }
+
     #[test]
     fn reaccents_only_known_suffixes() {
         assert_eq!(reaccent("informacoes").as_deref(), Some("informações"));
@@ -276,7 +365,13 @@ mod tests {
 
     #[test]
     fn codes_round_trip() {
-        for s in [Stemming::Off, Stemming::Snowball(Language::Portuguese), Stemming::Snowball(Language::English)] {
+        for s in [
+            Stemming::Off,
+            Stemming::Snowball(Language::Portuguese),
+            Stemming::Snowball(Language::English),
+            Stemming::Plural(Language::Portuguese),
+            Stemming::Plural(Language::English),
+        ] {
             assert_eq!(Stemming::from_code(s.code()), Some(s));
         }
         assert_eq!(Stemming::from_code("xx"), None);

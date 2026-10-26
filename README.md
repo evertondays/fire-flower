@@ -155,7 +155,7 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 ### Chaves no RocksDB
 
-Formato v3 (`meta:format = 3`). Um banco de formato anterior não abre: o
+Formato v4 (`meta:format = 4`). Um banco de formato anterior não abre: o
 `open` diz em que formato ele está e pede para recarregar.
 
 | Chave | Valor |
@@ -171,7 +171,10 @@ Formato v3 (`meta:format = 3`). Um banco de formato anterior não abre: o
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
-em chaves separadas para que a busca comum não leia posições.
+em chaves separadas para que a busca comum não leia posições. Listas com mais
+de 256 documentos têm, antes das entradas, uma tabela de saltos (último
+documento e tamanho de cada bloco de 128): o E e as frases vão direto ao
+bloco de um documento, sem decodificar a lista inteira.
 
 ### Configuração do RocksDB
 
@@ -202,13 +205,14 @@ python3 scripts/perf.py tudo --escala 10k
    `merge`, e o RocksDB une os pedaços na leitura e na compactação.
 2. **Sem `PostingsListID` separado.** A lista de um termo fica em `post:<id do
    nó terminal>`; não é preciso um segundo contador nem guardar o ID no nó.
-3. **Filhos guardam IDs numéricos** (`BTreeMap<char, u64>`), não strings
-   `"node:124"`. O `BTreeMap` deixa o autocompletar em ordem alfabética.
+3. **Filhos guardam IDs numéricos** (um vetor ordenado de `(char, u64)`), não
+   strings `"node:124"`. A ordem deixa o autocompletar em ordem alfabética.
 4. **Lote invertido, com cache de nós.** O lote junta termo → documentos e só
    percorre a Trie no commit, uma vez por termo distinto (e não uma vez por
    documento). Os nós lidos ou criados ficam num cache do escritor que passa de
-   um lote para o outro (`Config::writer_cache_nodes`, 1 milhão de nós por
-   padrão), então a raiz e os termos comuns não são relidos a cada commit.
+   um lote para o outro (`Config::writer_cache_nodes`, 3 milhões de nós por
+   padrão; ficam os usados mais recentemente), então os nós dos termos comuns
+   não são relidos a cada commit.
 5. **Serialização binária própria** em vez de Gob/JSON (menor e sem
    dependências).
 
@@ -227,12 +231,11 @@ python3 scripts/perf.py tudo --escala 10k
 - **Posições custam espaço.** Na fatia de 10k da Wikipédia, o banco
   compactado tem ~51 MB com posições e ~21 MB sem; use `--sem-posicoes` se
   não precisar de frases.
-- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 9 `Get`s
-  (a raiz e os dois níveis seguintes vêm do cache de nós das buscas,
+- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 7 `Get`s
+  (a raiz e os quatro níveis seguintes vêm do cache de nós das buscas,
   `Config::reader_cache_depth`). Com o block cache quente isso fica em
-  microssegundos, mas um índice de termos
-  ordenado (`term:<palavra>` com iterador de prefixo do RocksDB) faria o mesmo
-  com 1 leitura, e o autocompletar com um único scan.
+  microssegundos. Os prefixos curtos são a consulta mais cara (~3 ms na
+  Wikipédia inteira): visitam centenas de nós e unem até 256 listas.
 - **Prefixos muito curtos** (`a*`) expandem no máximo
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
   ranking, o prefixo conta como um termo só: o idf vem de todos os documentos

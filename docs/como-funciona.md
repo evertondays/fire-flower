@@ -264,7 +264,7 @@ ordem em que o RocksDB as guarda):
 
 ```text
 meta:doc_count         02
-meta:format            03
+meta:format            04
 meta:languages         pt,en
 meta:next_doc_id       03
 meta:next_node_id      0c
@@ -284,12 +284,12 @@ node:7                 00 01 72 08
 node:8                 00 01 6f 09
 node:9                 01 00
 norm:0                 02 01 02 00 01 03 00
-pos:11                 02 01 01 01 01 01 05
-pos:4                  02 01 01 02 01 01 02
-pos:9                  01 02 01 01
-post:11                02 01 02 01 02
-post:4                 02 01 02 01 02
-post:9                 01 02 02
+pos:11                 02 00 01 01 01 01 01 05
+pos:4                  02 00 01 01 02 01 01 02
+pos:9                  01 00 02 01 01
+post:11                02 00 01 02 01 02
+post:4                 02 00 01 02 01 02
+post:9                 01 00 02 02
 ```
 
 Os dois documentos foram indexados sem título (`add_document`). Com
@@ -329,13 +329,16 @@ Repare:
 73 0a       's' (0x73) → node:10
 ```
 
-Os filhos ficam em ordem de caractere (é um `BTreeMap`), o que deixa o
-autocompletar em ordem alfabética sem esforço extra.
+Os filhos ficam em ordem de caractere (em memória, um vetor ordenado com
+busca binária), o que deixa o autocompletar em ordem alfabética sem esforço
+extra. Era um `BTreeMap`, que aloca ~200 bytes mesmo para um filho só, e a
+maioria dos nós tem um filho só.
 
 ### Lendo uma lista: `post:11` (o termo `casa`)
 
 ```text
 02          2 documentos
+00          tabela de saltos vazia (lista pequena)
 01 02       documento 0 + 1 = 1; 02 = tf 1 << 1, sem título
 01 02       documento 1 + 1 = 2; tf 1, sem título
 ```
@@ -346,10 +349,21 @@ mais um número: quantas das ocorrências estão no título. Um documento com
 título). Entradas sem o termo no título, que são quase todas, não pagam nada
 a mais.
 
+**Tabela de saltos (formato v4).** O segundo número é a quantidade de
+entradas de uma tabela de saltos, que só listas com mais de 256 documentos
+têm: para cada bloco de 128 documentos, o último documento do bloco (em
+delta) e o tamanho do bloco em bytes. As entradas vêm logo depois e são as
+mesmas de uma lista sem tabela (os deltas continuam de um bloco para o
+outro). Decodificar a lista inteira só pula a tabela; para achar um
+documento numa lista de 145 mil, a busca vai direto ao bloco certo e
+decodifica no máximo 128 entradas (seção 6.2). A tabela custa ~3% do
+tamanho da lista.
+
 ### Lendo as posições: `pos:11`
 
 ```text
 02          2 documentos
+00          tabela de saltos vazia (a mesma regra de `post:`)
 01 01 01    documento 1: 1 posição, a 1 ("A casa azul": a@0 casa@1 azul@2)
 01 01 05    documento 2: 1 posição, a 5 ("O carro azul e a Casa": casa@5)
 ```
@@ -483,8 +497,11 @@ documento: quantos tokens sobraram sem as stopwords. Um documento que diz
 "café" dez vezes entra uma vez só na lista de `cafe`, com tf = 10 e as dez
 posições. O lote anota `(doc_id, tf)` e as posições em `pending[termo]`, e o
 tamanho numa lista à parte. No commit, cada termo distinto do lote é inserido
-na Trie **uma vez**, em ordem alfabética. Num lote de 1.000 artigos, "brasil"
-aparece em centenas deles, mas a Trie é percorrida uma vez só para ele.
+na Trie **uma vez**, em ordem alfabética. Num lote de 10 mil artigos,
+"brasil" aparece em milhares deles, mas a Trie é percorrida uma vez só para
+ele. E como os termos vêm em ordem, vizinhos compartilham o começo ("casa",
+"casaco", "casamento"): a descida recomeça do fim do prefixo comum com o
+termo anterior, e não da raiz.
 
 **Reindexar o mesmo ID** troca o tf, as posições e o tamanho dele: dentro do
 lote, a última adição vence; entre lotes, quem decide é o merge operator
@@ -520,8 +537,13 @@ banco, e só o escritor altera a Trie. Então o mapa volta para o `WriterState`
 e o próximo lote começa com ele: a raiz e os nós dos termos comuns não são
 relidos a cada commit. Um lote descartado (ou com commit que falhou) leva o
 cache junto, e o próximo começa do banco. O cache tem um teto
-(`Config::writer_cache_nodes`, 1 milhão de nós, ~200 MB): passando dele, saem
-primeiro os nós que o último lote não usou e depois os mais fundos.
+(`Config::writer_cache_nodes`, 3 milhões de nós, ~130 bytes cada, ~400 MB;
+ele só cresce até o tamanho da Trie). Passando dele, o descarte deixa o cache
+em 80% do limite, ficando os nós usados mais recentemente e, no lote em que o
+corte cai, os mais rasos. Na Wikipédia inteira a Trie tem 7,3 milhões de nós,
+e o cache de 3 milhões deixa o escritor com ~1,7 leituras por artigo (com 1
+milhão eram 7,5, e o descarte antigo, que guardava só os nós do último lote,
+fazia o cache despencar de 1 milhão para ~240 mil a cada vez que enchia).
 
 ### 5.4 Commit (`IndexBatch::commit`)
 
@@ -546,8 +568,13 @@ O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
 falhar, nada muda: nem o banco, nem os contadores.
 
-A CLI faz commit a cada 1.000 documentos para limitar a memória: o lote guarda
-os termos de todos os documentos até o commit.
+O `index-jsonl` faz commit a cada 10 mil documentos (`--lote`), e o `index`
+de arquivos, a cada 1.000: o lote guarda os termos de todos os documentos até
+o commit. Lotes maiores dividem o custo de percorrer a Trie por mais
+documentos: na Wikipédia inteira, a carga cai de 242 s (lote de 1.000) para
+~115 s (lote de 10 mil, com o cache de 3 milhões de nós), com pico de ~1,4 GB.
+`IndexBatch::commit_with_stats` diz onde o commit gastou o tempo (Trie,
+codificar listas, gravar), e o `wiki load` mostra isso a cada 10 mil artigos.
 
 ### 5.5 O que o RocksDB faz depois
 
@@ -596,10 +623,11 @@ sequenceDiagram
 ```
 
 Custo: **1 `get` por caractere + 2** (raiz e lista), menos os níveis que já
-estão no **cache de nós das buscas**: a raiz e os nós até a profundidade 2
+estão no **cache de nós das buscas**: a raiz e os nós até a profundidade 4
 (`Config::reader_cache_depth`) ficam decodificados em memória, compartilhados
-por todas as buscas (seção 7). A raiz tem um filho por caractere inicial e
-cresce com o índice: 13 KB com 100 mil artigos da Wikipédia. Sem o cache, toda
+por todas as buscas (seção 7). São no máximo 365 mil nós (~48 MB) na
+Wikipédia inteira. A raiz tem um filho por caractere inicial e cresce com o
+índice: 37 KB na Wikipédia inteira. Sem o cache, toda
 busca a decodificava inteira, e isso era quase todo o tempo de uma busca
 simples (116 µs de 120 µs num termo inexistente; com o cache, 5 µs).
 
@@ -613,9 +641,16 @@ prefixo de palavra não é palavra.
 1. Busca a lista de cada termo, como acima.
 2. **Lista vazia em qualquer termo:** retorna vazio na hora, sem buscar os
    outros.
-3. Ordena as listas da menor para a maior e faz a interseção nessa ordem. A
-   interseção de duas listas ordenadas anda com dois ponteiros, em tempo
-   linear. Começar pela menor faz o resultado parcial já nascer pequeno.
+3. A lista **menor** conduz: é a única decodificada inteira (o tamanho de
+   cada lista vem do cabeçalho, sem decodificar). Cada documento dela é
+   procurado nas outras, das menores para as maiores.
+4. Numa lista pelo menos 32 vezes maior que a que conduz, a procura usa a
+   tabela de saltos (`PostingsCursor`): vai direto ao bloco de 128 documentos
+   que pode conter o documento e não decodifica os blocos do meio. Um E de um
+   termo raro com um frequente, na Wikipédia inteira, caiu de 410 µs
+   (decodificando as 145 mil entradas do frequente) para 25 µs. Com listas de tamanhos
+   parecidos, quase todo bloco tem candidatos, e decodificar a lista e andar
+   nela em sequência é mais barato.
 
 ```text
 casa  → [1, 2]
@@ -630,8 +665,12 @@ Uma palavra com hífen vira vários termos, como na indexação: `e-mail` busca
 
 1. Desce até o nó `ca` (`node:6`).
 2. Faz uma busca em largura a partir dele e coleta os nós com ✓: `casa`,
-   `carro`. Para no máximo em `max_prefix_terms` (256) termos.
-3. Une as listas de todos esses termos (ordena e remove repetidos).
+   `carro`. Para no máximo em `max_prefix_terms` (256) termos. A busca anda
+   nível a nível, e os nós fora do cache de cada nível são lidos juntos com
+   um `MultiGet` (em lotes do tamanho do que ainda falta; o autocompletar
+   pede 10).
+3. Une as listas de todos esses termos, lidas num `MultiGet` só. Como elas já
+   estão ordenadas, a ordenação estável só intercala os trechos.
 4. O resultado entra na interseção como se fosse a lista de um termo comum.
 
 **Atenção:** prefixos muito curtos (`a*` na Wikipédia) casam milhares de

@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query, tokenize};
-use fire_flower::{Language, Stopwords};
+use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query_stemmed, tokenize};
+use fire_flower::{Language, Stemming, Stopwords};
 use fire_flower::{CommitStats, Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
@@ -77,6 +77,10 @@ enum Cmd {
         /// Cria o banco sem posições (sem busca por frase)
         #[arg(long)]
         sem_posicoes: bool,
+        /// Stemming de um banco novo ("pt", "en" ou "nenhum"). Sem a opção,
+        /// usa o que está gravado no banco (ou nenhum)
+        #[arg(long)]
+        stemming: Option<String>,
         /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
         /// colapso da carga quando o filtro passa de uma parte do block cache
         #[arg(long)]
@@ -239,13 +243,17 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, filtro_inteiro, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, filtro_inteiro, label } => {
             let languages = idiomas.as_deref().map(parse_languages).transpose()?;
+            let stemming = stemming
+                .map(|s| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, en ou nenhum)")))
+                .transpose()?;
             let config = Config {
                 block_cache_bytes: cache_mb << 20,
                 writer_cache_nodes: cache_nos.unwrap_or(Config::default().writer_cache_nodes),
                 languages,
                 positions: sem_posicoes.then_some(false),
+                stemming,
                 partition_filters: !filtro_inteiro,
                 statistics: true,
                 ..Config::default()
@@ -605,6 +613,7 @@ fn load(
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
         "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
         "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
+        "stemming": engine.stemmer().stemming().code(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,
@@ -1280,7 +1289,8 @@ impl OPos {
     }
 }
 
-/// Índice ingênuo em memória, construído só com `tokenize` e as stopwords:
+/// Índice ingênuo em memória, construído só com `tokenize`, as stopwords e o
+/// stemmer do banco (o radical de cada token, sem o cache da indexação):
 /// nada da indexação do motor (lote, merge, Trie) é reaproveitado.
 struct Oracle {
     terms: HashMap<String, OTerm>,
@@ -1369,7 +1379,14 @@ impl Oracle {
                     None => return empty(),
                 },
                 Clause::Term(t) => {
-                    let terms: Vec<&OTerm> = self.expand(vocab, &t.text).iter().map(|w| &self.terms[*w]).collect();
+                    let mut words = self.expand(vocab, &t.text);
+                    // Com stemming, o radical do prefixo também vale (depois do limite).
+                    if let Some(stem) = t.stem.as_deref().and_then(|s| vocab.iter().copied().find(|w| *w == s))
+                        && !words.contains(&stem)
+                    {
+                        words.push(stem);
+                    }
+                    let terms: Vec<&OTerm> = words.iter().map(|w| &self.terms[*w]).collect();
                     if terms.is_empty() {
                         return empty();
                     }
@@ -1472,6 +1489,12 @@ fn oracle(args: OracleArgs) -> AnyResult {
     // Aberto antes: o oráculo descarta as mesmas stopwords que estão gravadas no banco.
     let engine = Engine::open(&args.db, Config::default())?;
     let stopwords = engine.stopwords().clone();
+    // E o mesmo stemming: o termo de um token é o radical dele.
+    let stemmer = engine.stemmer().clone();
+    let term_of = |t: &str| if stemmer.is_on() { stemmer.stem(t) } else { t.to_string() };
+    // Radical -> uma palavra que o gera. As consultas são escritas com
+    // palavras: o radical de um radical pode ser outro (`brasileir` → `brasil`).
+    let mut word_of: HashMap<String, String> = HashMap::default();
     let has_positions = engine.has_positions();
     const AND_DOCS: usize = 2000;
     const PHRASE_DOCS: usize = 500;
@@ -1500,18 +1523,22 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let (positioned, n_title) = doc_tokens(&doc.title, &doc.text);
         let tokens: Vec<String> = positioned.iter().map(|(t, _)| t.clone()).collect();
         // termo -> (tf, tf no título)
-        let mut counts: HashMap<&str, (u32, u32)> = HashMap::default();
+        let mut counts: HashMap<String, (u32, u32)> = HashMap::default();
         let (mut len, mut title_len) = (0u32, 0u32);
         for (i, t) in tokens.iter().enumerate().filter(|(_, t)| !stopwords.contains(t)) {
             let in_title = i < n_title;
-            let c = counts.entry(t.as_str()).or_insert((0, 0));
+            let term = term_of(t);
+            if stemmer.is_on() && !word_of.contains_key(&term) {
+                word_of.insert(term.clone(), t.clone());
+            }
+            let c = counts.entry(term).or_insert((0, 0));
             c.0 += 1;
             c.1 += u32::from(in_title);
             len += 1;
             title_len += u32::from(in_title);
         }
         // Reservatórios: documentos para consultas AND e frases, títulos para revocação.
-        let mut unique: Vec<String> = counts.keys().map(|t| t.to_string()).collect();
+        let mut unique: Vec<String> = counts.keys().cloned().collect();
         unique.sort_unstable();
         if sampled_docs.len() < AND_DOCS {
             sampled_docs.push(unique);
@@ -1539,9 +1566,9 @@ fn oracle(args: OracleArgs) -> AnyResult {
             e.title_tfs.push(title_tf);
         };
         for (t, c) in counts {
-            match o.terms.get_mut(t) {
+            match o.terms.get_mut(&t) {
                 Some(e) => add(e, c),
-                None => add(o.terms.entry(t.to_string()).or_default(), c),
+                None => add(o.terms.entry(t).or_default(), c),
             }
         }
         o.spans.insert(doc.id, n_title as u32);
@@ -1566,6 +1593,9 @@ fn oracle(args: OracleArgs) -> AnyResult {
     let mut vocab: Vec<&str> = o.terms.keys().map(String::as_str).collect();
     vocab.sort_unstable();
     eprintln!("oráculo pronto: {docs} docs, {} termos ({:.0}s)", vocab.len(), started.elapsed().as_secs_f64());
+    // Uma palavra para usar numa consulta no lugar do termo.
+    let word = |t: &str| -> String { word_of.get(t).cloned().unwrap_or_else(|| t.to_string()) };
+    let parse = |q: &str| parse_query_stemmed(q, &stopwords, &stemmer);
 
     // 2. Termos a conferir: todos, ou uma amostra estratificada por df (potências de 2).
     let full = args.sample_terms == 0;
@@ -1620,13 +1650,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let doc = rng.pick(&sampled_docs);
         let query = match i % 6 {
             5 if !titles.is_empty() => rng.pick(&titles).1.clone(),
-            0 if !frequent.is_empty() => rng.pick(&frequent).to_string(),
-            0 | 1 => rng.pick(&vocab).to_string(),
-            2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| rng.pick(doc).clone()).collect::<Vec<_>>().join(" "),
+            0 if !frequent.is_empty() => word(rng.pick::<&str>(&frequent)),
+            0 | 1 => word(rng.pick::<&str>(&vocab)),
+            2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| word(rng.pick(doc).as_str())).collect::<Vec<_>>().join(" "),
             3 if !doc.is_empty() => {
-                let other = rng.pick(doc);
+                let other = word(rng.pick(doc).as_str());
                 let cut: String = other.chars().take(rng.range(2, 4)).collect();
-                format!("{} {cut}*", rng.pick(doc))
+                format!("{} {cut}*", word(rng.pick(doc).as_str()))
             }
             4 if has_positions && !usable.is_empty() => {
                 let tokens = rng.pick(&usable);
@@ -1650,9 +1680,9 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let mut needed: HashSet<String> = HashSet::default();
         if !full {
             needed.extend(check_terms.iter().map(|t| t.to_string()));
-            needed.extend(phrase_cases.iter().flatten().cloned());
+            needed.extend(phrase_cases.iter().flatten().map(|t| term_of(t)));
             for q in &rank_cases {
-                for c in parse_query(q, &stopwords) {
+                for c in parse(q) {
                     if let Clause::Phrase(parts) = c {
                         needed.extend(parts.into_iter().map(|p| p.text));
                     }
@@ -1661,17 +1691,21 @@ fn oracle(args: OracleArgs) -> AnyResult {
         }
         for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
             let doc = doc?;
-            let mut found: HashMap<&str, Vec<u32>> = HashMap::default();
+            let mut found: HashMap<String, Vec<u32>> = HashMap::default();
             let (tokens, _) = doc_tokens(&doc.title, &doc.text);
             for (t, p) in &tokens {
-                if !stopwords.contains(t) && (full || needed.contains(t)) {
-                    found.entry(t.as_str()).or_default().push(*p);
+                if stopwords.contains(t) {
+                    continue;
+                }
+                let term = term_of(t);
+                if full || needed.contains(&term) {
+                    found.entry(term).or_default().push(*p);
                 }
             }
             for (t, ps) in found {
-                match o.positions.get_mut(t) {
+                match o.positions.get_mut(&t) {
                     Some(e) => e.push(doc.id, &ps),
-                    None => o.positions.entry(t.to_string()).or_default().push(doc.id, &ps),
+                    None => o.positions.entry(t).or_default().push(doc.id, &ps),
                 }
             }
         }
@@ -1771,7 +1805,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         for t in &terms[1..] {
             expected = fire_flower::internals::intersect(&expected, &o.terms[t].docs);
         }
-        let query = terms.join(" ");
+        let query = terms.iter().map(|t| word(t)).collect::<Vec<_>>().join(" ");
         and.compare(&query, &engine.search(&query)?, &expected);
     }
     checks.push(and);
@@ -1791,7 +1825,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
             truncated += 1;
             ignored_terms += matches.len() - max_prefix;
         }
-        let mut expected: Vec<DocId> = matches.iter().take(max_prefix).flat_map(|t| o.terms[*t].docs.iter().copied()).collect();
+        let mut expanded: Vec<&str> = matches.iter().copied().take(max_prefix).collect();
+        // Com stemming, o radical do prefixo também vale (ver `QueryTerm::stem`).
+        let stem = term_of(&p);
+        if stemmer.is_on() && o.terms.contains_key(&stem) && !expanded.contains(&stem.as_str()) {
+            expanded.push(&stem);
+        }
+        let mut expected: Vec<DocId> = expanded.iter().flat_map(|t| o.terms[*t].docs.iter().copied()).collect();
         expected.sort_unstable();
         expected.dedup();
         prefix.compare(&format!("{p}*"), &engine.search(&format!("{p}*"))?, &expected);
@@ -1844,13 +1884,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
     let (mut phrase_hits, mut phrase_empty) = (0usize, 0usize);
     for window in &phrase_cases {
         let query = quote(window);
-        let mut kept: Vec<(u32, &str)> = Vec::new();
+        let mut kept: Vec<(u32, String)> = Vec::new();
         let first = window.iter().position(|t| !is_stop(t));
         for (i, t) in window.iter().enumerate() {
             if let Some(f) = first
                 && !is_stop(t)
             {
-                kept.push(((i - f) as u32, t.as_str()));
+                kept.push(((i - f) as u32, term_of(t)));
             }
         }
         if !has_positions {
@@ -1862,10 +1902,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
         }
         let expected: Vec<DocId> = match kept.len() {
             0 => Vec::new(),
-            1 => o.terms.get(kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
+            1 => o.terms.get(&kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
             _ => {
                 let parts: Option<Vec<(u32, &OTerm, &OPos)>> =
-                    kept.iter().map(|&(off, t)| Some((off, o.terms.get(t)?, o.positions.get(t)?))).collect();
+                    kept.iter().map(|(off, t)| Some((*off, o.terms.get(t)?, o.positions.get(t)?))).collect();
                 match parts {
                     Some(parts) => {
                         let mut docs = parts[0].1.docs.clone();
@@ -1888,7 +1928,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
     // 13. Ranking: os 10 primeiros e o total, contra o BM25 calculado aqui.
     let mut ranking = Check::new("ranking BM25 (top 10)");
     for q in &rank_cases {
-        let clauses = parse_query(q, &stopwords);
+        let clauses = parse(q);
         let Some((want, total)) = o.rank(&vocab, &clauses, 10) else { continue };
         let got = engine.search_ranked(q, 10)?;
         ranking.verdict(q, got.total == total && same_ranking(&got.hits, &want), || {
@@ -1926,6 +1966,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         &label,
         json!({ "db": args.db, "corpus": args.corpus, "take": args.take, "remap_ids": args.remap_ids,
                 "docs": docs, "termos_oraculo": vocab.len(), "divergencias": total, "posicoes": has_positions,
+                "stemming": stemmer.stemming().code(),
                 "verificacoes": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevancia": relevance }),
     )?;
     if total > 0 {

@@ -13,6 +13,9 @@ Suporta:
   (`--idiomas pt,en`, o padrão) e ficam gravados nele;
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
+- **stemming** opcional (Snowball do português, `--stemming pt`): "correndo"
+  acha "corrida" e "informações" acha "informação", sem deixar de ignorar os
+  acentos. É escolhido na criação do banco e fica gravado nele;
 - busca por **frase** (`"casa de papel"`): os termos em sequência, com as
   stopwords contando como buraco;
 - **ranking BM25F**: os resultados saem por relevância (`search_top`), com o
@@ -94,6 +97,13 @@ usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
 `scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
 frases dão erro. A escolha fica gravada no banco, como os idiomas.
 
+Com `--stemming pt` (nas mesmas opções), as palavras são indexadas e buscadas
+pelo radical: "correndo", "correu" e "corrida" viram `corr`. O radical sai da
+palavra sem acentos, então "informacoes" continua achando "informações". Num
+prefixo (`brasileiro*`), casam os radicais que começam com o texto digitado e
+também o radical dele (`brasileir`); o autocompletar passa a mostrar
+radicais. Também fica gravado no banco: mudar exige recarregar.
+
 ### Busca sem interface
 
 Busca e autocompletar sem interface, para scripts:
@@ -167,7 +177,7 @@ Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
-| `meta:format`, `meta:positions`, `meta:languages` | formato, se grava posições e idiomas das stopwords |
+| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming` | formato, se grava posições, idiomas das stopwords e stemming |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
@@ -244,7 +254,10 @@ python3 scripts/perf.py tudo --escala 10k
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
   ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
   que têm alguma completação, e o tf é a soma das completações no documento.
-- **Sem stemming** ("casa" e "casas" são termos diferentes).
+- **Stemming desligado por padrão** ("casa" e "casas" são termos
+  diferentes); com `--stemming pt`, o Snowball às vezes junta palavras sem
+  relação (`coreia` e `cor` viram `cor`) e o autocompletar mostra radicais
+  (`brasileir`) em vez de palavras.
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam
   valendo (`de*` acha "dezembro"). As listas estão em `src/stopwords/*.txt`;

@@ -242,7 +242,7 @@ prefixo na chave:
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
-| `meta:format`, `meta:positions`, `meta:languages` | versão do formato (3), se grava posições e idiomas das stopwords | |
+| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming` | versão do formato, se grava posições, idiomas das stopwords e stemming | |
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -494,6 +494,30 @@ descarta as mesmas palavras quando exatas, senão `casa de papel` exigiria um
 termo que não existe e voltaria vazia. Como prefixo (`de*`) elas continuam
 valendo. "são" e "era" ficam fora da lista de propósito: são também nomes
 (São Paulo, Era Vargas).
+
+**Stemming (opcional).** Com `Config::stemming` (`--stemming pt` na CLI), cada
+token que não é stopword vira o seu radical pelo Snowball (`src/stem.rs`):
+"correndo", "correu" e "corrida" viram `corr`. As stopwords são conferidas
+antes, na palavra inteira. Como os idiomas, a escolha é gravada na criação
+(`meta:stemming`) e conferida no `open`.
+
+O radical sai do token **já normalizado**, para a busca continuar insensível a
+acentos. O Snowball do português, porém, foi escrito para texto acentuado e
+erra os sufixos sem acento ("informacao" → `informaca`, "informacoes" →
+`informaco`). Por isso, antes dele, os sufixos que ele precisa ver acentuados
+ganham o acento de volta (`-cao` → `-ção`, `-coes` → `-ções`, `-avel` →
+`-ável`…): "informacao" → "informação" → `inform`. Aplicar o Snowball na
+palavra original, com acentos, juntaria mais flexões, mas 4% das palavras da
+Wikipédia mudariam de radical quando digitadas sem acento ("são" → `sa`, "sao"
+→ `sao`).
+
+O Snowball custa ~200 ns por palavra, mais que o resto da tokenização; a
+indexação guarda os radicais já calculados (`StemCache`, até 1 milhão de
+palavras, mantido entre lotes) e paga ~40 ns. Na busca, termos exatos e de
+frase são reduzidos do mesmo jeito; um prefixo não (`bras*` casa os radicais
+que começam com `bras`), mas o radical do texto digitado também entra
+(`brasileiro*` casa `brasileir`, senão a palavra inteira, digitada sem espaço
+no TUI, não acharia nada).
 
 ### 5.2 Lote invertido
 

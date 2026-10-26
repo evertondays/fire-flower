@@ -7,7 +7,7 @@
 //!   o título vem primeiro, e o texto começa `TITLE_GAP` posições depois
 //! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
-//! - `meta:*`       -> formato, contadores de ID, estatísticas e idiomas
+//! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas e stemming
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -22,7 +22,8 @@ use rustc_hash::FxHashMap;
 
 use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, PostingsCursor, TrieNode};
 use crate::stopwords::{self, Language, Stopwords};
-use crate::text::{Analyzer, Clause, normalize_term, parse_query};
+use crate::stem::{Stemmer, Stemming};
+use crate::text::{Analyzer, Clause, normalize_term, parse_query_stemmed};
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
@@ -43,6 +44,8 @@ const META_TOTAL_LEN: &[u8] = b"meta:total_len";
 const META_TOTAL_TITLE_LEN: &[u8] = b"meta:total_title_len";
 /// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
 const META_LANGUAGES: &[u8] = b"meta:languages";
+/// Stemming do banco ("nenhum", "pt", "en"; ver [`Stemming::code`]).
+const META_STEMMING: &[u8] = b"meta:stemming";
 
 const NODE: &[u8] = b"node:";
 const POST: &[u8] = b"post:";
@@ -130,6 +133,13 @@ pub struct Config {
     /// faz o `open` falhar. Sem posições o banco fica menor e a carga mais
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
+    /// Reduz as palavras ao radical (Snowball) na indexação e na busca:
+    /// "correndo" acha "corrida". Ver [`crate::stem`].
+    ///
+    /// Como os idiomas, é decidido na criação do banco: `None` usa o que está
+    /// gravado (ou [`Stemming::Off`], num banco novo; bancos de antes do
+    /// stemming são `Off`), e `Some` diferente do gravado faz o `open` falhar.
+    pub stemming: Option<Stemming>,
     /// Filtros de Bloom e índices dos SSTs em partições de 4 KB (ligado por
     /// padrão). Desligar volta ao filtro inteiro, que num banco grande passa
     /// do tamanho de uma parte do block cache e é relido a cada `Get`; existe
@@ -178,6 +188,7 @@ impl Default for Config {
             reader_cache_depth: Some(4),
             languages: None,
             positions: None,
+            stemming: None,
             partition_filters: true,
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,
@@ -198,6 +209,8 @@ pub struct Engine {
     writer: Mutex<WriterState>,
     config: Config,
     stopwords: Stopwords,
+    /// Stemming gravado no banco (`meta:stemming`).
+    stemmer: Stemmer,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
     /// Número do último commit gravado (ver [`EpochCache`]).
@@ -218,6 +231,8 @@ struct WriterState {
     /// e só o devolve no commit: um lote descartado leva o cache junto, e
     /// nada que não foi gravado sobrevive.
     cache: NodeCache,
+    /// Buffers da análise e radicais já calculados, entre um lote e outro.
+    analyzer: Analyzer,
 }
 
 #[derive(Default)]
@@ -366,12 +381,20 @@ impl Engine {
             total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
         };
         let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
-        let writer = Mutex::new(WriterState { next_node_id, next_doc_id, stats, cache: NodeCache::default() });
+        let stemmer = Stemmer::new(resolve_stemming(&db, config.stemming)?);
+        let writer = Mutex::new(WriterState {
+            next_node_id,
+            next_doc_id,
+            stats,
+            cache: NodeCache::default(),
+            analyzer: Analyzer::default(),
+        });
         Ok(Self {
             db,
             writer,
             config,
             stopwords,
+            stemmer,
             positions,
             epoch: AtomicU64::new(0),
             norms: EpochCache::default(),
@@ -387,6 +410,7 @@ impl Engine {
         // continua válido mesmo se outra thread entrou em pânico com o lock.
         let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let cache = std::mem::take(&mut state.cache);
+        let analyzer = std::mem::take(&mut state.analyzer);
         IndexBatch {
             engine: self,
             next_node_id: state.next_node_id,
@@ -399,7 +423,7 @@ impl Engine {
             pending: FxHashMap::default(),
             lengths: Vec::new(),
             labels: Vec::new(),
-            analyzer: Analyzer::default(),
+            analyzer,
         }
     }
 
@@ -430,9 +454,10 @@ impl Engine {
         self.view().search_ranked(query, k)
     }
 
-    /// Documentos que contêm exatamente `term` (normalizado aqui).
+    /// Documentos que contêm exatamente `term` (normalizado aqui e, com
+    /// stemming, reduzido ao radical, como numa busca).
     pub fn postings(&self, term: &str) -> Result<Vec<DocId>> {
-        let Some(term) = normalize_term(term) else { return Ok(Vec::new()) };
+        let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
             Some(node) => view.load_docs(node),
@@ -442,7 +467,7 @@ impl Engine {
 
     /// Como [`Engine::postings`], com a frequência do termo em cada documento.
     pub fn term_postings(&self, term: &str) -> Result<Vec<Posting>> {
-        let Some(term) = normalize_term(term) else { return Ok(Vec::new()) };
+        let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
             Some(node) => view.load_postings(node),
@@ -450,8 +475,22 @@ impl Engine {
         }
     }
 
+    /// O termo do índice para uma palavra: normalizada e, com stemming,
+    /// reduzida ao radical. `None` se não houver nada indexável.
+    pub fn index_term(&self, word: &str) -> Option<String> {
+        let term = normalize_term(word)?;
+        Some(if self.stemmer.is_on() { self.stemmer.stem(&term) } else { term })
+    }
+
+    /// Separa a consulta em partes como a busca faz (stopwords e stemming do
+    /// banco); ver [`crate::text::parse_query`].
+    pub fn parse_query(&self, query: &str) -> Vec<Clause> {
+        parse_query_stemmed(query, &self.stopwords, &self.stemmer)
+    }
+
     /// Autocompletar: até `limit` palavras indexadas que começam com `prefix`,
-    /// das mais curtas para as mais longas e em ordem alfabética.
+    /// das mais curtas para as mais longas e em ordem alfabética. Com
+    /// stemming, as palavras indexadas são radicais.
     pub fn suggest(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
         let Some(prefix) = normalize_term(prefix) else { return Ok(Vec::new()) };
         let words = self.view().words_with_prefix(&prefix, limit)?;
@@ -506,6 +545,11 @@ impl Engine {
     /// Idiomas das stopwords deste banco.
     pub fn languages(&self) -> &[Language] {
         self.stopwords.languages()
+    }
+
+    /// Stemming deste banco (o gravado nele).
+    pub fn stemmer(&self) -> &Stemmer {
+        &self.stemmer
     }
 }
 
@@ -880,7 +924,7 @@ impl View<'_> {
     }
 
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
-        let clauses = parse_query(query, &self.engine.stopwords);
+        let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
         // Listas exatas ficam como bytes até se saber quem conduz o E.
         let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
@@ -889,7 +933,7 @@ impl View<'_> {
         for clause in &clauses {
             match clause {
                 Clause::Term(t) if t.prefix => {
-                    let list = self.prefix_docs(&t.text)?;
+                    let list = self.prefix_docs(&t.text, t.stem.as_deref())?;
                     if list.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -990,7 +1034,7 @@ impl View<'_> {
     }
 
     fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
-        let clauses = parse_query(query, &self.engine.stopwords);
+        let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
         if clauses.is_empty() {
             return Ok(TopHits::default());
@@ -1021,7 +1065,7 @@ impl View<'_> {
                     // tf somado das completações que ele contém, e o idf do
                     // conjunto. Uma completação rara não vale mais que a
                     // palavra comum (R1 do plano de relevância).
-                    let list = self.prefix_postings(&t.text)?;
+                    let list = self.prefix_postings(&t.text, t.stem.as_deref())?;
                     if list.is_empty() {
                         return Ok(TopHits::default());
                     }
@@ -1240,12 +1284,25 @@ impl View<'_> {
     }
 
 
+    /// Nós das completações de `prefix` e, com stemming, o do radical do
+    /// prefixo (ver [`crate::text::QueryTerm::stem`]), sem repetir.
+    fn prefix_nodes(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<u64>> {
+        let mut nodes: Vec<u64> =
+            self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?.into_iter().map(|(_, n)| n).collect();
+        if let Some(node) = stem.map(|s| self.term_node(s)).transpose()?.flatten()
+            && !nodes.contains(&node)
+        {
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
     /// Listas das completações de `prefix` unidas por documento, com o tf
     /// somado: o prefixo como se fosse um termo só.
-    fn prefix_postings(&self, prefix: &str) -> Result<Vec<Posting>> {
-        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
+    fn prefix_postings(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<Posting>> {
+        let nodes = self.prefix_nodes(prefix, stem)?;
         let mut all: Vec<Posting> = Vec::new();
-        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+        for value in self.get_many(POST, nodes.into_iter())?.into_iter().flatten() {
             all.extend(codec::decode_postings(&value)?);
         }
         // `all` é a concatenação de listas já ordenadas: a ordenação estável
@@ -1265,10 +1322,10 @@ impl View<'_> {
         Ok(merged)
     }
 
-    fn prefix_docs(&self, prefix: &str) -> Result<Vec<DocId>> {
-        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
+    fn prefix_docs(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<DocId>> {
+        let nodes = self.prefix_nodes(prefix, stem)?;
         let mut all = Vec::new();
-        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+        for value in self.get_many(POST, nodes.into_iter())?.into_iter().flatten() {
             all.extend(codec::decode_docs(&value)?);
         }
         all.sort(); // trechos já ordenados: ver `prefix_postings`
@@ -1784,7 +1841,7 @@ impl IndexBatch<'_> {
     /// para pesar o título mais que o resto.
     pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
-        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords);
+        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords, &self.engine.stemmer);
         let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
             acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
@@ -1920,6 +1977,7 @@ impl IndexBatch<'_> {
         stats.evict_secs = t.elapsed().as_secs_f64();
         stats.cache_nodes = nodes.len();
         self.state.cache = NodeCache { nodes, generation: self.generation };
+        self.state.analyzer = std::mem::take(&mut self.analyzer);
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
         self.state.stats = stats_index;
@@ -2226,6 +2284,32 @@ fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Languag
         db.put(META_LANGUAGES, codes.join(","))?;
     }
     Ok(languages)
+}
+
+/// Stemming do banco. Num banco sem a chave, grava o da config (ou `Off`);
+/// um banco que já tem dados e não tem a chave é de antes do stemming: `Off`.
+fn resolve_stemming(db: &DB, wanted: Option<Stemming>) -> Result<Stemming> {
+    let stored = match db.get_pinned(META_STEMMING)? {
+        Some(v) => {
+            let code = String::from_utf8_lossy(&v);
+            Some(Stemming::from_code(&code).ok_or_else(|| Error::Corrupt(format!("stemming desconhecido no banco: {code:?}")))?)
+        }
+        None if read_counter(db, META_NEXT_NODE)?.is_some() => Some(Stemming::Off),
+        None => None,
+    };
+    let stemming = match (stored, wanted) {
+        (Some(stored), Some(wanted)) if stored != wanted => {
+            return Err(Error::Config(format!(
+                "o banco foi criado com stemming {stored}, mas a config pede {wanted}; recarregue o banco"
+            )));
+        }
+        (Some(stored), _) => stored,
+        (None, wanted) => wanted.unwrap_or_default(),
+    };
+    if db.get_pinned(META_STEMMING)?.is_none() {
+        db.put(META_STEMMING, stemming.code())?;
+    }
+    Ok(stemming)
 }
 
 fn parse_languages(codes: &str) -> Result<Vec<Language>> {

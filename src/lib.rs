@@ -32,7 +32,7 @@ mod engine;
 pub mod stopwords;
 pub mod text;
 
-pub use engine::{Config, Engine, IndexBatch};
+pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch};
 pub use stopwords::{Language, Stopwords};
 
 /// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).
@@ -40,8 +40,7 @@ pub use stopwords::{Language, Stopwords};
 #[doc(hidden)]
 pub mod internals {
     pub use crate::codec::{
-        NormBlock, PositionsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into,
-        encode_postings, merge_positions, merge_postings,
+        NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
     };
     pub use crate::engine::{intersect, reads_on_this_thread};
 }
@@ -52,8 +51,17 @@ pub type DocId = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Posting {
     pub doc: DocId,
-    /// Frequência do termo no documento (≥ 1).
+    /// Frequência do termo no documento inteiro, título e texto (≥ 1).
     pub tf: u32,
+    /// Quantas dessas ocorrências estão no título (≤ `tf`).
+    pub title_tf: u32,
+}
+
+impl Posting {
+    /// Entrada sem ocorrências no título.
+    pub fn new(doc: DocId, tf: u32) -> Self {
+        Self { doc, tf, title_tf: 0 }
+    }
 }
 
 /// Um resultado ranqueado: o documento e a nota BM25.
@@ -77,14 +85,27 @@ pub struct TopHits {
 pub struct IndexStats {
     /// Documentos distintos indexados (reindexar o mesmo ID não conta de novo).
     pub doc_count: u64,
-    /// Soma dos tamanhos dos documentos (tokens indexados, sem stopwords).
+    /// Soma dos tamanhos dos documentos (tokens indexados, sem stopwords),
+    /// título e texto.
     pub total_len: u64,
+    /// Soma dos tamanhos dos títulos (já contados em `total_len`).
+    pub total_title_len: u64,
 }
 
 impl IndexStats {
     /// Tamanho médio de um documento.
     pub fn avg_len(&self) -> f64 {
         if self.doc_count == 0 { 0.0 } else { self.total_len as f64 / self.doc_count as f64 }
+    }
+
+    /// Tamanho médio de um título.
+    pub fn avg_title_len(&self) -> f64 {
+        if self.doc_count == 0 { 0.0 } else { self.total_title_len as f64 / self.doc_count as f64 }
+    }
+
+    /// Tamanho médio do texto sem o título.
+    pub fn avg_body_len(&self) -> f64 {
+        self.avg_len() - self.avg_title_len()
     }
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;

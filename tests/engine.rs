@@ -373,7 +373,7 @@ fn database_without_stopwords() {
 use fire_flower::{Error, Hit, IndexStats, Posting};
 
 fn p(doc: u64, tf: u32) -> Posting {
-    Posting { doc, tf }
+    Posting::new(doc, tf)
 }
 
 fn positions(engine: &Engine, term: &str) -> Vec<(u64, Vec<u32>)> {
@@ -400,11 +400,11 @@ fn stores_tf_positions_lengths_and_stats() {
     assert_eq!(engine.doc_len(2).unwrap(), Some(1));
     assert_eq!(engine.doc_len(3).unwrap(), Some(0));
     assert_eq!(engine.doc_len(4).unwrap(), None);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 5 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 5, total_title_len: 0 });
 
     let mut lens = Vec::new();
-    engine.for_each_doc_len(|d, l| lens.push((d, l))).unwrap();
-    assert_eq!(lens, [(1, 4), (2, 1), (3, 0)]);
+    engine.for_each_doc_len(|d, l, t| lens.push((d, l, t))).unwrap();
+    assert_eq!(lens, [(1, 4, 0), (2, 1, 0), (3, 0, 0)]);
 
     // Persistem e seguem certos depois de reabrir e compactar.
     drop(engine);
@@ -413,7 +413,7 @@ fn stores_tf_positions_lengths_and_stats() {
     engine.compact();
     assert_eq!(engine.term_postings("papel").unwrap(), [p(1, 1), p(2, 1), p(2000, 2)]);
     assert_eq!(positions(&engine, "papel"), [(1, vec![2]), (2, vec![0]), (2000, vec![0, 1])]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7, total_title_len: 0 });
     assert_eq!(engine.doc_len(2000).unwrap(), Some(2));
 }
 
@@ -427,7 +427,7 @@ fn reindexing_replaces_tf_positions_and_length() {
     engine.index_document(7, "eco").unwrap();
     assert_eq!(engine.term_postings("eco").unwrap(), [p(7, 1)]);
     assert_eq!(positions(&engine, "eco"), [(7, vec![0])]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 1, total_len: 1 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 1, total_len: 1, total_title_len: 0 });
 
     // No mesmo lote, fora de ordem: a última adição vence.
     let mut batch = engine.batch();
@@ -439,15 +439,15 @@ fn reindexing_replaces_tf_positions_and_length() {
     assert_eq!(positions(&engine, "sol"), [(8, vec![0]), (9, vec![1])]);
     assert_eq!(positions(&engine, "lua"), [(8, vec![1]), (9, vec![0, 2])]);
     assert_eq!(engine.doc_len(9).unwrap(), Some(3));
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3, total_title_len: 0 });
 
     // Depois de compactar (merge completo) continua igual.
     engine.compact();
     assert_eq!(engine.term_postings("sol").unwrap(), [p(8, 1), p(9, 1)]);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6, total_title_len: 0 });
     drop(engine);
     let engine = open(&dir);
-    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6 });
+    assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6, total_title_len: 0 });
 }
 
 #[test]
@@ -579,14 +579,14 @@ fn bm25_matches_hand_computation() {
 }
 
 #[test]
-fn ties_break_by_id_and_prefix_takes_the_best_term() {
+fn ties_break_by_id_and_prefix_is_one_term() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
     let mut batch = engine.batch();
     for id in [30, 10, 20] {
         batch.add_document(id, "igual").unwrap();
     }
-    // D8: "carro carroca" tem dois termos do prefixo; vale o melhor, não a soma.
+    // R1: o prefixo é um termo só, com idf do conjunto e tf somado.
     batch.add_document(40, "carro carroca").unwrap();
     batch.add_document(41, "carro xis").unwrap();
     batch.add_document(42, "carroca xis").unwrap();
@@ -596,15 +596,42 @@ fn ties_break_by_id_and_prefix_takes_the_best_term() {
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [10, 20, 30]);
     assert!(got.windows(2).all(|w| w[0].1 == w[1].1));
 
+    // "carr*" casa 3 documentos: df = 3, e o 40 tem as duas completações (tf 2).
     let (n, avg) = (6.0, 9.0 / 6.0);
-    let carro = |tf: f64, len: f64| bm25(n, 2.0, tf, len, avg);
+    let carr = |tf: f64, len: f64| bm25(n, 3.0, tf, len, avg);
     let got: std::collections::HashMap<u64, f64> = ranked(&engine, "carr*").into_iter().collect();
     assert_eq!(got.len(), 3);
-    assert!(close(got[&40], carro(1.0, 2.0)), "máximo, não soma");
-    assert!(close(got[&41], carro(1.0, 2.0)));
-    assert!(close(got[&42], carro(1.0, 2.0)));
+    assert!(close(got[&40], carr(2.0, 2.0)), "tf somado");
+    assert!(close(got[&41], carr(1.0, 2.0)));
+    assert!(close(got[&42], carr(1.0, 2.0)));
+    assert!(got[&40] > got[&41]);
     let got = ranked(&engine, "carr* xis");
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [41, 42]);
+}
+
+/// O caso "nortel": uma completação rara não pode valer mais que a palavra
+/// que se está digitando. Com o máximo por completação (a regra antiga), o
+/// documento com "nortel" (df 1) ganhava dos que têm "norte" (df alto).
+#[test]
+fn rare_completion_does_not_beat_the_common_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_document(1, "coreia nortel empresa").unwrap();
+    for id in 2..12 {
+        batch.add_document(id, "coreia norte").unwrap();
+    }
+    for id in 12..40 {
+        batch.add_document(id, &format!("norte outro{id}")).unwrap();
+    }
+    batch.commit().unwrap();
+    let got = ranked(&engine, "coreia norte*");
+    assert_eq!(got.len(), 11);
+    assert_ne!(got[0].0, 1, "{got:?}");
+    assert_eq!(got.last().unwrap().0, 1, "documento só com a completação rara vem por último: {got:?}");
+    // Com só "norte" e "nortel" no índice, `norte*` tem o mesmo df de `norte` mais 1.
+    let exact = ranked(&engine, "coreia norte");
+    assert_eq!(exact.iter().map(|g| g.0).collect::<Vec<_>>(), got[..10].iter().map(|g| g.0).collect::<Vec<_>>());
 }
 
 /// Os cortes do top-k (limite superior e níveis de tf) não podem mudar o
@@ -932,4 +959,292 @@ fn bloom_filters_larger_than_a_cache_shard_are_not_reread_on_every_get() {
 
 fn engine_reads() -> u64 {
     fire_flower::internals::reads_on_this_thread()
+}
+
+/// Formato v3: o título é um campo. As palavras dele são buscáveis, o tf do
+/// título vem à parte na lista e os tamanhos do título ficam guardados.
+#[test]
+fn title_is_a_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_titled(1, "Coreia do Norte", "A Coreia do Norte fica na Ásia. Coreia, Coreia.").unwrap();
+    batch.add_titled(2, "Bandeira", "A bandeira da Coreia do Norte.").unwrap();
+    batch.add_document(3, "norte sem título").unwrap();
+    batch.commit().unwrap();
+
+    assert_eq!(engine.term_postings("coreia").unwrap(), [Posting { doc: 1, tf: 4, title_tf: 1 }, p(2, 1)]);
+    assert_eq!(engine.term_postings("bandeira").unwrap(), [Posting { doc: 2, tf: 2, title_tf: 1 }]);
+    assert_eq!(engine.term_postings("norte").unwrap(), [Posting { doc: 1, tf: 2, title_tf: 1 }, p(2, 1), p(3, 1)]);
+    // Termo só no título também casa.
+    assert_eq!(engine.search("bandeira").unwrap(), [2]);
+
+    // Tamanhos: o inteiro (título + texto) e o do título, sem stopwords.
+    let mut lens = Vec::new();
+    engine.for_each_doc_len(|d, l, t| lens.push((d, l, t))).unwrap();
+    assert_eq!(lens, [(1, 8, 2), (2, 4, 1), (3, 2, 0)]);
+    let stats = engine.stats().unwrap();
+    assert_eq!((stats.doc_count, stats.total_len, stats.total_title_len), (3, 14, 3));
+
+    // Reindexar troca o título e as estatísticas.
+    engine.index_document(2, "outro texto").unwrap();
+    assert_eq!(engine.stats().unwrap().total_title_len, 2);
+
+    // add_labeled_titled grava o rótulo e o título.
+    let mut batch = engine.batch();
+    let id = batch.add_labeled_titled("docs/readme.md", "readme", "instruções").unwrap();
+    batch.commit().unwrap();
+    assert_eq!(engine.label(id).unwrap().as_deref(), Some("docs/readme.md"));
+    assert_eq!(engine.term_postings("readme").unwrap(), [Posting { doc: id, tf: 1, title_tf: 1 }]);
+}
+
+/// Posições: o título em 0…T − 1, o texto a partir de T + TITLE_GAP. Uma
+/// frase não casa atravessando o fim do título e o começo do texto.
+#[test]
+fn phrase_does_not_cross_from_title_to_text() {
+    use fire_flower::text::TITLE_GAP;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    batch.add_titled(1, "Casa de", "papel azul").unwrap();
+    batch.add_titled(2, "Outro", "casa de papel").unwrap();
+    batch.commit().unwrap();
+    let node = engine.term_node("papel").unwrap().unwrap();
+    // Título "Casa de" tem 2 tokens: o texto começa em 2 + TITLE_GAP.
+    assert_eq!(engine.positions_of_node(node).unwrap(), [(1, vec![2 + TITLE_GAP]), (2, vec![1 + TITLE_GAP + 2])]);
+    assert_eq!(engine.search("\"casa de papel\"").unwrap(), [2]);
+    assert_eq!(engine.search("casa papel").unwrap(), [1, 2], "o E continua valendo entre os campos");
+}
+
+/// Banco v2 (formato anterior ao título) com merges pendentes no WAL: tem que
+/// ser recusado com a mensagem de recarregar, sem rodar o merge operator novo
+/// e sem alterar o banco.
+#[test]
+fn v2_database_is_rejected_before_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let concat = |_: &[u8], existing: Option<&[u8]>, ops: &rocksdb::MergeOperands| {
+        let mut out = existing.map(<[u8]>::to_vec).unwrap_or_default();
+        for op in ops {
+            out.extend_from_slice(op);
+        }
+        Some(out)
+    };
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.set_merge_operator_associative("fire_flower_v2", concat);
+        let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+        db.put(b"meta:format", [2u8]).unwrap();
+        db.put(b"meta:next_node_id", [5u8]).unwrap();
+        db.merge(b"post:4", [1u8, 7, 1]).unwrap();
+        db.merge(b"post:4", [1u8, 9, 1]).unwrap();
+    }
+    let err = Engine::open(dir.path(), Config::default()).err().expect("v2 tem que falhar");
+    assert!(matches!(&err, Error::Config(m) if m.contains("formato 2") && m.contains("recarregue")), "{err}");
+    // O merge operator antigo ainda lê a lista como era: nada foi tocado.
+    let mut opts = rocksdb::Options::default();
+    opts.set_merge_operator_associative("fire_flower_v2", concat);
+    let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+    assert_eq!(db.get(b"post:4").unwrap().unwrap(), [1u8, 7, 1, 1, 9, 1]);
+}
+
+/// BM25F (plano de relevância, R4): tf~ = tf_texto / B_texto + w · tf_título / B_título.
+fn bm25f(n: f64, df: f64, (tf_body, tf_title): (f64, f64), (body_len, title_len): (f64, f64), (avg_body, avg_title): (f64, f64), (w, bt): (f64, f64)) -> f64 {
+    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+    let b_body = 1.0 - B + B * body_len / avg_body;
+    let b_title = 1.0 - bt + bt * title_len / avg_title;
+    let ptf = tf_body / b_body + w * tf_title / b_title;
+    idf * ptf * (K1 + 1.0) / (ptf + K1)
+}
+
+fn titled(dir: &tempfile::TempDir, config: Config, docs: &[(u64, &str, &str)]) -> Engine {
+    let engine = Engine::open(dir.path(), config).unwrap();
+    let mut batch = engine.batch();
+    for (id, title, text) in docs {
+        batch.add_titled(*id, title, text).unwrap();
+    }
+    batch.commit().unwrap();
+    engine
+}
+
+#[test]
+fn bm25f_matches_hand_computation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (w, bt) = (3.0, 0.5);
+    let config = Config { title_weight: w, title_b: bt, ..Config::default() };
+    let engine = titled(&dir, config, &[(1, "Coreia", "coreia fica asia"), (2, "Bandeira coreia", "verde"), (3, "Outro", "coreia coreia texto longo aqui")]);
+    // Tamanhos (texto, título): 1 → (3, 1); 2 → (1, 2); 3 → (5, 1). Médias: texto 3, título 4/3.
+    let (n, avg) = (3.0, (3.0, 4.0 / 3.0));
+    let got: std::collections::HashMap<u64, f64> = ranked(&engine, "coreia").into_iter().collect();
+    let want = [
+        (1, bm25f(n, 3.0, (1.0, 1.0), (3.0, 1.0), avg, (w, bt))),
+        (2, bm25f(n, 3.0, (0.0, 1.0), (1.0, 2.0), avg, (w, bt))),
+        (3, bm25f(n, 3.0, (2.0, 0.0), (5.0, 1.0), avg, (w, bt))),
+    ];
+    for (doc, score) in want {
+        assert!(close(got[&doc], score), "doc {doc}: {} vs {score}", got[&doc]);
+    }
+    // Termo só no título também pontua; "verde" só no texto do 2.
+    assert!(close(ranked(&engine, "verde")[0].1, bm25f(n, 1.0, (1.0, 0.0), (1.0, 2.0), avg, (w, bt))));
+}
+
+/// O caso "Coreia do Norte": o artigo cujo título é a consulta vem antes dos
+/// derivados ("Bandeira da…", "Demografia da…"), mesmo sendo mais longo; e
+/// título curto vence título longo.
+#[test]
+fn title_match_ranks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_text = "a coreia do norte é um país da ásia com capital em pyongyang ".repeat(30);
+    let engine = titled(
+        &dir,
+        Config::default(),
+        &[
+            (1, "Bandeira da Coreia do Norte", "a bandeira da coreia do norte tem estrela"),
+            (2, "Coreia do Norte", &long_text),
+            (3, "Demografia da Coreia do Norte", "população da coreia do norte"),
+            (4, "Rio", "coreia norte coreia norte"),
+        ],
+    );
+    let got = ranked(&engine, "coreia do norte");
+    assert_eq!(got[0].0, 2, "{got:?}");
+    assert_eq!(ranked(&engine, "coreia do nor*")[0].0, 2, "digitando também");
+    assert_eq!(ranked(&engine, "\"coreia do norte\"")[0].0, 2, "frase também");
+}
+
+/// Frase no título: a ocorrência conta como título pela posição.
+#[test]
+fn phrase_in_title_counts_as_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = titled(&dir, Config::default(), &[(1, "Casa de papel", "outra coisa aqui"), (2, "Série", "casa de papel outra")]);
+    let got = ranked(&engine, "\"casa de papel\"");
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [1, 2]);
+    assert!(got[0].1 > got[1].1);
+    // Sem peso no título as duas ocorrências valem como texto.
+    drop(engine);
+    let engine = Engine::open(dir.path(), Config { title_weight: 0.0, ..Config::default() }).unwrap();
+    let got: std::collections::HashMap<u64, f64> = ranked(&engine, "\"casa de papel\"").into_iter().collect();
+    assert_eq!(got[&1], 0.0, "com peso 0 a frase só no título não pontua");
+}
+
+#[test]
+fn invalid_ranking_config_is_rejected() {
+    for config in [
+        Config { title_weight: -1.0, ..Config::default() },
+        Config { title_weight: f64::NAN, ..Config::default() },
+        Config { title_b: 1.5, ..Config::default() },
+        Config { bm25_b: -0.1, ..Config::default() },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(Engine::open(dir.path(), config), Err(Error::Config(_))));
+    }
+    // b = 1 é válido (sem limite útil para o corte, mas exato).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = titled(&dir, Config { bm25_b: 1.0, title_b: 1.0, ..Config::default() }, &[(1, "a", "x"), (2, "", "x x")]);
+    assert_eq!(engine.search_top("x", 10).unwrap().len(), 2);
+}
+
+/// O corte do top-k com títulos (chave com o tf do título convertido) não
+/// pode mudar o resultado: com k pequeno, o começo do ranking completo.
+#[test]
+fn top_k_pruning_is_exact_with_titles() {
+    for (w, bt) in [(3.0, 0.5), (8.0, 0.0), (1.0, 0.75), (0.0, 0.5)] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), Config { title_weight: w, title_b: bt, ..Config::default() }).unwrap();
+        let mut batch = engine.batch();
+        let mut rng = 7u64;
+        let mut next = |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        for id in 0..2000u64 {
+            let title = ["", "alvo", "alvo alvo outro", "outro", "x y z alvo"][next(5) as usize];
+            let tf = 1 + next(6) as usize;
+            let filler = ["x"; 4][..next(5) as usize].join(" ");
+            batch.add_titled(id * 3, title, &format!("{} {filler} outro casa de papel", "alvo ".repeat(tf))).unwrap();
+        }
+        batch.commit().unwrap();
+        for q in ["alvo", "alvo outro", "alv*", "x alvo", "\"casa de papel\"", "\"casa de papel\" alvo"] {
+            let all = engine.search_ranked(q, usize::MAX).unwrap();
+            for k in [1, 3, 10, 50, 500] {
+                let top = engine.search_ranked(q, k).unwrap();
+                assert_eq!(top.total, all.total, "{q} k={k} w={w}");
+                assert_eq!(top.hits, all.hits[..k.min(all.hits.len())], "{q} k={k} w={w} b={bt}");
+            }
+        }
+    }
+}
+
+/// Formato v4: listas com tabela de saltos. E, frases e ranking com listas
+/// que atravessam muitos blocos de 128 documentos, montadas em vários lotes
+/// (merge rápido), com reindexação (merge completo) e depois de compactar,
+/// têm que dar o mesmo que um cálculo ingênuo.
+#[test]
+fn skip_lists_give_the_same_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+    let words = ["sol", "lua", "mar", "rio", "monte", "vale", "pedra", "areia"];
+    let mut rng = 2024u64;
+    let mut next = |n: u64| {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 33) % n
+    };
+    let mut docs: std::collections::BTreeMap<u64, Vec<&str>> = std::collections::BTreeMap::new();
+    let make = |next: &mut dyn FnMut(u64) -> u64| -> Vec<&str> {
+        // Palavras comuns em quase todo documento; "rara" de vez em quando.
+        let mut text: Vec<&str> = (0..2 + next(8)).map(|_| words[next(words.len() as u64) as usize]).collect();
+        if next(40) == 0 {
+            text.push("rara");
+        }
+        text
+    };
+    for chunk in 0..4u64 {
+        let mut batch = engine.batch();
+        for i in 0..900u64 {
+            let id = chunk * 900 + i;
+            let text = make(&mut next);
+            batch.add_document(id * 3, &text.join(" ")).unwrap();
+            docs.insert(id * 3, text);
+        }
+        batch.commit().unwrap();
+    }
+    // Reindexa documentos espalhados: os pedaços se sobrepõem às listas antigas.
+    let mut batch = engine.batch();
+    for id in (0..3600u64).step_by(37) {
+        let text = make(&mut next);
+        batch.add_document(id * 3, &text.join(" ")).unwrap();
+        // Termos que saíram do texto continuam apontando para o documento.
+        let old = docs.remove(&(id * 3)).unwrap();
+        let mut merged: Vec<&str> = text.clone();
+        merged.extend(old.iter().filter(|w| !text.contains(w)));
+        docs.insert(id * 3, merged);
+    }
+    batch.commit().unwrap();
+
+    let has = |d: &Vec<&str>, w: &str| d.contains(&w);
+    let check = |engine: &Engine, when: &str| {
+        for q in ["sol lua", "rara sol", "rara mar pedra", "vale areia monte", "sol", "rara"] {
+            let terms: Vec<&str> = q.split(' ').collect();
+            let want: Vec<u64> = docs.iter().filter(|(_, d)| terms.iter().all(|t| has(d, t))).map(|(&id, _)| id).collect();
+            assert_eq!(engine.search(q).unwrap(), want, "{when}: {q}");
+            let top = engine.search_ranked(q, 20).unwrap();
+            assert_eq!(top.total, want.len(), "{when}: {q} (ranqueado)");
+            let all = engine.search_ranked(q, usize::MAX).unwrap();
+            assert_eq!(top.hits, all.hits[..top.hits.len()], "{when}: {q} (top 20 = começo do ranking)");
+        }
+        // Frases: conferidas contra a busca sem frase (subconjunto) e contra
+        // a contagem do ranking.
+        for q in ["\"sol lua\"", "\"mar rio\" sol", "rara \"pedra areia\""] {
+            let found = engine.search(q).unwrap();
+            let loose = engine.search(&q.replace('"', "")).unwrap();
+            assert!(found.iter().all(|d| loose.binary_search(d).is_ok()), "{when}: {q}");
+            assert!(!found.is_empty() || q.contains("rara"), "{when}: {q} vazio");
+            assert_eq!(engine.search_ranked(q, 5).unwrap().total, found.len(), "{when}: {q}");
+        }
+    };
+    check(&engine, "antes de compactar");
+    let before: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
+    engine.compact();
+    check(&engine, "depois de compactar");
+    let after: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
+    assert_eq!(before, after);
 }

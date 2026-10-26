@@ -1,104 +1,75 @@
-# Plano de Validação de Performance — fire-flower (Rust + RocksDB)
+# Plano de performance — fire-flower (Rust + RocksDB)
 
-Plano incremental para medir, validar e otimizar o **fire-flower** usando a
-**Wikipédia em português** (1,1 milhão de artigos, já baixada) como carga
-principal.
+Plano para medir, validar e otimizar o **fire-flower** usando a **Wikipédia em
+português** (1,1 milhão de artigos) como carga principal.
 
-**O que mudou em relação à versão anterior**
+**Estado em 26/10/2026 (commit `d088f12`, formato v3 com BM25F):** o harness, o
+oráculo e as fases de medição rodam até a Wikipédia inteira. A carga completa
+leva **4 minutos** (1.112.246 artigos em 242 s, sem colapso), e o
+`perf.py tudo --escala full`, 31 minutos. A análise detalhada da última rodada
+está em [ANALISE-full-vs-100k.md](https://github.com/evertondays/fire-flower-bench/blob/main/ANALISE-full-vs-100k.md).
 
-- O corpus deixou de ser hipotético: a Wikipédia já está em disco, com fatias
-  de 1k, 10k e 100k documentos para subir a carga aos poucos.
-- Entrou uma fase de **corretude em escala** antes da de performance: o índice
-  é comparado com um índice ingênuo em memória.
-- As consultas vêm do próprio corpus, separadas pelo que custa caro *neste*
-  motor: frequência do termo, comprimento e prefixo.
-- Saíram itens que o motor ainda não tem (busca por frase, OR, update/delete),
-  e entraram os riscos que ele tem: um `Get` por caractere, merge operator e
-  limite de expansão de prefixo.
-- O `db_bench` virou fase opcional, e os comandos foram corrigidos
-  (`cargo install criterion` não existe; criterion é só dependência).
-- Foram considerados os limites da máquina: WSL2, 7,7 GB de RAM e 12 núcleos.
+**Progresso na branch `performance-issues-in-v3-version` (commit `ad63e51`,
+formato v5):** carga inteira em **116 s** (−52%), E de termo raro com frequente
+−93%, frases −38% a −72%, títulos −44%, 19,5 mil consultas/s com 12 threads,
+zero divergências. P1, P2 e P5 (saltos) feitos; P3 parcial; P4 encerrado (o
+limite é a máquina). Detalhes em
+[PROGRESSO-performance.md](https://github.com/evertondays/fire-flower-bench/blob/main/PROGRESSO-performance.md). O que
+falta tem uma causa comum: ler listas inteiras de termos muito frequentes
+(block-max no top-k, frases de termos frequentes, prefixos de 1–2 letras).
 
 ---
 
 ## Como rodar
 
-Tudo está implementado em `examples/wiki.rs` (o harness) e orquestrado por
-`scripts/perf.py`. A escala define a maior fatia usada; comece pequeno, porque
-a Wikipédia inteira leva mais de uma hora.
+Tudo está em `examples/wiki.rs` (o harness) e é orquestrado por
+`scripts/perf.py`. A escala define a maior fatia do corpus usada.
 
 ```bash
-python3 scripts/perf.py tudo --escala 10k     # todas as fases, ~7 min
-python3 scripts/perf.py pr --escala 10k       # checagem rápida contra a linha de base
-python3 scripts/perf.py frases --escala 10k   # só frases e ranking (carga com/sem posições, oráculo, latência)
-python3 scripts/perf.py relatorio --escala 10k
+python3 scripts/perf.py tudo --escala 10k        # todas as fases, ~7 min
+python3 scripts/perf.py tudo --escala 100k       # ~12 min
+python3 scripts/perf.py tudo --escala full       # ~31 min
+python3 scripts/perf.py pr --escala 100k         # checagem rápida contra a linha de base
+python3 scripts/perf.py carga-longa --reproduzir # cenário do colapso da carga (ver achado 5)
+python3 scripts/perf.py frases --escala 10k      # só frases e ranking
+python3 scripts/perf.py relevancia --escala 100k # consultas com resposta conhecida
+python3 scripts/perf.py relatorio --escala full  # regera o RESULTADOS.md de fire-flower-bench
 ```
 
-Ao salvar uma linha de base nova (`tudo`, ou `pr --salvar-baseline`), a
-anterior, de outro commit, fica guardada como
-`bench/baseline-pr-<escala>-<commit>.json`.
+- Resultados ficam no repositório separado
+  [fire-flower-bench](https://github.com/evertondays/fire-flower-bench), clonado ao lado deste
+  (`../fire-flower-bench`; `FF_BENCH_DIR` para mudar): um JSON por medição em
+  `results/` (com commit e data) e o resumo legível em
+  [`RESULTADOS.md`](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md). Depois de uma rodada, commite e suba
+  esse repositório.
+- Linha de base do `pr`: `baseline-pr-<escala>.json`, no mesmo repositório. Ao
+  salvar uma nova, a anterior (de outro commit) fica como
+  `baseline-pr-<escala>-<commit>.json`.
+- Para medir com cache frio, rode `sudo -v` antes: sem isso o `perf.py` pula
+  essa parte.
 
-Os resultados ficam em `bench/results/` (um JSON por medição, com commit e
-data) e o resumo legível em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
+---
 
-## Achados da primeira linha de base (escala 10k, 25/10/2026)
+## 1. Onde está o custo hoje
 
-Números em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
+Medido na Wikipédia inteira, cache quente, 1 thread, banco compactado.
 
-1. **Corretude:** zero divergências do oráculo em todos os 288 mil termos, 5
-   mil consultas AND, 2 mil prefixos e autocompletares e mil títulos.
-   Idempotência, lotes vs. único e reabrir também batem.
-2. **Prefixo incompleto é a regra, não a exceção:** cerca de metade dos
-   prefixos sorteados casa mais de 256 termos, e o resultado de `pre*` fica
-   incompleto. Já com 10k documentos.
-3. **Custo por caractere confirmado:** Gets por consulta = comprimento + 2
-   (`t-len-3` → 5, `t-len-8` → 10, `t-len-15` → 17). Prefixos curtos fazem de
-   640 a 840 Gets e levam ~2 ms. É o argumento medido para o índice ordenado
-   `term:<palavra>`.
-4. **Merge pendente pesa:** antes da compactação, `t-freq` tem p50 de 85 µs;
-   depois, 60 µs (−30%). Reindexar a fatia dobra o banco (17,6 → 27,6 MB) até
-   compactar (16,3 MB).
-5. **Risco para a escala 1,1M, o block cache:** com 64 MB, toda leitura vai ao
-   disco (~1 block read por Get, p50 15× pior), mesmo com o banco de 16 MB
-   cabendo no cache. O cache LRU se divide em 64 partes, e o filtro de Bloom
-   do SST (~1,3 MB num bloco só) não cabe numa parte de 1 MB. Com 256 MB as
-   partes têm 4 MB e cabe. Na Wikipédia inteira os SSTs são maiores e o filtro
-   pode passar de 4 MB. **Confirmado e corrigido (25/10):** na carga inteira a
-   velocidade caía de ~5.000 para ~200 artigos/s em 200k, 500k ou 600k
-   artigos (quando a compactação gerava um SST de chaves `node:` com filtro de
-   ~6 MB); o RocksDB chegou a contar 22 TB de filtro inserido no cache. Agora
-   filtros e índices são particionados (blocos de 4 KB). Cenário de teste:
-   `perf.py carga-longa` (com `--reproduzir`, roda antes a config antiga, que
-   tem que colapsar) e o teste `bloom_filters_larger_than_a_cache_shard_...`.
-6. **Lotes maiores indexam mais rápido:** lote de 10.000 dá +26% docs/s, mas
-   o pico de RSS vai de 160 para 300 MB.
-7. **Leitura escala:** `misto` vai de 4,9 mil qps (1 thread) a 30,6 mil qps
-   (12 threads), 6,3×. Indexar ao mesmo tempo não mexeu no p99 nesta escala,
-   mas o volume escrito foi pequeno (1.000 docs).
-8. **Ruído:** docs/s variou ~10% entre execuções iguais (953 vs. 860). O
-   limite de 10% do `pr` pode dar falso alarme na carga; o p50 das buscas foi
-   mais estável.
-
-## 1. O que estamos testando
-
-O motor guarda os termos numa Trie persistida no RocksDB (um registro por nó)
-e as listas de postagem com merge operator. Os testes miram o custo real de
-cada operação:
-
-| Operação | Caminho no código | Custo esperado | O que pode dar errado em escala |
+| Operação | Custo medido (full) | De onde vem | Situação |
 |---|---|---|---|
-| Indexar lote | `IndexBatch::add_document` + `commit` | tokenizar + percorrer a Trie por termo único + 1 `merge` por termo | o cache de nós do lote é descartado a cada commit, então os nós quentes são lidos e decodificados de novo em todo lote |
-| Termo exato | `View::postings` → `find_node` | **1 `Get` por caractere** + 1 `Get` da lista | a raiz (`node:0`) é decodificada em toda consulta e pode ter milhares de filhos (a Wikipédia tem muitos alfabetos) |
-| Termo frequente | `load_postings` | decodificar ~1 milhão de varints ("de", "a", "o") | listas de MB; operandos de merge ainda não compactados são unidos *em toda leitura* |
-| AND (`a b c`) | `search` + `intersect` | começa pela lista menor | sempre carrega todas as listas inteiras, mesmo a de "de" |
-| Prefixo (`port*`) | `prefix_postings` → busca em largura na Trie | 1 `Get` por nó visitado | `a*` para em 256 termos (`max_prefix_terms`): **resultado incompleto** |
-| Autocompletar | `suggest` | idem, até `limit` | busca em largura em prefixos curtos |
-| Abrir o banco | `Engine::open` | leitura de 2 contadores | tempo de recuperação do WAL após carga grande |
+| Carga | 242 s, ~10 MB/s estável depois de 400k | **commit: 74–80% do tempo**, numa thread só; tokenização ~20% | aberto: falta saber o que dentro do commit (seção 8, P1) |
+| Termo raro ou médio | 18–23 µs | descida na Trie, ~1 µs por letra | resolvido: não muda com a escala |
+| Autocompletar | 22–71 µs | busca em largura nos níveis rasos (em cache) | resolvido |
+| Termo frequente | 329 µs (145 mil docs) | decodificar a lista inteira, ~2 ns por documento | aberto (P5) |
+| E de termos médios | 44–110 µs | listas curtas | resolvido |
+| E com termo frequente | 0,4–1,9 ms | decodifica a lista frequente inteira | aberto (P5) |
+| Prefixo curto (`p-1`, `p-2`) | p50 4,4–5,1 ms, p99 10–30 ms | 500–800 leituras na Trie, fora do cache de nós rasos; corte em 256 termos | **aberto: a consulta mais cara, e o TUI faz uma por tecla** (P3) |
+| Frases | p50 0,9–4,1 ms, p99 ~10 ms | listas `pos:` inteiras (até 2 MB) e blocos fora do block cache | aberto (P5, P6) |
+| Top 10 (BM25F) | 107 µs (títulos) a 976 µs (termo frequente) | decodifica as listas inteiras | aberto (P5) |
+| Várias threads | 4,3× com 12 threads | suspeito: `RwLock` dos caches de leitura (`EpochCache`) | aberto (P4) |
+| Abrir o banco | 38 ms após a carga, 29 ms compactado | | resolvido |
 
-**Fora do escopo por enquanto** (o motor não tem): OR, remoção e
-atualização. Busca por frase e ranking BM25 já existem (ver
-[plano-frases-e-ranking.md](plano-frases-e-ranking.md)) e têm conjuntos
-próprios (`frase-*`, `rank-*`).
+**Fora do escopo por enquanto** (o motor não tem): OR, remoção e atualização
+(ver [design-escrita-leitura.md](design-escrita-leitura.md)).
 
 ---
 
@@ -106,408 +77,306 @@ próprios (`frase-*`, `rank-*`).
 
 | Arquivo (`~/datasets/ptwiki/`) | Artigos | Tamanho | Uso |
 |---|---|---|---|
-| `ptwiki-1000.jsonl` | 1.000 | 21 MB | smoke test, iteração rápida |
+| `ptwiki-1000.jsonl` | 1.000 | 21 MB | smoke test |
 | `ptwiki-10000.jsonl` | 10.000 | 93 MB | oráculo completo, por PR |
-| `ptwiki-100000.jsonl` | 100.000 | 471 MB | profiling, varreduras de configuração |
-| `ptwiki.jsonl` | 1.112.246 | 2,7 GB (2,65 GB de texto) | carga total, concorrência |
+| `ptwiki-100000.jsonl` | 100.000 | 471 MB | experimentos de configuração |
+| `ptwiki.jsonl` | 1.112.246 | 2,7 GB (2,69 GB de texto) | carga total, concorrência |
 
 - **Formato:** um JSON por linha, `{"id": u64, "title", "url", "text"}`.
-- **Fonte:** Hugging Face `wikimedia/wikipedia`, snapshot `20231101.pt`, com o
-  texto já limpo (sem wikitext). Os parquets originais ficam em `raw/`.
-- **Como regerar:** `scripts/ptwiki_corpus.py`.
-- **Fatias:** cada uma é um prefixo da seguinte (`head -n N`), então os
-  resultados das fatias menores são comparáveis com os das maiores.
-- **IDs:** o `id` é o page id da Wikipédia, único, mas **esparso**. Isso afeta
-  o tamanho das listas, que guardam deltas (ver Fase 3).
-- **O que indexar:** `title + "\n" + text`. Assim, buscar o título de um
-  artigo tem que trazer o próprio artigo, o que serve de checagem de
-  revocação.
-- **Pendente:** confirmar que os IDs são únicos. A checagem foi interrompida e
-  será refeita pelo `wiki vocab`, que lê o corpus inteiro de qualquer forma.
-
-O corpus está em disco e não toca o código; o resto do plano depende dele.
+- **Fonte:** Hugging Face `wikimedia/wikipedia`, snapshot `20231101.pt`, texto
+  já limpo. Os parquets originais ficam em `raw/`. Regerar com
+  `scripts/ptwiki_corpus.py`.
+- **Fatias:** cada uma é um prefixo da seguinte (`head -n N`). Os primeiros
+  100k artigos da carga inteira dão, janela a janela, os mesmos números da
+  carga de 100k.
+- **IDs:** page ids da Wikipédia, únicos (confirmado no corpus inteiro: 0
+  repetidos), crescentes no arquivo e **esparsos** (até 7,2 milhões para 1,1
+  milhão de artigos).
+- **Tamanho dos artigos:** os primeiros são longos (4,8 KB em média nos
+  primeiros 100k) e os do fim, curtos (2,5 KB na média geral). Por isso
+  artigos/s **sobe** na carga inteira; compare cargas por **MB/s**.
 
 ---
 
 ## 3. Regras do ambiente
 
-A máquina é um WSL2 com 7,7 GB de RAM, 12 núcleos e disco ext4 em VHD.
-Números de outra máquina não são comparáveis com os daqui.
+WSL2, Ryzen 5 5600X (6 núcleos físicos, 12 threads), 7,7 GB de RAM, ext4 em
+VHD. Números de outra máquina não são comparáveis com os daqui.
 
-- **Compilar com poucos jobs.** Com 12 jobs, compilar o RocksDB em C++ chega
-  perto de estourar a RAM. Use `.cargo/config.toml` com `[build] jobs = 4`.
-- **Nada pesado em paralelo** durante as medições: outra compilação, outra
-  sessão rodando `cargo check`, Jellyfin transcodificando.
-- **Banco e corpus no disco Linux** (`~/…`), nunca em `/mnt/c`, que é lento
-  (9p) e distorce I/O.
-- **Sempre build release**, num commit fixo. Registre o hash do commit, a
-  `Config` usada e o resultado de `free -h` em cada rodada.
-- **Cache quente vs. frio.** Para frio, reabra o banco depois de
-  `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`. Para quente, descarte a
-  primeira passada.
-- **Teto de memória:** a carga total precisa caber sem usar swap. Uso de swap
-  conta como regressão.
+- **Compilar com poucos jobs:** `.cargo/config.toml` tem `[build] jobs = 4`
+  (compilar o RocksDB com 12 jobs chega perto de estourar a RAM).
+- **Nada pesado em paralelo** durante as medições (outra compilação, outra
+  sessão com `cargo check`, Jellyfin transcodificando).
+- **Banco e corpus no disco Linux** (`~/…`), nunca em `/mnt/c`.
+- **Sempre build release**, num commit fixo. O harness grava commit, `Config`
+  e estado da memória em cada resultado.
+- **Teto de memória:** a carga total tem que caber sem swap (hoje: pico de
+  838 MB, 6 GB livres).
+- **Ruído:** a carga varia ~1% entre rodadas iguais na full e até ~10% no
+  10k. O p50 das buscas é mais estável que o p99.
 
 ---
 
-## 4. Fase 0 — Ferramentas e harness
-
-### Ferramentas
-
-```bash
-cargo install hyperfine        # comparar comandos inteiros
-cargo install samply           # profiler de CPU
-sudo apt install heaptrack     # perfil de alocações
-```
-
-- `/usr/bin/time -v` dá o pico de RSS ("Maximum resident set size").
-- `cargo flamegraph` precisa do `perf`, e o `perf` do apt não corresponde ao
-  kernel do WSL2. Use o **samply**; se ele falhar no WSL, compile o `perf` a
-  partir do fonte do kernel da Microsoft.
-- Criterion **não** se instala com `cargo install`: ele entra como
-  dev-dependency.
-
-### Cargo.toml
-
-```toml
-[dev-dependencies]
-tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[[bench]]
-name = "micro"
-harness = false
-
-# Release com símbolos, só para profiling. Não altera o `release` normal.
-[profile.profiling]
-inherits = "release"
-debug = true
-```
-
-`lto` e `codegen-units = 1` ficam como **experimento separado** (Fase 6). Eles
-deixam a compilação mais lenta e mais pesada, e o ganho precisa ser medido,
-não assumido.
-
-### Ganchos no motor (mudanças pequenas)
-
-O `Engine` descarta as `Options` depois do `open`, então hoje não há como ler
-as estatísticas do RocksDB. É preciso:
-
-1. `Config::statistics: bool`. Quando ligado, chamar `opts.enable_statistics()`
-   e `opts.set_statistics_level(StatsLevel::ExceptTimers)`, e guardar as
-   `Options` dentro do `Engine`.
-2. `Engine::rocksdb_stats() -> Option<String>`, que devolve
-   `opts.get_statistics()`.
-3. `Engine::property(name) -> Option<String>`, que repassa
-   `db.property_value(...)` (`rocksdb.stats`, `rocksdb.estimate-num-keys`,
-   `rocksdb.total-sst-files-size`, `rocksdb.num-files-at-level0` etc.).
-4. `Engine::compact()`, que chama `db.compact_range::<&[u8], &[u8]>(None, None)`.
+## 4. Ferramentas e harness
 
 ### Harness: `examples/wiki.rs`
 
-Um único binário com subcomandos, todos lendo o JSONL:
+| Subcomando | O que faz |
+|---|---|
+| `load` | indexa o corpus; a cada 10k artigos mostra MB/s, fração do tempo no commit, Gets por artigo, filtro de Bloom relido, stall, arquivos no L0, RSS e RAM livre, e acusa colapso (MB/s abaixo de 20% da mediana das 10 janelas anteriores). Opções de experimento: `--batch`, `--cache-mb`, `--cache-nos`, `--sem-posicoes`, `--filtro-inteiro`, `--remap-ids`, `--streaming` |
+| `vocab` | df e comprimento de cada termo; confere IDs únicos |
+| `queries` | gera os conjuntos de consulta (seção 6) com seed fixa |
+| `oracle` | compara o motor com um índice ingênuo em memória (seção 5) |
+| `bench` | latência por conjunto (p50/p95/p99/máx, qps, Gets e blocos lidos por consulta) |
+| `sizes` | espaço por tipo de chave e os 20 maiores valores |
+| `digest` | resumo do conteúdo lógico, para comparar bancos |
+| `concurrent` | buscas com e sem indexação em paralelo |
+| `relevancia` | consultas com resposta conhecida (ver [plano-relevancia.md](plano-relevancia.md)) |
 
-| Subcomando | O que faz | Saída |
+O PerfContext é lido pelo relatório em texto: o enum `PerfMetric` do crate
+`rocksdb` 0.23 está desalinhado com o RocksDB 10.4 embutido.
+
+### Ferramentas
+
+| Ferramenta | Para quê | Situação |
 |---|---|---|
-| `load --db D --corpus F [--batch N] [--skip K] [--take N] [--remap-ids]` | indexa e imprime progresso a cada 10k docs (docs/s, MB/s, RSS, tamanho do banco) | `results/load-*.json` |
-| `vocab --corpus F` | tokeniza com `fire_flower::text::tokenize` e conta df (em quantos docs) e comprimento de cada termo; confere IDs únicos | `vocab.tsv` |
-| `queries --vocab V --corpus F --seed 42` | gera os conjuntos da Fase 4 | `bench/queries/*.txt` |
-| `oracle --db D --corpus F` | compara o motor com um índice ingênuo em memória (Fase 1) | divergências |
-| `bench --db D --queries Q [--threads T] [--cold]` | roda as consultas e mede latência e PerfContext | `results/bench-*.json` |
-| `sizes --db D` | percorre o banco somando chaves e valores por espaço (`node:`, `post:`, `meta:`) e lista os 20 maiores valores | tabela |
-
-Usar `fire_flower::text::tokenize` no `vocab` e no `oracle` garante que o oráculo
-normaliza exatamente como o motor.
+| `samply` (`cargo install samply`) | profiler de CPU (o `perf` do apt não bate com o kernel do WSL2) | **falta instalar**; necessário para P1 e P4 |
+| `heaptrack` (`sudo apt install heaptrack`) | alocações | falta instalar |
+| `hyperfine` | comparar comandos inteiros | opcional |
+| Criterion (`benches/micro.rs`) | microbenchmarks com dados reais (banco de 100k) | pronto |
+| `[profile.profiling]` no `Cargo.toml` | release com símbolos | pronto |
 
 ---
 
-## 5. Fase 1 — Corretude em escala
+## 5. Fases de medição
 
-Velocidade não vale nada se o resultado estiver errado. Esta fase roda antes
-de qualquer medição de performance, e o critério é **zero divergências**.
-
-| Teste | Fatia | Como | Esperado |
+| Fase | O que mede | Situação | Onde ver |
 |---|---|---|---|
-| Listas de postagem | 10k | índice ingênuo `HashMap<termo, BTreeSet<id>>`, comparando **todos** os termos | idênticas |
-| Listas (amostra) | 100k | 50k termos sorteados, estratificados por df | idênticas |
-| AND | 10k e 100k | 5k consultas de 2 a 5 termos; o oráculo faz a interseção | idênticas |
-| Prefixo | 10k | o oráculo filtra o vocabulário por prefixo | idêntico quando ≤ 256 termos; quando passar disso, **registrar o tamanho da diferença** |
-| Autocompletar | 10k | o oráculo ordena por (comprimento, alfabeto) | idêntico |
-| Título → artigo | 100k | 1.000 títulos sorteados; o resultado tem que conter o próprio artigo | 100% |
-| Normalização | qualquer | "São Paulo", "sao paulo" e "SÃO PAULO" | mesmos resultados |
-| Reabrir | 100k | carregar, fechar, abrir e repetir as consultas; carregar mais 1k docs | contadores corretos, nada sobrescrito |
-| Idempotência | 10k | indexar a fatia duas vezes | mesmos resultados; anotar o tamanho do banco antes e depois de `compact()` |
-| Lotes vs. único | 1k | `--batch 1` vs. `--batch 1000` | bancos com o mesmo conteúdo lógico |
+| 1 — corretude | oráculo, idempotência, lotes vs. único, reabrir | ✅ 0 divergências em 10k (todos os termos) e 100k (amostra) | `RESULTADOS.md` |
+| 2 — escada de carga | 1k → 10k → 100k → 1,1M, mais experimentos no 100k | ✅ até 1,1M | `RESULTADOS.md`, análise seção 1 |
+| 3 — conjuntos de consulta | ~1.000 consultas por conjunto, por escala | ✅ (ver ressalva abaixo) | `bench/queries/<escala>/` |
+| 4 — latência | por conjunto; merge pendente; block cache de 64 MB / 256 MB / 1 GB | ✅ quente na full; ❌ frio nunca rodou | análise seção 4 |
+| 5 — concorrência | `misto` com 1–12 threads; leitura durante escrita | ✅ na full | análise seção 5 |
+| 6 — profiling | flamegraph de carga, busca e compactação | ❌ **nunca rodou** | seção 8 |
+| 7 — `db_bench` | RocksDB puro vs. o motor | descartada: o `Get` do RocksDB nunca apareceu como gargalo | — |
+| 8 — regressões | `pr`: oráculo 10k + carga + bench de 5 conjuntos | ✅ linhas de base de 100k e full | `baseline-pr-*.json` (fire-flower-bench) |
 
----
+### Fase 1 — o que o oráculo confere
 
-## 6. Fase 2 — Escada de indexação (bulk)
+O índice ingênuo é construído só com `tokenize` e as stopwords (nada da
+indexação do motor é reaproveitado) e compara: listas (doc, tf, tf no título),
+posições, tamanhos e estatísticas, E, prefixo, autocompletar, título → artigo,
+normalização, frases (tiradas de trechos reais e com a ordem trocada) e o top
+10 do BM25F (diferença relativa < 1e-4). Critério: **zero divergências**.
 
-Indexar as fatias em ordem, cada uma num banco novo:
+| Teste | Fatia |
+|---|---|
+| Todos os termos | 10k |
+| Amostra estratificada por df (~31 mil termos) | 100k |
+| Reabrir e carregar mais 1.000 artigos | 100k |
+| Idempotência (a fatia duas vezes) | 10k |
+| Lotes vs. único (lote 1 vs. 1000) | 1k |
 
-```bash
-/usr/bin/time -v target/release/examples/wiki load \
-  --db ~/bench-db/ptwiki-100k --corpus ~/datasets/ptwiki/ptwiki-100000.jsonl --batch 1000
-```
+**Lacuna:** nada confere o banco de 1,1 milhão diretamente, porque o oráculo
+completo da Wikipédia inteira não cabe na RAM (seção 8, H3).
 
-| Fatia | Tempo | docs/s | MB/s | Pico RSS | Banco (MB) | Banco ÷ texto | Nós da Trie | Termos únicos | Write amp | Stalls |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1k | | | | | | | | | | |
-| 10k | | | | | | | | | | |
-| 100k | | | | | | | | | | |
-| 1,1M | | | | | | | | | | |
+### Fase 2 — experimentos de carga (100k, `d088f12`)
 
-- O número de nós sai de `meta:next_node_id`.
-- Write amp e stalls saem de `rocksdb.stats`, na seção de compaction e no
-  "Stall".
-
-**O que observar:** docs/s deveria ficar aproximadamente constante entre as
-fatias. Se cair à medida que o índice cresce, o gargalo está em algo que
-cresce junto: leitura de nós da Trie, tamanho das listas no merge ou
-compactação. Aí a Fase 6 entra direto na fatia em que a queda começou.
-
-### Experimentos na fatia de 100k
-
-| Experimento | Variações | Mede |
-|---|---|---|
-| Tamanho do lote | 100, 1k, 10k, 50k docs/commit | docs/s vs. pico de RSS (o lote guarda em memória todo nó que tocou) |
-| IDs | page id original vs. `--remap-ids` (1..N) | tamanho do espaço `post:`; deltas menores devem caber em 1 byte |
-| Streaming | `index_document` por doc, 10k docs | commits/s e overhead fixo por commit |
-| Block cache | 64 MB, 256 MB, 1 GB | docs/s e RSS |
-| LTO | release vs. `lto = "thin"` + `codegen-units = 1` | docs/s (só fica se ganhar mais que o ruído) |
-
-### Depois da carga total
-
-- **Tempo de abertura:** `hyperfine 'target/release/fire-flower search ~/bench-db/ptwiki-full xyz'`,
-  medindo logo depois da carga e depois de um `compact()`.
-- **`wiki sizes`:** quanto ocupa `node:` vs. `post:`, o tamanho de `node:0`
-  e quanto ocupam as listas de "de", "a", "o".
-- **Tempo de `compact()`** e espaço antes e depois.
-
----
-
-## 7. Fase 3 — Conjuntos de consulta
-
-O `wiki vocab` roda sobre o corpus inteiro; o `wiki queries` sorteia com seed
-fixa e grava em `bench/queries/`. São arquivos pequenos, versionados no repo.
-Cerca de 1.000 consultas por conjunto (sorteios com reposição quando o grupo é
-pequeno).
-
-| Conjunto | Como escolher | Exemplo | O que isola |
+| Experimento | artigos/s | vs. padrão | Pico de RSS |
 |---|---|---|---|
-| `t-raro` | df 1–10 | termos raros | caminho mínimo: Trie + lista curta |
-| `t-medio` | df 100–10k | "constituicao" | caso típico |
-| `t-freq` | df ≥ 100k | "de", "em", "que" | decodificar listas de MB e merge |
-| `t-len-3` / `t-len-8` / `t-len-15` | df parecido, comprimentos diferentes | "rio" / "portugal" / "inconstitucional" | **custo por caractere** (1 `Get` por nível) |
-| `t-miss` | termos inexistentes, curtos e longos, incluindo os que divergem só no final | "constituicaox" | quanto custa não achar nada |
-| `and-raro-freq` | 1 raro + 1 frequente | "pessoa de" | se a interseção a partir da menor lista funciona |
-| `and-freq` | 2–3 frequentes | "de a o" | pior caso do AND |
-| `and-n` | 2, 3 e 5 termos médios | | escala com o número de termos |
-| `p-1` / `p-2` / `p-4` / `p-raro` | prefixos de 1, 2–3 e 4+ caracteres, e prefixo raro | "a*", "co*", "port*" | busca em largura e o corte de 256 |
-| `s-*` | os mesmos prefixos no `suggest`, limite 10 | | autocompletar |
-| `titulos` | 1.000 títulos reais | "Revolução Francesa" | mistura realista; também checa revocação |
-| `misto` | 70% `titulos`/`t-medio`, 20% `and-*`, 10% `p-*` | | carga das Fases 4 e 5 |
-| `frase-2` / `frase-3` | trechos reais de 2 e 3 palavras sem stopword | `"revolução francesa"` | conferência de posições |
-| `frase-stop` | 3 palavras com stopword no meio | `"copa do mundo"` | o buraco da stopword |
-| `frase-freq` | 2 palavras entre os 500 termos de maior df | `"sao paulo"` | muitos candidatos para conferir |
-| `frase-miss` | `frase-2`/`frase-3` com a ordem trocada | `"francesa revolução"` | conferir sem achar |
-| `rank-freq` | os termos de `t-freq`, top 10 | | custo do BM25 numa lista grande |
-| `rank-and` | 2–3 termos (df ≥ 100) do mesmo artigo, top 10 | | BM25 depois do E |
-| `rank-titulos` | os títulos de `titulos`, top 10 | | o caso real da CLI e do TUI |
-
-Conjuntos `rank-*` são medidos com `search_ranked(q, 10)`; os demais com
-`search` (todos os IDs), e os `s-*` com `suggest`.
+| padrão (lote 1.000) | 3.660 | — | 472 MB |
+| lote 100 / 5.000 / 10.000 / 50.000 | 2.061 / 5.362 / 5.980 / 7.339 | −44% / +47% / +63% / +100% | 476 / 525 / 696 / 1.332 MB |
+| sem cache de nós do escritor | 1.949 | −47% | 305 MB |
+| sem posições | 4.835 | +32% | 429 MB |
+| block cache 64 MB / 1 GB | 3.562 / 3.590 | −3% / −2% | 460 / 471 MB |
+| IDs remapeados (1..N) | 3.755 | +3% | 471 MB |
+| streaming (1 commit por artigo) | 519 | — | 248 MB |
 
 ---
 
-## 8. Fase 4 — Latência de busca
+## 6. Conjuntos de consulta
 
-Sobre o banco de 1,1M, com uma thread:
+O `wiki vocab` roda sobre a fatia da escala e o `wiki queries` sorteia com seed
+fixa, gravando em `bench/queries/<escala>/`.
 
-```bash
-target/release/examples/wiki bench --db ~/bench-db/ptwiki-full --queries bench/queries/t-freq.txt
-target/release/examples/wiki bench --db ~/bench-db/ptwiki-full --queries bench/queries/t-freq.txt --cold
-```
+**Ressalva:** os conjuntos são **por escala**. `t-freq` é "termo frequente
+naquela escala" (25 mil documentos por consulta no 100k, 145 mil na full),
+então "100k vs. full" mostra quanto cada tipo de consulta custa em cada
+escala, não as mesmas consultas (seção 8, H2).
 
-Para cada conjunto, registrar: p50, p95, p99 e máximo (histograma), qps, média
-de resultados por consulta e, via PerfContext, `Get`s e block reads por
-consulta.
-
-| Conjunto | p50 | p95 | p99 | máx | qps | resultados (média) | `Get`s/consulta | block reads/consulta |
-|---|---|---|---|---|---|---|---|---|
-| `t-raro` | | | | | | | | |
-| … | | | | | | | | |
-
-### PerfContext por consulta
-
-O PerfContext é por thread: meça na mesma thread que fez a busca.
-
-```rust
-use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
-
-set_perf_stats(PerfStatsLevel::EnableTime); // EnableCount se o timer pesar
-let mut ctx = PerfContext::default();
-
-ctx.reset();
-let docs = engine.search(query)?;
-let gets = ctx.metric(PerfMetric::GetFromMemtableCount);
-let cache_hits = ctx.metric(PerfMetric::BlockCacheHitCount);
-let block_reads = ctx.metric(PerfMetric::BlockReadCount);
-let merge_ns = ctx.metric(PerfMetric::MergeOperatorTimeNanos);
-```
-
-**Confirmar:** `t-len-*` deveria mostrar `Get`s ≈ comprimento + 2. Se o p50
-crescer de forma linear com o comprimento, isso é o argumento medido para o
-índice ordenado `term:<palavra>` citado no README.
-
-### Experimentos específicos
-
-| Experimento | Como | Hipótese a testar |
+| Conjunto | Como escolher | O que isola |
 |---|---|---|
-| Merge pendente | `t-freq` logo após a carga vs. após `compact()` | operandos não compactados deixam a leitura de termos frequentes muito mais lenta (ver `MergeOperatorTimeNanos`) |
-| Decodificar a raiz | microbench de `TrieNode::decode` sobre o `node:0` real | toda consulta paga esse custo; se for relevante, guardar a raiz decodificada em memória |
-| Block cache | 64 MB, 256 MB e 1 GB, com cache frio e quente | a partir de que tamanho a Trie quente fica toda em RAM |
-| Tamanho do resultado | `t-freq` mede o tempo de `search` e quantos IDs devolve | devolver ~1M IDs é parte do custo; serve de argumento para uma API com `limit` |
+| `t-raro` / `t-medio` / `t-freq` | df 1–10 / 100–10k / os mais frequentes | caminho mínimo / caso típico / listas grandes |
+| `t-len-3` / `-8` / `-15` | mesmo df, comprimentos diferentes | custo por letra |
+| `t-miss` | termos inexistentes | quanto custa não achar |
+| `and-raro-freq` / `and-freq` / `and-2,3,5` | combinações | interseção |
+| `p-1` / `p-2` / `p-4` / `p-raro` | prefixos de 1, 2–3, 4–6 letras e raros | busca em largura e o corte de 256 |
+| `s-*` | os mesmos prefixos no `suggest` | autocompletar |
+| `titulos` | 1.000 títulos reais | mistura realista |
+| `misto` | 70% títulos/termos médios, 20% E, 10% prefixo | carga das fases 4 e 5 |
+| `frase-2` / `-3` / `-stop` / `-freq` / `-miss` | trechos reais; com stopword; termos frequentes; ordem trocada | conferência de posições |
+| `rank-freq` / `rank-and` / `rank-titulos` | top 10 (BM25F) | custo do ranking |
 
-### Microbenchmarks com Criterion (`benches/micro.rs`)
-
-Com dados reais em vez de `format!("doc-{i}")`. Os bancos são construídos
-**uma vez** (fatia de 100k), fora da medição.
-
-- `tokenize` sobre 1.000 artigos reais (MB/s).
-- `decode_postings` e `merge_postings` sobre a lista real de "de".
-- `intersect` com listas reais (rara × frequente, frequente × frequente).
-- `search` com 5 consultas fixas, uma de cada tipo, no banco de 100k.
-- Indexar 1.000 artigos num banco vazio: o único bench com `TempDir` por
-  iteração (`iter_batched`, `BatchSize::PerIteration`).
-
-```bash
-cargo bench --bench micro -- --save-baseline main
-cargo bench --bench micro -- --baseline main     # depois de uma mudança
-```
+`rank-*` são medidos com `search_ranked(q, 10)`, `s-*` com `suggest` e os
+demais com `search` (todos os IDs).
 
 ---
 
-## 9. Fase 5 — Concorrência
+## 7. Achados
 
-O `Engine` é `Sync`: há um escritor por vez, e as buscas rodam em paralelo
-sobre snapshots.
-
-1. **Só leitura:** `misto` com 1, 2, 4, 8 e 12 threads. qps deveria escalar
-   até perto do número de núcleos.
-2. **Leitura durante escrita:** carregar `--take 1000000` e depois, em
-   paralelo, `load --skip 1000000` (os 112k restantes) + `bench misto` com 1,
-   4 e 8 threads.
-   - p99 das buscas vs. o mesmo p99 sem escrita;
-   - docs/s da indexação vs. o mesmo docs/s sem leitores;
-   - stalls e compactações em `rocksdb.stats` durante a janela.
-3. **Commit no meio da busca:** o snapshot garante consistência. O teste
-   checa que uma consulta nunca vê metade de um lote. Nenhum documento do lote
-   em andamento pode aparecer sem os outros: rodar o oráculo do lote na thread
-   leitora.
-
----
-
-## 10. Fase 6 — Profiling direcionado
-
-```bash
-cargo build --profile profiling --example wiki
-samply record target/profiling/examples/wiki load --db /tmp/p100k --corpus ~/datasets/ptwiki/ptwiki-100000.jsonl
-samply record target/profiling/examples/wiki bench --db ~/bench-db/ptwiki-full --queries bench/queries/t-freq.txt
-heaptrack target/profiling/examples/wiki load --db /tmp/p100k --corpus ~/datasets/ptwiki/ptwiki-100000.jsonl
-```
-
-Hipóteses a confirmar ou descartar no flamegraph (top 3 de funções na
-indexação, na busca e na compactação):
-
-- **Indexação:** NFKD caractere a caractere no `tokenize`; alocação de
-  `HashSet<String>` por documento; `node_mut` relendo e redecodificando os
-  mesmos nós em todo lote; `format!` montando chaves (`node_key`, `post_key`);
-  rehash do `HashMap` do lote.
-- **Busca:** `TrieNode::decode` (sobretudo da raiz); `decode_postings` em
-  listas grandes; cópia de `String` na busca em largura do prefixo.
-- **Compactação:** `merge_postings` decodifica, ordena e recodifica a lista
-  inteira a cada merge, o que pode ser caro para os termos frequentes.
-
-**Memória:** amostrar o RSS a cada segundo durante a carga total (um laço com
-`ps -o rss=`) e plotar. Ele deve estabilizar; crescimento contínuo indica
-vazamento ou um lote grande demais.
-
----
-
-## 11. Fase 7 (opcional) — Baseline do RocksDB puro
-
-Só vale se a Fase 4 mostrar que o `Get` do RocksDB em si é o gargalo, e não o
-código à volta dele.
-
-- O crate usa **RocksDB 10.4.2** (`librocksdb-sys 0.17.3+10.4.2`). O
-  `db_bench` do apt é bem mais antigo; compile o da mesma versão:
-  `git checkout v10.4.2 && make -j4 db_bench` (`-j4` por causa da RAM).
-- Use chaves e valores parecidos com os nossos (chaves `node:N` de ~12 bytes,
-  nós de poucos bytes) e as mesmas opções (LZ4, Bloom de 10 bits, cache de
-  256 MB):
-
-```bash
-./db_bench --benchmarks=fillrandom,readrandom,seekrandom --num=20000000 \
-  --key_size=16 --value_size=24 --compression_type=lz4 --bloom_bits=10 \
-  --cache_size=268435456 --threads=4 --seek_nexts=10
-```
-
-- Compare o `readrandom` com o tempo por `Get` medido na Fase 4. A diferença é
-  o overhead do fire-flower.
-
----
-
-## 12. Fase 8 — Regressões
-
-- **Por PR (alguns minutos):** oráculo na fatia de 10k + carga de 100k +
-  `bench` de `t-medio`, `t-freq` e `p-2`. Falha se o oráculo divergir ou se o
-  p50 piorar mais de 10% em relação ao baseline salvo.
-- **Manual ou semanal:** a escada completa (Fase 2) e a concorrência (Fase 5).
-- **Formato:** o `wiki` grava JSON em `bench/results/<data>-<commit>.json`, e
-  um script compara dois arquivos.
-- **Criterion:** `--save-baseline` / `--baseline` para os micros.
-- Compare **só resultados da mesma máquina**.
-
----
-
-## 13. Metas
-
-Definidas depois do primeiro baseline. A estrutura:
-
-| Métrica | Baseline | Meta |
+| # | Achado | Situação |
 |---|---|---|
-| Divergências do oráculo | — | **0** (fixa) |
-| Carga total sem swap | — | **sim** (fixa) |
-| docs/s na carga total | | |
-| Banco ÷ texto bruto | | |
-| p99 de `titulos` (quente) | | |
-| p99 de `t-freq` (quente) | | |
-| p99 de `misto` com indexação em paralelo | | |
-| Tempo de abertura após a carga total | | |
+| 1 | Corretude: zero divergências em todos os oráculos, em todas as rodadas | mantido a cada PR |
+| 2 | Prefixo incompleto é a regra: metade dos prefixos sorteados casa mais de 256 termos | aberto (por projeto); o índice ordenado mudaria a ordem (mais curtos primeiro) |
+| 3 | Custo por letra confirmado (~1 µs por letra); prefixos curtos fazem 500–800 leituras | parcial: `MultiGet` por nível e cache até a profundidade 4 (`p-2` −28%) |
+| 4 | Merge pendente pesa: sem compactar, termo frequente, títulos e frases ficam 30–50% mais lentos (full: `t-freq` 677 → 329 µs); compactar a full leva 8,7 s | ✅ compactar no fim por padrão; v5 deixou o merge pendente mais barato que o do v3 (`t-freq` antes de compactar 677 → 399 µs); compactar leva 5,3 s |
+| 5 | **Colapso da carga inteira** (de ~5.000 para ~200 artigos/s em 200k, 500k ou 600k): filtro de Bloom de ~6 MB num bloco só, maior que uma parte do block cache, relido a cada leitura (22 TB contados) | ✅ resolvido com filtros particionados (`a9009c7`); vigiado por `perf.py carga-longa` e pelo teste `bloom_filters_larger_than_a_cache_shard_...` |
+| 6 | Lotes maiores indexam muito mais rápido (lote de 10 mil: +63% no 100k) | ✅ lote padrão de 10 mil |
+| 7 | A carga perde velocidade até ~400k e depois fica plana em ~10 MB/s; o commit sobe de 63% para 80% do tempo e as leituras do escritor, de 7 para 15–18 por artigo (Trie com 7,3 M nós, cache do escritor com 1 M) | ✅ descarte por recência + cache de 3 M nós: carga plana, 116 s |
+| 8 | A concorrência escala pouco: 4,3× com 12 threads (era 6,3× no 10k do formato v2) | encerrado: o RocksDB puro escala 5,5× nesta máquina; 19,5 mil qps (4,3×) |
+| 9 | Na full, o banco (1,4 GB) não cabe no block cache de 256 MB: frases leem 4–6 blocos de fora do cache por consulta e `p-2`, 112 | registrado: 1 GB tira mais 10–20%; padrão mantido em 256 MB |
+| 10 | Listas longas custam ~2 ns por documento em qualquer escala (termo frequente, frases, ranking) | parcial: E e frases saltam blocos; listas inteiras (`t-freq`, `frase-freq`) iguais |
+| 11 | Indexar em paralelo sobe o p50 das buscas em 60–75% na full; a indexação perde 18–47% de velocidade com leitores | registrar |
+| 12 | Posições são 58% do banco (`pos:` 878 MB de 1,5 GB); o banco compactado tem 0,52× o texto | registrar |
+| 13 | O detector de colapso dá falso positivo com lotes maiores que a janela (lote de 50 mil) | ✅ janelas agrupadas por lote |
 
 ---
 
-## 14. Checklist
+## 8. Próximos passos
 
-- [x] Baixar e converter a Wikipédia PT (1,1M artigos + fatias)
-- [x] `.cargo/config.toml` com `jobs = 4`
+Cada passo é um PR com a medição que o justifica, comparado com
+`baseline-pr-full.json` (ou a de 100k, para iterar mais rápido).
+
+### P1 — O que dentro do commit custa (profiling)
+
+**Por quê:** o commit é 74–80% da carga e é o que fica mais caro à medida que
+o índice cresce. Não se sabe quanto é percorrer a Trie (e reler nós que saíram
+do cache), codificar as listas ou gravar no RocksDB.
+
+1. Instrumentar o commit (tempo em `insert_term`, em leituras de nó, em
+   codificação de listas, em `norm:` e em `db.write`) e mostrar no monitor do
+   `wiki load`.
+2. `samply record` da carga de 100k e de 300k–500k (onde a velocidade cai).
+
+**Pronto quando:** a carga tem uma divisão de tempo por etapa e um top 3 de
+funções; dali saem os próximos PRs de carga.
+
+### P2 — Ajustes baratos de carga e pós-carga
+
+| Mudança | Hipótese | Como medir |
+|---|---|---|
+| Lote padrão de 10 mil (CLI, `carregar_wikipedia.py`, `perf.py`) | +50% na full com ~700 MB de RSS | carga da full, MB/s por janela |
+| Cache de nós do escritor de 4 M nós (~800 MB) | menos releituras: Gets por artigo voltam para < 10 | `wiki load --cache-nos 4000000` na full |
+| Compactar no fim da carga por padrão | −30–50% em termo frequente, títulos e frases, por 9 s | fase 4 antes/depois |
+
+**Pronto quando:** carga da full ≤ 180 s sem passar de 1,5 GB de RSS.
+
+### P3 — Prefixos curtos: índice ordenado de termos
+
+**Por quê:** `p-1`/`p-2` são as consultas mais caras (p50 de 4–5 ms, p99 de
+10–30 ms na full) e o TUI faz uma a cada tecla.
+
+Ideia: uma chave `term:<palavra>` → nó terminal, lida com o iterador do
+RocksDB. O prefixo vira uma varredura de faixa (sem busca em largura na Trie),
+e o corte de 256 termos pode ser trocado por um corte por df.
+
+**Pronto quando:** `p-1` e `p-2` com p50 ≤ 1 ms e p99 ≤ 5 ms na full, com o
+oráculo de prefixo e autocompletar sem divergências. Medir também o custo em
+espaço e na carga.
+
+### P4 — Concorrência
+
+**Por quê:** 4,3× com 12 threads. Suspeito: todo acesso aos caches de leitura
+(nós rasos e tamanhos, `EpochCache`) pega um `RwLock` compartilhado.
+
+1. `samply` do `bench misto --threads 12` para confirmar a disputa.
+2. A/B: cache dividido em partes, ou cópia de leitura por thread trocada a cada
+   commit; e o block cache `HyperClock` no lugar do LRU.
+
+**Pronto quando:** ≥ 7× com 12 threads no `misto` da full.
+
+### P5 — Listas longas
+
+**Por quê:** termo frequente, frases e ranking decodificam a lista inteira
+(~2 ns por documento): `frase-freq` com p50 de 4,1 ms, `rank-freq` de 976 µs
+na full.
+
+Ideia: listas em blocos com índice de saltos (e o máximo de tf por bloco, para
+block-max no top-k), para pular o que não interessa sem decodificar. Muda o
+formato do banco.
+
+**Meta revista:** a meta antiga ("`rank-freq` ≤ 2× `t-freq`") deixa de valer: a
+razão piora quando a busca simples melhora. No lugar, latência absoluta:
+`rank-freq` ≤ 300 µs e `frase-freq` ≤ 1 ms de p50 na full.
+
+### P6 — Block cache para a full
+
+1 GB zera as leituras fora do cache e tira 10–15% do p50 de títulos, `misto` e
+`p-2`. Decidir o padrão (ou um padrão proporcional ao banco) junto com o P4.
+
+### Harness
+
+| # | O quê |
+|---|---|
+| H1 | Detector de colapso: só comparar janelas quando o lote for menor que a janela (ou alinhar janelas aos commits) |
+| H2 | Um conjunto fixo de consultas, igual em todas as escalas, para comparar 100k e full diretamente |
+| H3 | Oráculo e relevância por amostra também na full (o oráculo em duas passadas, guardando só os termos sorteados) |
+| H4 | Cache frio: rodar com `sudo -v` antes |
+| H5 | Experimento de LTO (`lto = "thin"` + `codegen-units = 1`): só fica se ganhar mais que o ruído |
+
+### Descartado ou adiado
+
+- **Fase 7 (`db_bench`):** o `Get` do RocksDB nunca foi o gargalo.
+- **Preparar documentos em paralelo** ([design-escrita-leitura.md](design-escrita-leitura.md),
+  1.2): com o commit em 74–80% do tempo, o ganho máximo seria ~1,25× (Amdahl),
+  menos que o lote maior. Volta a valer se o P1 deixar o commit barato.
+- **Hipóteses antigas de profiling** (NFKD por caractere, `format!` nas chaves,
+  `HashSet` por documento, raiz decodificada em toda busca, devolver 1 milhão
+  de IDs): já resolvidas no código.
+
+---
+
+## 9. Metas
+
+Linha de base: rodada `tudo --escala full` de 26/10/2026, commit `d088f12`.
+
+| Métrica | Linha de base (full) | Meta | `ad63e51` |
+|---|---|---|---|
+| Divergências do oráculo | 0 | **0** (fixa) | 0 ✅ |
+| Carga total sem swap e sem colapso | sim | **sim** (fixa) | sim ✅ |
+| Tempo da carga total | 242 s (11,1 MB/s) | ≤ 180 s (P2) | 116 s ✅ |
+| Pico de RSS na carga total | 838 MB | ≤ 1,5 GB | 1.370 MB ✅ |
+| Banco compactado ÷ texto | 0,52 | ≤ 0,55 | 0,53 ✅ |
+| p50 / p99 de `titulos` | 93 µs / 1,8 ms | p99 ≤ 1 ms | 51 µs / 1,5 ms ❌ |
+| p50 / p99 de `rank-titulos` | 107 µs / 1,9 ms | p99 ≤ 1 ms | 63 µs / 1,9 ms ❌ |
+| p50 / p99 de `t-freq` | 329 / 722 µs | registrar (P5) | 328 / 725 µs |
+| p50 de `rank-freq` | 976 µs | ≤ 300 µs (P5) | 917 µs ❌ |
+| p50 / p99 de `p-2` | 4,4 / 10,3 ms | ≤ 1 / 5 ms (P3) | 3,2 / 7,1 ms ❌ |
+| p50 / p99 de `frase-freq` | 4,1 / 17,4 ms | p50 ≤ 1 ms (P5) | 4,1 / 19,4 ms ❌ |
+| `misto` com 12 threads | 11.873 qps (4,3×) | ≥ 7× (P4) | 19.521 qps (4,3×); inviável aqui |
+| p99 de `misto` com indexação em paralelo (4 leitores) | 7,6 ms | ≤ 5 ms | 4,2 ms ✅ |
+| Abrir o banco + 1 busca | 38 ms (29 ms compactado) | registrar | 28 ms compactado |
+
+---
+
+## 10. Checklist
+
+- [x] Wikipédia PT baixada e convertida (1,1M artigos + fatias)
 - [x] Ganchos no `Engine`: estatísticas, propriedades, `compact()`
-- [x] `examples/wiki.rs`: `load`, `vocab`, `queries`, `oracle`, `bench`, `sizes` (+ `digest` e `concurrent`)
-- [x] `scripts/perf.py`: fases, `pr`, `comparar` e `relatorio`, com `--escala`
-- [ ] `vocab` sobre o corpus inteiro + confirmar IDs únicos (feito na escala 10k: 0 IDs repetidos)
-- [x] Gerar e versionar `bench/queries/` (escala 10k)
-- [x] **Fase 1:** oráculo com zero divergências (10k, todos os termos)
-- [ ] **Fase 2:** escada 1k → 1,1M preenchida (1k, 10k e 100k feitos; falta 1,1M)
-- [x] **Fase 4:** latência por conjunto + merge pendente vs. compactado (10k)
-- [ ] **Fase 6:** flamegraph de carga e busca, top 3 de cada (precisa instalar o `samply`)
-- [x] **Fase 5:** leitura durante escrita (10k)
-- [x] Preencher as metas e salvar o baseline (10k: `bench/baseline-pr-10k.json`)
-- [ ] (Opcional) **Fase 7:** `db_bench`
-- [ ] Repetir na escala 100k e depois na 1,1M
-
-**Ordem sugerida:** ganchos + `wiki load` + `oracle` primeiro. A corretude na
-fatia de 10k sai no mesmo dia, e a escada de carga roda sozinha enquanto o
-resto é escrito.
+- [x] Harness (`load` com monitor por janela, `vocab`, `queries`, `oracle`, `bench`, `sizes`, `digest`, `concurrent`, `relevancia`)
+- [x] `scripts/perf.py`: fases, `pr`, `carga-longa`, `frases`, `comparar`, `relatorio`
+- [x] IDs únicos confirmados no corpus inteiro
+- [x] Fase 1 (corretude) em 10k e 100k
+- [x] Fase 2 (escada) até 1,1M
+- [x] Fases 4 e 5 (latência quente e concorrência) na full
+- [x] Linha de base salva (`baseline-pr-100k.json`, `baseline-pr-full.json`, em fire-flower-bench)
+- [x] Colapso da carga inteira corrigido e com cenário de teste
+- [ ] Latência com cache frio (H4)
+- [x] P1: divisão do tempo do commit (`CommitStats`, no monitor do `wiki load`)
+- [x] P2: lote, cache de nós e compactação no fim
+- [ ] P3: prefixos curtos (parcial: `MultiGet` e cache até a profundidade 4)
+- [x] P4: concorrência medida; limite é a máquina (RocksDB puro 5,5×)
+- [x] P5: listas em blocos com saltos (formato v5)
+- [ ] Block-max no top-k e frases de termos frequentes
+- [x] H1: detector de colapso por lote
+- [ ] H2–H3: conjunto fixo, oráculo e relevância na full

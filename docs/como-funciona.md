@@ -235,14 +235,14 @@ prefixo na chave:
 | Chave | Valor | Exemplo |
 |---|---|---|
 | `node:<id>` | um nó da Trie: "é fim de palavra?" + filhos (`caractere → id`) | `node:0` é sempre a raiz |
-| `post:<id>` | lista de postagem do termo que **termina** no nó `<id>`: cada documento e quantas vezes o termo aparece nele (tf) | `post:11` = documentos com `casa` |
-| `pos:<id>` | as posições do termo em cada documento (só em bancos com posições) | `pos:11` = onde `casa` aparece |
-| `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco | `norm:0` = documentos 0 a 1023 |
+| `post:<id>` | lista de postagem do termo que **termina** no nó `<id>`: cada documento, quantas vezes o termo aparece nele (tf) e quantas dessas estão no título | `post:11` = documentos com `casa` |
+| `pos:<id>` | as posições do termo em cada documento (só em bancos com posições); o título vem primeiro e o texto começa 100 posições depois do fim dele | `pos:11` = onde `casa` aparece |
+| `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco, e o do título | `norm:0` = documentos 0 a 1023 |
 | `doc:<id>` | rótulo do documento (a CLI grava o caminho do arquivo) | `doc:42` → `/home/.../notas.txt` |
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
-| `meta:doc_count`, `meta:total_len` | total de documentos e soma dos tamanhos (para o ranking) | |
-| `meta:format`, `meta:positions`, `meta:languages` | versão do formato (2), se grava posições e idiomas das stopwords | |
+| `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
+| `meta:format`, `meta:positions`, `meta:languages` | versão do formato (3), se grava posições e idiomas das stopwords | |
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -264,12 +264,13 @@ ordem em que o RocksDB as guarda):
 
 ```text
 meta:doc_count         02
-meta:format            02
+meta:format            04
 meta:languages         pt,en
 meta:next_doc_id       03
 meta:next_node_id      0c
 meta:positions         01
 meta:total_len         05
+meta:total_title_len   00
 node:0                 00 02 61 01 63 05
 node:1                 00 01 7a 02
 node:10                00 01 61 0b
@@ -282,14 +283,18 @@ node:6                 00 02 72 07 73 0a
 node:7                 00 01 72 08
 node:8                 00 01 6f 09
 node:9                 01 00
-norm:0                 02 01 02 01 03
-pos:11                 02 01 01 01 01 01 05
-pos:4                  02 01 01 02 01 01 02
-pos:9                  01 02 01 01
-post:11                02 01 01 01 01
-post:4                 02 01 01 01 01
-post:9                 01 02 01
+norm:0                 02 01 02 00 01 03 00
+pos:11                 02 00 01 01 01 01 01 05
+pos:4                  02 00 01 01 02 01 01 02
+pos:9                  01 00 02 01 01
+post:11                02 00 01 02 01 02
+post:4                 02 00 01 02 01 02
+post:9                 01 00 02 02
 ```
+
+Os dois documentos foram indexados sem título (`add_document`). Com
+`add_titled`, as palavras do título entram nas mesmas listas e o tf do título
+aparece à parte (abaixo).
 
 "a", "o" e "e" são stopwords: não entram no índice. A Trie que esses bytes
 descrevem tem só `azul`, `carro` e `casa`:
@@ -324,21 +329,48 @@ Repare:
 73 0a       's' (0x73) → node:10
 ```
 
-Os filhos ficam em ordem de caractere (é um `BTreeMap`), o que deixa o
-autocompletar em ordem alfabética sem esforço extra.
+Os filhos ficam em ordem de caractere (em memória, um vetor ordenado com
+busca binária), o que deixa o autocompletar em ordem alfabética sem esforço
+extra. Era um `BTreeMap`, que aloca ~200 bytes mesmo para um filho só, e a
+maioria dos nós tem um filho só.
 
 ### Lendo uma lista: `post:11` (o termo `casa`)
 
 ```text
 02          2 documentos
-01 01       documento 0 + 1 = 1, tf 1
-01 01       documento 1 + 1 = 2, tf 1
+00          tabela de saltos vazia (lista pequena)
+01 02       documento 0 + 1 = 1; 02 = tf 1 << 1, sem título
+01 02       documento 1 + 1 = 2; tf 1, sem título
 ```
+
+O segundo número é `tf << 1 | tem título`. Quando o bit de baixo é 1, vem
+mais um número: quantas das ocorrências estão no título. Um documento com
+"Casa" no título e mais duas vezes no texto teria `.. 07 01` (tf 3, 1 no
+título). Entradas sem o termo no título, que são quase todas, não pagam nada
+a mais.
+
+**Tabela de saltos (formato v5).** O segundo número é a quantidade de
+blocos de uma tabela de saltos, que só listas com mais de 256 documentos
+têm: para cada bloco, o último documento (em delta), o tamanho em bytes e
+quantas entradas ele tem (menos 1). As entradas vêm logo depois e são as
+mesmas de uma lista sem tabela (os deltas continuam de um bloco para o
+outro). Decodificar a lista inteira só pula a tabela; para achar um
+documento numa lista de 145 mil, a busca vai direto ao bloco certo e
+decodifica só as entradas dele (seção 6.2). A tabela custa ~2% do tamanho
+da lista.
+
+O lote grava blocos de 128 entradas, mas a tabela aceita blocos de qualquer
+tamanho, e isso existe por causa do merge (5.5): unir pedaços é só
+concatenar as tabelas deles. No formato v4 os blocos tinham sempre 128
+entradas, e o merge na leitura de um termo frequente com pedaços pendentes
+recalculava a tabela percorrendo a lista inteira: antes de compactar,
+`t-freq` ficava 43% mais lento que no v3. Com a v5 ficou 41% mais rápido.
 
 ### Lendo as posições: `pos:11`
 
 ```text
 02          2 documentos
+00          tabela de saltos vazia (a mesma regra de `post:`)
 01 01 01    documento 1: 1 posição, a 1 ("A casa azul": a@0 casa@1 azul@2)
 01 01 05    documento 2: 1 posição, a 5 ("O carro azul e a Casa": casa@5)
 ```
@@ -351,12 +383,13 @@ conferida: `azul` em 2 e `casa` em 2 + 3.
 
 ```text
 02          2 documentos neste bloco (IDs 0 a 1023)
-01 02       deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul)
-01 03       deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa)
+01 02 00    deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul), título 0
+01 03 00    deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa), título 0
 ```
 
-O tamanho conta só os tokens indexados (sem stopwords). `meta:total_len = 5`
-é a soma dos tamanhos e `meta:doc_count = 2`; o ranking usa o tamanho médio
+O tamanho conta só os tokens indexados (sem stopwords), título e texto
+juntos; o terceiro número é quanto disso é título. `meta:total_len = 5` é a
+soma dos tamanhos e `meta:doc_count = 2`; o ranking usa o tamanho médio
 (5 ÷ 2) para comparar documentos.
 
 Duas técnicas deixam tudo isso pequeno:
@@ -471,8 +504,11 @@ documento: quantos tokens sobraram sem as stopwords. Um documento que diz
 "café" dez vezes entra uma vez só na lista de `cafe`, com tf = 10 e as dez
 posições. O lote anota `(doc_id, tf)` e as posições em `pending[termo]`, e o
 tamanho numa lista à parte. No commit, cada termo distinto do lote é inserido
-na Trie **uma vez**, em ordem alfabética. Num lote de 1.000 artigos, "brasil"
-aparece em centenas deles, mas a Trie é percorrida uma vez só para ele.
+na Trie **uma vez**, em ordem alfabética. Num lote de 10 mil artigos,
+"brasil" aparece em milhares deles, mas a Trie é percorrida uma vez só para
+ele. E como os termos vêm em ordem, vizinhos compartilham o começo ("casa",
+"casaco", "casamento"): a descida recomeça do fim do prefixo comum com o
+termo anterior, e não da raiz.
 
 **Reindexar o mesmo ID** troca o tf, as posições e o tamanho dele: dentro do
 lote, a última adição vence; entre lotes, quem decide é o merge operator
@@ -508,8 +544,13 @@ banco, e só o escritor altera a Trie. Então o mapa volta para o `WriterState`
 e o próximo lote começa com ele: a raiz e os nós dos termos comuns não são
 relidos a cada commit. Um lote descartado (ou com commit que falhou) leva o
 cache junto, e o próximo começa do banco. O cache tem um teto
-(`Config::writer_cache_nodes`, 1 milhão de nós, ~200 MB): passando dele, saem
-primeiro os nós que o último lote não usou e depois os mais fundos.
+(`Config::writer_cache_nodes`, 3 milhões de nós, ~130 bytes cada, ~400 MB;
+ele só cresce até o tamanho da Trie). Passando dele, o descarte deixa o cache
+em 80% do limite, ficando os nós usados mais recentemente e, no lote em que o
+corte cai, os mais rasos. Na Wikipédia inteira a Trie tem 7,3 milhões de nós,
+e o cache de 3 milhões deixa o escritor com ~1,7 leituras por artigo (com 1
+milhão eram 7,5, e o descarte antigo, que guardava só os nós do último lote,
+fazia o cache despencar de 1 milhão para ~240 mil a cada vez que enchia).
 
 ### 5.4 Commit (`IndexBatch::commit`)
 
@@ -534,8 +575,13 @@ O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
 falhar, nada muda: nem o banco, nem os contadores.
 
-A CLI faz commit a cada 1.000 documentos para limitar a memória: o lote guarda
-os termos de todos os documentos até o commit.
+O `index-jsonl` faz commit a cada 10 mil documentos (`--lote`), e o `index`
+de arquivos, a cada 1.000: o lote guarda os termos de todos os documentos até
+o commit. Lotes maiores dividem o custo de percorrer a Trie por mais
+documentos: na Wikipédia inteira, a carga cai de 242 s (lote de 1.000) para
+~115 s (lote de 10 mil, com o cache de 3 milhões de nós), com pico de ~1,4 GB.
+`IndexBatch::commit_with_stats` diz onde o commit gastou o tempo (Trie,
+codificar listas, gravar), e o `wiki load` mostra isso a cada 10 mil artigos.
 
 ### 5.5 O que o RocksDB faz depois
 
@@ -550,9 +596,12 @@ mais novo vence (é assim que reindexar troca o tf e as posições). Essa regra 
 associativa, então o RocksDB pode juntar pedaços consecutivos em qualquer
 agrupamento; um teste confere isso com pedaços aleatórios. O caso comum, uma
 carga com IDs crescentes, tem um atalho: cada pedaço começa depois do fim do
-anterior, e o merge só concatena os bytes, refazendo um delta por pedaço, sem
-decodificar as listas. Pedaços que se sobrepõem passam pelo caminho completo
-(decodifica, ordena de forma estável, fica com o último de cada documento).
+anterior, e o merge só concatena os bytes, refazendo um delta por pedaço, e
+concatena as tabelas de saltos (um pedaço pequeno vira um bloco). Uma lista
+com tabela nem é percorrida: o último documento vem da tabela e o primeiro,
+da primeira entrada. Pedaços que se sobrepõem passam pelo caminho completo
+(decodifica, ordena de forma estável, fica com o último de cada documento, e
+regrava em blocos de 128).
 
 Enquanto a compactação não roda, uma leitura de `post:<id>` une os pedaços na
 hora. Por isso listas muito disputadas podem ficar mais lentas logo depois de
@@ -584,10 +633,11 @@ sequenceDiagram
 ```
 
 Custo: **1 `get` por caractere + 2** (raiz e lista), menos os níveis que já
-estão no **cache de nós das buscas**: a raiz e os nós até a profundidade 2
+estão no **cache de nós das buscas**: a raiz e os nós até a profundidade 4
 (`Config::reader_cache_depth`) ficam decodificados em memória, compartilhados
-por todas as buscas (seção 7). A raiz tem um filho por caractere inicial e
-cresce com o índice: 13 KB com 100 mil artigos da Wikipédia. Sem o cache, toda
+por todas as buscas (seção 7). São no máximo 365 mil nós (~48 MB) na
+Wikipédia inteira. A raiz tem um filho por caractere inicial e cresce com o
+índice: 37 KB na Wikipédia inteira. Sem o cache, toda
 busca a decodificava inteira, e isso era quase todo o tempo de uma busca
 simples (116 µs de 120 µs num termo inexistente; com o cache, 5 µs).
 
@@ -601,9 +651,16 @@ prefixo de palavra não é palavra.
 1. Busca a lista de cada termo, como acima.
 2. **Lista vazia em qualquer termo:** retorna vazio na hora, sem buscar os
    outros.
-3. Ordena as listas da menor para a maior e faz a interseção nessa ordem. A
-   interseção de duas listas ordenadas anda com dois ponteiros, em tempo
-   linear. Começar pela menor faz o resultado parcial já nascer pequeno.
+3. A lista **menor** conduz: é a única decodificada inteira (o tamanho de
+   cada lista vem do cabeçalho, sem decodificar). Cada documento dela é
+   procurado nas outras, das menores para as maiores.
+4. Numa lista pelo menos 32 vezes maior que a que conduz, a procura usa a
+   tabela de saltos (`PostingsCursor`): vai direto ao bloco de 128 documentos
+   que pode conter o documento e não decodifica os blocos do meio. Um E de um
+   termo raro com um frequente, na Wikipédia inteira, caiu de 410 µs
+   (decodificando as 145 mil entradas do frequente) para 25 µs. Com listas de tamanhos
+   parecidos, quase todo bloco tem candidatos, e decodificar a lista e andar
+   nela em sequência é mais barato.
 
 ```text
 casa  → [1, 2]
@@ -618,8 +675,12 @@ Uma palavra com hífen vira vários termos, como na indexação: `e-mail` busca
 
 1. Desce até o nó `ca` (`node:6`).
 2. Faz uma busca em largura a partir dele e coleta os nós com ✓: `casa`,
-   `carro`. Para no máximo em `max_prefix_terms` (256) termos.
-3. Une as listas de todos esses termos (ordena e remove repetidos).
+   `carro`. Para no máximo em `max_prefix_terms` (256) termos. A busca anda
+   nível a nível, e os nós fora do cache de cada nível são lidos juntos com
+   um `MultiGet` (em lotes do tamanho do que ainda falta; o autocompletar
+   pede 10).
+3. Une as listas de todos esses termos, lidas num `MultiGet` só. Como elas já
+   estão ordenadas, a ordenação estável só intercala os trechos.
 4. O resultado entra na interseção como se fosse a lista de um termo comum.
 
 **Atenção:** prefixos muito curtos (`a*` na Wikipédia) casam milhares de
@@ -663,23 +724,47 @@ prefixo dentro de frase.
 ### 6.6 Ranking: `search_top("casa azul", 10)`
 
 `search` devolve todos os IDs em ordem. `search_top` (e `search_ranked`, que
-também dá o total) devolve os *k* mais relevantes pelo **BM25**:
+também dá o total) devolve os *k* mais relevantes pelo **BM25F**, o BM25 com
+o título como campo próprio:
 
 ```text
 idf(t)     = ln(1 + (N − df + 0,5) / (df + 0,5))
-nota(t, d) = idf(t) · tf · (k1 + 1) / (tf + k1 · (1 − b + b · |d| / média))
+B_f(d)     = 1 − b_f + b_f · len_f(d) / média_f          (f = texto, título)
+tf~(t, d)  = tf_texto / B_texto  +  w · tf_título / B_título
+nota(t, d) = idf(t) · tf~ · (k1 + 1) / (tf~ + k1)
 nota(d)    = soma das notas das partes da consulta
 ```
 
-*N* é `meta:doc_count`, *df* o tamanho da lista do termo, *|d|* o tamanho do
-documento (`norm:`) e a média é `total_len ÷ N`. `k1 = 1,2` e `b = 0,75`
-(`Config::bm25_k1`, `Config::bm25_b`). Um termo raro (idf alto) pesa mais; o
-tf ajuda, mas satura; e o mesmo tf vale mais num documento curto.
+*N* é `meta:doc_count`, *df* o tamanho da lista do termo, `len_f` o tamanho
+do campo no documento (`norm:` guarda o do documento inteiro e o do título;
+o do texto é a diferença) e as médias vêm de `total_len` e `total_title_len`.
+`k1 = 1,2` e `b = 0,75` no texto (`Config::bm25_k1`, `Config::bm25_b`); no
+título, peso `w = 50` e `b = 0,9` (`Config::title_weight`,
+`Config::title_b`). Um termo raro (idf alto) pesa mais; o tf ajuda, mas
+satura; o mesmo tf vale mais num documento curto; e uma ocorrência no
+título vale como muitas no texto, mais ainda num título curto.
 
-- **Prefixo:** cada documento fica com a nota do **melhor** termo expandido
-  que ele contém (não a soma, para não premiar quem tem muitas variações).
+Por que somar dentro da saturação (BM25F) e não dois BM25: com um BM25 por
+campo, cada campo satura sozinho e o título vale quase uma palavra a mais.
+Assim, a consulta `coreia do norte` põe o artigo "Coreia do Norte" à frente
+de "Bandeira da Coreia do Norte" e de "Demografia da…", que antes empatavam
+com ele.
+
+O peso e o `b` do título saíram de uma grade sobre consultas com resposta
+conhecida na Wikipédia de 100k ([plano-relevancia.md](plano-relevancia.md),
+Fase 4): a qualidade sobe até ~50 e depois quase não muda. Sem título
+(`add_document`), `tf_título = 0` e a nota é exatamente o BM25.
+
+- **Prefixo:** conta como **um termo só**. O df é o número de documentos com
+  alguma completação, e o tf de um documento é a soma dos tf das completações
+  que ele contém. Assim uma completação rara não vale mais que a palavra que
+  se está digitando: com a regra antiga (a nota da melhor completação, cada
+  uma com o próprio idf), `coreia norte*` punha em 1º um artigo que cita a
+  Nortel ([plano-relevancia.md](plano-relevancia.md), R1).
 - **Frase:** entra na soma como um termo, com tf = quantas vezes a frase
-  aparece no documento e idf = soma dos idfs dos termos (como o Lucene).
+  aparece no documento e idf = soma dos idfs dos termos (como o Lucene). Uma
+  ocorrência que começa antes da extensão do título (`norm:` guarda também
+  quantas posições o título ocupa) conta como título.
 - **Empate:** nota decrescente, depois ID crescente.
 
 O E é o mesmo da busca sem ranking: a lista menor conduz e as outras avançam
@@ -688,13 +773,17 @@ casa, a nota é somada na ordem da consulta e entra num heap dos *k* melhores.
 
 Para não pagar a nota de todo documento:
 
-- **Limite superior.** A maior nota que uma parte pode dar com um certo tf é a
-  de um documento de tamanho 0. Isso fica numa tabela por tf, sem divisão. Com
-  o heap cheio, um documento cujo limite não passa do pior guardado é pulado
-  sem ler o tamanho. O corte é exato: ponto flutuante arredonda de forma
-  monótona, então o limite nunca fica abaixo da nota de verdade.
-- **Termo único** (o caso mais comum): a nota só depende do tf e do tamanho.
-  Os documentos são agrupados em níveis de tf, e o limite de um nível vale
+- **Limite superior.** A maior nota que uma parte pode dar é a de um
+  documento de tamanho 0. Ela depende de uma **chave**: as ocorrências
+  equivalentes do texto, com as do título convertidas (`w · (1 − b_texto) /
+  (1 − b_título)` cada) e arredondadas para cima. Sem título, a chave é o
+  próprio tf. O limite por chave fica numa tabela, sem divisão, com uma
+  margem relativa de 1e-12 para o arredondamento. Com o heap cheio, um
+  documento cujo limite não passa do pior guardado é pulado sem ler o
+  tamanho. O corte é exato (os testes comparam o top-k com o ranking
+  completo, com e sem título).
+- **Termo único** (o caso mais comum): a nota só depende dos tf e dos
+  tamanhos. Os documentos são agrupados em níveis de chave, e o limite de um nível vale
   para todos os abaixo dele. Uma passada conta os documentos de cada nível;
   a primeira faixa (do maior tf até juntar *k* documentos) enche o top; a
   segunda vai até o primeiro nível cujo limite não alcança o pior guardado, e
@@ -703,7 +792,7 @@ Para não pagar a nota de todo documento:
   documentos), só ~11% recebem nota; o resto (tf baixo) nem lê o tamanho.
 - **Tamanhos em cache.** Os blocos de `norm:` decodificados ficam num cache do
   `Engine`, compartilhado pelas buscas (seção 7). Em memória o bloco é denso
-  (um número por ID, até 4 KB), então ler o tamanho de um documento é um
+  (um registro por ID, até 8 KB), então ler os tamanhos de um documento é um
   acesso direto.
 
 Na Wikipédia de 100k (cache quente, 1 thread), o top 10 de um termo frequente

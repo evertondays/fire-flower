@@ -2,7 +2,8 @@
 //!
 //! Todos os subcomandos leem o corpus JSONL da Wikipédia
 //! (`{"id", "title", "text"}` por linha) e gravam resultados em
-//! `bench/results/<data>-<commit>-<tipo>-<rótulo>.json`.
+//! `results/<data>-<commit>-<tipo>-<rótulo>.json` do repositório
+//! fire-flower-bench, clonado ao lado deste (`FF_BENCH_DIR` para mudar).
 //!
 //! ```text
 //! cargo run --release --example wiki -- load    --db D --corpus F [--batch N] [--skip K] [--take N] [--remap-ids]
@@ -27,9 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::{Clause, index_terms, parse_query, tokenize};
+use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query, tokenize};
 use fire_flower::{Language, Stopwords};
-use fire_flower::{Config, DocId, Engine};
+use fire_flower::{CommitStats, Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ enum Cmd {
         db: PathBuf,
         #[arg(long)]
         corpus: PathBuf,
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = 10000)]
         batch: usize,
         #[arg(long, default_value_t = 0)]
         skip: u64,
@@ -142,6 +143,40 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Avalia a ordenação com consultas de resposta conhecida (docs/plano-relevancia.md)
+    Relevancia {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Pasta dos conjuntos rel-*.tsv. Os que faltarem (todos, com --gerar)
+        /// são gerados do corpus e gravados ali
+        #[arg(long)]
+        sets: PathBuf,
+        /// Consultas escritas à mão (padrão: bench/relevancia/manual.tsv)
+        #[arg(long)]
+        manual: Option<PathBuf>,
+        #[arg(long)]
+        take: Option<u64>,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 1000)]
+        per_set: usize,
+        /// Gera os conjuntos de novo mesmo que já existam
+        #[arg(long)]
+        gerar: bool,
+        /// Peso do título no BM25F (padrão: o do Config)
+        #[arg(long)]
+        peso_titulo: Option<f64>,
+        /// `b` do título no BM25F (padrão: o do Config)
+        #[arg(long)]
+        b_titulo: Option<f64>,
+        /// Não imprime as consultas à mão (para a grade)
+        #[arg(long)]
+        resumo: bool,
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// Mede latência das consultas (p50/p95/p99/máx, qps, Gets e block reads por consulta)
     Bench {
         #[arg(long)]
@@ -160,6 +195,9 @@ enum Cmd {
         /// Mede também tempos no PerfContext (mais preciso, mas pesa na latência)
         #[arg(long)]
         perf_time: bool,
+        /// Profundidade do cache de nós das buscas ("nenhum" desliga)
+        #[arg(long)]
+        cache_leitura: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
         #[arg(long)]
@@ -221,8 +259,22 @@ fn main() -> AnyResult {
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label } => {
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label })
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_mb, label } => {
-            bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, cache_mb, label)
+        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, label } => {
+            let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
+            let defaults = Config::default();
+            let config = Config {
+                title_weight: peso_titulo.unwrap_or(defaults.title_weight),
+                title_b: b_titulo.unwrap_or(defaults.title_b),
+                ..defaults
+            };
+            relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
+        }
+        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, label } => {
+            let mut config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
+            if let Some(depth) = cache_leitura {
+                config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
+            }
+            bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, config, label)
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),
@@ -247,7 +299,9 @@ struct Doc {
     line: u64,
     id: DocId,
     title: String,
-    /// `title + "\n" + text`, o que o motor indexa.
+    /// O texto sem o título (o motor indexa os dois, como campos).
+    text: String,
+    /// `title + "\n" + text`: para quem só quer o conjunto de termos.
     body: String,
     bytes: usize,
 }
@@ -303,7 +357,7 @@ impl Iterator for Corpus {
             body.push('\n');
             body.push_str(&article.text);
             let id = if self.remap_ids { self.line } else { article.id };
-            return Some(Ok(Doc { line: self.line, id, title: article.title, body, bytes: self.buf.len() }));
+            return Some(Ok(Doc { line: self.line, id, title: article.title, text: article.text, body, bytes: self.buf.len() }));
         }
     }
 }
@@ -332,6 +386,14 @@ fn stem(path: &Path) -> String {
 
 fn project_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Repositório dos resultados: `FF_BENCH_DIR` ou `../fire-flower-bench`.
+fn bench_dir() -> PathBuf {
+    match std::env::var_os("FF_BENCH_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => project_dir().parent().map_or_else(project_dir, PathBuf::from).join("fire-flower-bench"),
+    }
 }
 
 fn git_commit() -> String {
@@ -429,9 +491,9 @@ fn config_json(config: &Config) -> Value {
     })
 }
 
-/// Grava o resultado em bench/results/ e devolve o caminho.
+/// Grava o resultado em `results/` do repositório de resultados e devolve o caminho.
 fn save_result(kind: &str, label: &str, mut value: Value) -> AnyResult<PathBuf> {
-    let dir = project_dir().join("bench").join("results");
+    let dir = bench_dir().join("results");
     std::fs::create_dir_all(&dir)?;
     let commit = git_commit();
     let ts = timestamp();
@@ -511,16 +573,19 @@ fn load(
         let doc = doc?;
         match batch.as_mut() {
             Some(b) => {
-                b.add_document(doc.id, &doc.body)?;
+                b.add_titled(doc.id, &doc.title, &doc.text)?;
                 b.set_label(doc.id, &doc.title);
                 if b.len() >= batch_size {
-                    let t = Instant::now();
-                    batch.take().unwrap().commit()?;
-                    monitor.commit_secs += t.elapsed().as_secs_f64();
+                    monitor.add_commit(batch.take().unwrap().commit_with_stats()?);
                     batch = Some(engine.batch());
                 }
             }
-            None => engine.index_document(doc.id, &doc.body)?,
+            None => {
+                let mut b = engine.batch();
+                b.add_titled(doc.id, &doc.title, &doc.text)?;
+                b.set_label(doc.id, &doc.title);
+                b.commit()?;
+            }
         }
         docs += 1;
         bytes += doc.bytes as u64;
@@ -529,9 +594,9 @@ fn load(
         }
     }
     if let Some(b) = batch {
-        b.commit()?;
+        monitor.add_commit(b.commit_with_stats()?);
     }
-    let collapse = monitor.collapse();
+    let collapse = monitor.collapse(batch_size);
     let secs = started.elapsed().as_secs_f64();
     let (_, peak) = rss();
     let db_bytes = dir_size(db);
@@ -539,7 +604,7 @@ fn load(
         "db": db, "corpus": corpus_path, "batch": batch_size, "skip": skip, "take": take,
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
         "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
-        "formato": 2, "posicoes": engine.has_positions(),
+        "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,
@@ -550,6 +615,7 @@ fn load(
         "escrita": write_metrics(&engine),
         "swap_aumento": swap_used().saturating_sub(swap_before),
         "janelas": monitor.windows, "colapso": collapse,
+        "commit_etapas": monitor.all.json(secs, docs as f64),
     });
     println!(
         "{docs} docs em {secs:.1}s: {:.0} docs/s, {:.1} MB/s, pico RSS {:.0} MB, banco {:.0} MB ({:.2}× o texto)",
@@ -575,10 +641,63 @@ struct LoadMonitor {
     docs: u64,
     bytes: u64,
     reads: u64,
-    /// Segundos dentro de `commit` desde o começo da janela.
-    commit_secs: f64,
+    /// Soma dos commits desde o começo da janela.
+    commits: CommitTotals,
+    /// Soma desde o começo da carga.
+    all: CommitTotals,
     tickers: HashMap<String, u64>,
     windows: Vec<Value>,
+}
+
+/// Soma de [`CommitStats`] de vários commits.
+#[derive(Default, Clone, Copy)]
+struct CommitTotals {
+    commits: u64,
+    terms: u64,
+    node_reads: u64,
+    new_nodes: u64,
+    batch_bytes: u64,
+    cache_nodes: u64,
+    sort: f64,
+    trie: f64,
+    encode: f64,
+    nodes: f64,
+    write: f64,
+    evict: f64,
+    total: f64,
+}
+
+impl CommitTotals {
+    fn add(&mut self, c: &CommitStats) {
+        self.commits += 1;
+        self.terms += c.terms as u64;
+        self.node_reads += c.node_reads;
+        self.new_nodes += c.new_nodes as u64;
+        self.batch_bytes += c.batch_bytes as u64;
+        self.cache_nodes = c.cache_nodes as u64;
+        self.sort += c.sort_secs;
+        self.trie += c.trie_secs;
+        self.encode += c.encode_secs;
+        self.nodes += c.nodes_secs;
+        self.write += c.write_secs;
+        self.evict += c.evict_secs;
+        self.total += c.total_secs;
+    }
+
+    /// Frações do tempo `secs` em cada etapa do commit, mais contagens por documento.
+    fn json(&self, secs: f64, docs: f64) -> Value {
+        let f = |v: f64| v / secs.max(1e-9);
+        json!({
+            "commit_fracao": f(self.total), "ordenar_fracao": f(self.sort), "trie_fracao": f(self.trie),
+            "codificar_fracao": f(self.encode), "nos_fracao": f(self.nodes), "gravar_fracao": f(self.write),
+            "descarte_fracao": f(self.evict), "commits": self.commits,
+            "termos_por_commit": self.terms as f64 / self.commits.max(1) as f64,
+            "leituras_commit_por_doc": self.node_reads as f64 / docs.max(1.0),
+            "nos_novos_por_doc": self.new_nodes as f64 / docs.max(1.0),
+            "lote_mb": mb(self.batch_bytes) / self.commits.max(1) as f64,
+            "cache_nos": self.cache_nodes,
+        })
+    }
 }
 
 impl LoadMonitor {
@@ -588,10 +707,16 @@ impl LoadMonitor {
             docs: 0,
             bytes: 0,
             reads: fire_flower::internals::reads_on_this_thread(),
-            commit_secs: 0.0,
+            commits: CommitTotals::default(),
+            all: CommitTotals::default(),
             tickers: engine.rocksdb_stats().map(|s| tickers(&s)).unwrap_or_default(),
             windows: Vec::new(),
         }
+    }
+
+    fn add_commit(&mut self, stats: CommitStats) {
+        self.commits.add(&stats);
+        self.all.add(&stats);
     }
 
     fn window(&mut self, engine: &Engine, db: &Path, docs: u64, bytes: u64, started: Instant) {
@@ -602,10 +727,9 @@ impl LoadMonitor {
         let prop = |name: &str| engine.property(name).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let n = (docs - self.docs).max(1) as f64;
         let (cur, _) = rss();
-        let w = json!({
-            "docs": docs, "segundos": started.elapsed().as_secs_f64(),
+        let mut w = json!({
+            "docs": docs, "segundos": started.elapsed().as_secs_f64(), "janela_s": dt, "janela_mb": mb(bytes - self.bytes),
             "docs_por_s": (docs - self.docs) as f64 / dt, "mb_por_s": mb(bytes - self.bytes) / dt,
-            "commit_fracao": self.commit_secs / dt,
             "gets_por_doc": (reads - self.reads) as f64 / n,
             "filtro_mb": mb(delta("rocksdb.block.cache.filter.bytes.insert")),
             "filtro_miss": delta("rocksdb.block.cache.filter.miss"),
@@ -616,31 +740,53 @@ impl LoadMonitor {
             "rss_mb": mb(cur), "ram_livre_mb": mb(machine()["ram_livre"].as_u64().unwrap_or(0)),
             "swap_mb": mb(swap_used()), "banco_mb": mb(dir_size(db)),
         });
+        if let (Value::Object(map), Value::Object(extra)) = (&mut w, self.commits.json(dt, n)) {
+            map.extend(extra);
+        }
         let f = |k: &str| w[k].as_f64().unwrap_or(0.0);
         eprintln!(
-            "{docs:>9} docs {:>6.0} docs/s {:>5.1} MB/s | commit {:>3.0}% Gets/doc {:>5.0} filtro {:>8.0} MB stall {:>4.1}s L0 {:>2} | RSS {:>5.0} MB livre {:>5.0} MB banco {:>6.0} MB ({:.0}s)",
-            f("docs_por_s"), f("mb_por_s"), f("commit_fracao") * 100.0, f("gets_por_doc"), f("filtro_mb"),
-            f("stall_s"), f("l0"), f("rss_mb"), f("ram_livre_mb"), f("banco_mb"), f("segundos")
+            "{docs:>9} docs {:>6.0} docs/s {:>5.1} MB/s | commit {:>3.0}% (trie {:>3.0}% codif {:>3.0}% grava {:>3.0}% nós {:>2.0}%) leituras/doc {:>5.1} cache {:>4.0}k | filtro {:>4.0} MB stall {:>3.1}s L0 {:>2} | RSS {:>5.0} MB ({:.0}s)",
+            f("docs_por_s"), f("mb_por_s"), f("commit_fracao") * 100.0, f("trie_fracao") * 100.0,
+            f("codificar_fracao") * 100.0, f("gravar_fracao") * 100.0, f("nos_fracao") * 100.0,
+            f("leituras_commit_por_doc"), f("cache_nos") / 1000.0, f("filtro_mb"), f("stall_s"), f("l0"),
+            f("rss_mb"), f("segundos")
         );
         self.windows.push(w);
-        *self = Self { at: Instant::now(), docs, bytes, reads, commit_secs: 0.0, tickers: now, windows: std::mem::take(&mut self.windows) };
+        *self = Self {
+            at: Instant::now(),
+            docs,
+            bytes,
+            reads,
+            commits: CommitTotals::default(),
+            all: self.all,
+            tickers: now,
+            windows: std::mem::take(&mut self.windows),
+        };
     }
 
-    /// A primeira janela com MB/s abaixo de 20% da mediana das 10 anteriores
-    /// (MB/s e não docs/s: o tamanho dos artigos varia muito ao longo do corpus).
-    fn collapse(&self) -> Value {
-        let speed = |w: &Value| w["mb_por_s"].as_f64().unwrap_or(0.0);
-        for i in 3..self.windows.len() {
-            let mut before: Vec<f64> = self.windows[i.saturating_sub(10)..i].iter().map(speed).collect();
+    /// O primeiro trecho com MB/s abaixo de 20% da mediana dos 10 anteriores
+    /// (MB/s e não docs/s: o tamanho dos artigos varia muito ao longo do
+    /// corpus). Com lotes maiores que a janela, as janelas são agrupadas até
+    /// cobrir um lote: senão a janela que contém o commit inteiro parece um
+    /// colapso, e as outras, rápidas demais.
+    fn collapse(&self, batch: usize) -> Value {
+        let group = (batch as u64).div_ceil(LOAD_WINDOW).max(1) as usize;
+        let num = |w: &Value, k: &str| w[k].as_f64().unwrap_or(0.0);
+        let speeds: Vec<(f64, &Value)> = self
+            .windows
+            .chunks(group)
+            .map(|c| (c.iter().map(|w| num(w, "janela_mb")).sum::<f64>() / c.iter().map(|w| num(w, "janela_s")).sum::<f64>().max(1e-9), c.last().unwrap()))
+            .collect();
+        for i in 3..speeds.len() {
+            let mut before: Vec<f64> = speeds[i.saturating_sub(10)..i].iter().map(|s| s.0).collect();
             before.sort_by(f64::total_cmp);
             let median = before[before.len() / 2];
-            let w = &self.windows[i];
-            if speed(w) < 0.2 * median {
+            let (speed, w) = speeds[i];
+            if speed < 0.2 * median {
                 eprintln!(
                     "\n⚠ colapso em {} docs: {:.1} → {:.1} MB/s; filtro relido {:.0} MB, Gets/doc {:.0}, stall {:.1}s, L0 {}, RAM livre {:.0} MB",
-                    w["docs"], median, speed(w), w["filtro_mb"].as_f64().unwrap_or(0.0),
-                    w["gets_por_doc"].as_f64().unwrap_or(0.0), w["stall_s"].as_f64().unwrap_or(0.0), w["l0"],
-                    w["ram_livre_mb"].as_f64().unwrap_or(0.0)
+                    w["docs"], median, speed, num(w, "filtro_mb"), num(w, "gets_por_doc"), num(w, "stall_s"), w["l0"],
+                    num(w, "ram_livre_mb")
                 );
                 return json!({ "docs": w["docs"], "mb_por_s_antes": median, "janela": w });
             }
@@ -1035,16 +1181,19 @@ fn trie_order(a: &&str, b: &&str) -> std::cmp::Ordering {
     a.chars().count().cmp(&b.chars().count()).then_with(|| a.cmp(b))
 }
 
-/// Lista de um termo no oráculo: documentos em ordem e o tf de cada um.
+/// Lista de um termo no oráculo: documentos em ordem, o tf de cada um e
+/// quantas ocorrências estão no título.
 #[derive(Default)]
 struct OTerm {
     docs: Vec<DocId>,
     tfs: Vec<u32>,
+    title_tfs: Vec<u32>,
 }
 
 impl OTerm {
-    fn tf(&self, doc: DocId) -> Option<u32> {
-        self.docs.binary_search(&doc).ok().map(|i| self.tfs[i])
+    /// (tf no documento inteiro, tf no título).
+    fn tfs_of(&self, doc: DocId) -> Option<(u32, u32)> {
+        self.docs.binary_search(&doc).ok().map(|i| (self.tfs[i], self.title_tfs[i]))
     }
 
     /// Ordena por documento; o mesmo documento duas vezes: a última vence.
@@ -1052,10 +1201,11 @@ impl OTerm {
         if self.docs.windows(2).all(|w| w[0] < w[1]) {
             return;
         }
-        let mut pairs: Vec<(DocId, u32)> = self.docs.iter().copied().zip(self.tfs.iter().copied()).collect();
-        pairs.sort_by_key(|p| p.0);
-        let mut kept: Vec<(DocId, u32)> = Vec::with_capacity(pairs.len());
-        for p in pairs {
+        let mut entries: Vec<(DocId, u32, u32)> =
+            (0..self.docs.len()).map(|i| (self.docs[i], self.tfs[i], self.title_tfs[i])).collect();
+        entries.sort_by_key(|p| p.0);
+        let mut kept: Vec<(DocId, u32, u32)> = Vec::with_capacity(entries.len());
+        for p in entries {
             match kept.last_mut() {
                 Some(last) if last.0 == p.0 => *last = p,
                 _ => kept.push(p),
@@ -1063,7 +1213,21 @@ impl OTerm {
         }
         self.docs = kept.iter().map(|p| p.0).collect();
         self.tfs = kept.iter().map(|p| p.1).collect();
+        self.title_tfs = kept.iter().map(|p| p.2).collect();
     }
+}
+
+/// Tokens de um artigo com as posições do motor: o título em 0…T − 1 e o
+/// texto a partir de T + `TITLE_GAP` (ou de 0, sem título). Também diz quantos
+/// tokens são do título.
+fn doc_tokens(title: &str, text: &str) -> (Vec<(String, u32)>, usize) {
+    let title_tokens = tokenize(title);
+    let span = title_tokens.len() as u32;
+    let offset = if span > 0 { span + TITLE_GAP } else { 0 };
+    let n_title = title_tokens.len();
+    let mut out: Vec<(String, u32)> = title_tokens.into_iter().enumerate().map(|(i, t)| (t, i as u32)).collect();
+    out.extend(tokenize(text).into_iter().enumerate().map(|(i, t)| (t, offset + i as u32)));
+    (out, n_title)
 }
 
 /// Posições de um termo no oráculo, achatadas para caber na memória.
@@ -1121,17 +1285,25 @@ impl OPos {
 struct Oracle {
     terms: HashMap<String, OTerm>,
     positions: HashMap<String, OPos>,
-    lens: HashMap<DocId, u32>,
+    /// (tamanho inteiro, tamanho do título), sem stopwords.
+    lens: HashMap<DocId, (u32, u32)>,
+    /// Posições ocupadas pelo título (stopwords inclusive): uma frase que
+    /// começa antes disso está no título.
+    spans: HashMap<DocId, u32>,
     total_len: u64,
+    total_title_len: u64,
     k1: f64,
     b: f64,
+    title_weight: f64,
+    title_b: f64,
     max_prefix: usize,
 }
 
 /// Uma parte da consulta resolvida no oráculo.
 enum OClause<'a> {
     Term(&'a OTerm),
-    Prefix(Vec<&'a OTerm>),
+    /// As completações e o df do conjunto (documentos com alguma delas).
+    Prefix(Vec<&'a OTerm>, usize),
     Phrase(Vec<(u32, &'a OTerm, &'a OPos)>),
 }
 
@@ -1142,12 +1314,19 @@ impl Oracle {
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
     }
 
-    /// Fórmula do plano, escrita de novo aqui (não usa a do motor).
-    fn bm25(&self, idf: f64, tf: u32, len: u32) -> f64 {
-        let avg = self.total_len as f64 / self.lens.len().max(1) as f64;
-        let tf = f64::from(tf);
-        let norm = if avg > 0.0 { 1.0 - self.b + self.b * f64::from(len) / avg } else { 1.0 };
-        idf * tf * (self.k1 + 1.0) / (tf + self.k1 * norm)
+    /// BM25F do plano de relevância (seção 1), escrito de novo aqui (não usa
+    /// a conta do motor): `tf~ = tf_texto / B_texto + w · tf_título / B_título`.
+    fn bm25(&self, idf: f64, tf: u32, title_tf: u32, doc: DocId) -> f64 {
+        let n = self.lens.len().max(1) as f64;
+        let (len, title_len) = self.lens[&doc];
+        let body_len = f64::from(len - title_len);
+        let avg_body = (self.total_len - self.total_title_len) as f64 / n;
+        let avg_title = self.total_title_len as f64 / n;
+        let norm = |b: f64, l: f64, avg: f64| if avg > 0.0 { 1.0 - b + b * l / avg } else { 1.0 - b };
+        let (b_body, b_title) = (norm(self.b, body_len, avg_body), norm(self.title_b, f64::from(title_len), avg_title));
+        let part = |tf: u32, weight: f64, b: f64| if tf == 0 || b <= 0.0 { 0.0 } else { weight * f64::from(tf) / b };
+        let ptf = part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title);
+        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
     }
 
     /// Termos com o prefixo, na ordem da Trie, até o limite do motor.
@@ -1159,21 +1338,23 @@ impl Oracle {
         matches
     }
 
-    /// Ocorrências da frase no documento, por força bruta.
-    fn phrase_count(parts: &[(u32, &OTerm, &OPos)], doc: DocId) -> u32 {
+    /// Ocorrências da frase no documento, por força bruta, e quantas
+    /// começam antes de `span` (no título).
+    fn phrase_count(parts: &[(u32, &OTerm, &OPos)], doc: DocId, span: u32) -> (u32, u32) {
         let lists: Vec<&[u32]> = match parts.iter().map(|(_, _, pos)| pos.get(doc)).collect::<Option<Vec<_>>>() {
             Some(lists) => lists,
-            None => return 0,
+            None => return (0, 0),
         };
-        let mut count = 0;
+        let (mut count, mut in_title) = (0, 0);
         for &p0 in lists[0] {
             let Some(start) = p0.checked_sub(parts[0].0) else { continue };
             let all = parts.iter().zip(&lists).skip(1).all(|((off, _, _), list)| {
                 u32::try_from(u64::from(start) + u64::from(*off)).is_ok_and(|want| list.binary_search(&want).is_ok())
             });
             count += u32::from(all);
+            in_title += u32::from(all && start < span);
         }
-        count
+        (count, in_title)
     }
 
     /// Documentos que casam com a consulta, em ordem. `None` se alguma frase
@@ -1192,7 +1373,10 @@ impl Oracle {
                     if terms.is_empty() {
                         return empty();
                     }
-                    resolved.push(OClause::Prefix(terms));
+                    let mut union: Vec<DocId> = terms.iter().flat_map(|t| t.docs.iter().copied()).collect();
+                    union.sort_unstable();
+                    union.dedup();
+                    resolved.push(OClause::Prefix(terms, union.len()));
                 }
                 Clause::Phrase(parts) => {
                     let mut out = Vec::new();
@@ -1211,7 +1395,7 @@ impl Oracle {
         for c in &resolved {
             match c {
                 OClause::Term(t) => sets.push(t.docs.clone()),
-                OClause::Prefix(ts) => {
+                OClause::Prefix(ts, _) => {
                     let mut all: Vec<DocId> = ts.iter().flat_map(|t| t.docs.iter().copied()).collect();
                     all.sort_unstable();
                     all.dedup();
@@ -1227,7 +1411,7 @@ impl Oracle {
         }
         docs.retain(|&d| {
             resolved.iter().all(|c| match c {
-                OClause::Phrase(parts) => Self::phrase_count(parts, d) > 0,
+                OClause::Phrase(parts) => Self::phrase_count(parts, d, 0).0 > 0,
                 _ => true,
             })
         });
@@ -1240,18 +1424,22 @@ impl Oracle {
         let mut scored: Vec<(DocId, f64)> = docs
             .iter()
             .map(|&d| {
-                let len = self.lens[&d];
                 let mut score = 0.0;
                 for c in &resolved {
                     score += match c {
-                        OClause::Term(t) => self.bm25(self.idf(t.docs.len()), t.tf(d).unwrap_or(0), len),
-                        OClause::Prefix(ts) => ts
-                            .iter()
-                            .filter_map(|t| t.tf(d).map(|tf| self.bm25(self.idf(t.docs.len()), tf, len)))
-                            .fold(0.0, f64::max),
+                        OClause::Term(t) => {
+                            let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
+                            self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
+                        }
+                        // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
+                        OClause::Prefix(ts, df) => {
+                            let (tf, title_tf) = ts.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                            self.bm25(self.idf(*df), tf, title_tf, d)
+                        }
                         OClause::Phrase(parts) => {
                             let idf: f64 = parts.iter().map(|(_, t, _)| self.idf(t.docs.len())).sum();
-                            self.bm25(idf, Self::phrase_count(parts, d), len)
+                            let (tf, title_tf) = Self::phrase_count(parts, d, self.spans[&d]);
+                            self.bm25(idf, tf, title_tf, d)
                         }
                     };
                 }
@@ -1293,9 +1481,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
         terms: HashMap::default(),
         positions: HashMap::default(),
         lens: HashMap::default(),
+        spans: HashMap::default(),
         total_len: 0,
+        total_title_len: 0,
         k1: engine.config().bm25_k1,
         b: engine.config().bm25_b,
+        title_weight: engine.config().title_weight,
+        title_b: engine.config().title_b,
         max_prefix: engine.config().max_prefix_terms,
     };
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
@@ -1305,12 +1497,18 @@ fn oracle(args: OracleArgs) -> AnyResult {
     for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
         let doc = doc?;
         docs += 1;
-        let tokens = tokenize(&doc.body);
-        let mut counts: HashMap<&str, u32> = HashMap::default();
-        let mut len = 0u32;
-        for t in tokens.iter().filter(|t| !stopwords.contains(t)) {
-            *counts.entry(t.as_str()).or_insert(0) += 1;
+        let (positioned, n_title) = doc_tokens(&doc.title, &doc.text);
+        let tokens: Vec<String> = positioned.iter().map(|(t, _)| t.clone()).collect();
+        // termo -> (tf, tf no título)
+        let mut counts: HashMap<&str, (u32, u32)> = HashMap::default();
+        let (mut len, mut title_len) = (0u32, 0u32);
+        for (i, t) in tokens.iter().enumerate().filter(|(_, t)| !stopwords.contains(t)) {
+            let in_title = i < n_title;
+            let c = counts.entry(t.as_str()).or_insert((0, 0));
+            c.0 += 1;
+            c.1 += u32::from(in_title);
             len += 1;
+            title_len += u32::from(in_title);
         }
         // Reservatórios: documentos para consultas AND e frases, títulos para revocação.
         let mut unique: Vec<String> = counts.keys().map(|t| t.to_string()).collect();
@@ -1335,9 +1533,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
                 titles[j] = (doc.id, doc.title.clone());
             }
         }
-        let add = |e: &mut OTerm, tf: u32| {
+        let add = |e: &mut OTerm, (tf, title_tf): (u32, u32)| {
             e.docs.push(doc.id);
             e.tfs.push(tf);
+            e.title_tfs.push(title_tf);
         };
         for (t, c) in counts {
             match o.terms.get_mut(t) {
@@ -1345,12 +1544,17 @@ fn oracle(args: OracleArgs) -> AnyResult {
                 None => add(o.terms.entry(t.to_string()).or_default(), c),
             }
         }
-        match o.lens.insert(doc.id, len) {
-            Some(old) => {
+        o.spans.insert(doc.id, n_title as u32);
+        match o.lens.insert(doc.id, (len, title_len)) {
+            Some((old, old_title)) => {
                 repeated += 1;
                 o.total_len = o.total_len + u64::from(len) - u64::from(old);
+                o.total_title_len = o.total_title_len + u64::from(title_len) - u64::from(old_title);
             }
-            None => o.total_len += u64::from(len),
+            None => {
+                o.total_len += u64::from(len);
+                o.total_title_len += u64::from(title_len);
+            }
         }
         if docs.is_multiple_of(20_000) {
             eprintln!("oráculo: {docs} docs, {} termos ({:.0}s)", o.terms.len(), started.elapsed().as_secs_f64());
@@ -1408,12 +1612,14 @@ fn oracle(args: OracleArgs) -> AnyResult {
         phrase_cases.push(window);
     }
 
-    // 4. Consultas de ranking: termo frequente, termo qualquer, E, prefixo e frase.
+    // 4. Consultas de ranking: termo frequente, termo qualquer, E, prefixo,
+    //    frase e título (onde o peso do título mais pesa).
     let frequent: Vec<&str> = vocab.iter().copied().filter(|t| o.terms[*t].docs.len() >= 50).collect();
     let mut rank_cases: Vec<String> = Vec::new();
     for i in 0..args.rank_queries {
         let doc = rng.pick(&sampled_docs);
-        let query = match i % 5 {
+        let query = match i % 6 {
+            5 if !titles.is_empty() => rng.pick(&titles).1.clone(),
             0 if !frequent.is_empty() => rng.pick(&frequent).to_string(),
             0 | 1 => rng.pick(&vocab).to_string(),
             2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| rng.pick(doc).clone()).collect::<Vec<_>>().join(" "),
@@ -1456,10 +1662,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
         for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
             let doc = doc?;
             let mut found: HashMap<&str, Vec<u32>> = HashMap::default();
-            let tokens = tokenize(&doc.body);
-            for (i, t) in tokens.iter().enumerate() {
+            let (tokens, _) = doc_tokens(&doc.title, &doc.text);
+            for (t, p) in &tokens {
                 if !stopwords.contains(t) && (full || needed.contains(t)) {
-                    found.entry(t.as_str()).or_default().push(i as u32);
+                    found.entry(t.as_str()).or_default().push(*p);
                 }
             }
             for (t, ps) in found {
@@ -1489,7 +1695,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
         nodes
     };
     let posting_list = |t: &OTerm| -> Vec<fire_flower::Posting> {
-        t.docs.iter().zip(&t.tfs).map(|(&doc, &tf)| fire_flower::Posting { doc, tf }).collect()
+        (0..t.docs.len()).map(|i| fire_flower::Posting { doc: t.docs[i], tf: t.tfs[i], title_tf: t.title_tfs[i] }).collect()
     };
     for term in &check_terms {
         let node = node_of.get(*term).copied();
@@ -1526,19 +1732,20 @@ fn oracle(args: OracleArgs) -> AnyResult {
 
     // 7. Tamanhos dos documentos e estatísticas.
     let mut lengths = Check::new("tamanhos e estatísticas");
-    let mut engine_lens: Vec<(DocId, u32)> = Vec::new();
-    engine.for_each_doc_len(|d, l| engine_lens.push((d, l)))?;
+    let mut engine_lens: Vec<(DocId, (u32, u32))> = Vec::new();
+    engine.for_each_doc_len(|d, l, t| engine_lens.push((d, (l, t))))?;
     engine_lens.sort_unstable();
-    let mut oracle_lens: Vec<(DocId, u32)> = o.lens.iter().map(|(&d, &l)| (d, l)).collect();
+    let mut oracle_lens: Vec<(DocId, (u32, u32))> = o.lens.iter().map(|(&d, &l)| (d, l)).collect();
     oracle_lens.sort_unstable();
     lengths.compare("documentos com tamanho", &engine_lens.len(), &oracle_lens.len());
-    let engine_map: HashMap<DocId, u32> = engine_lens.into_iter().collect();
-    for (doc, len) in &oracle_lens {
-        lengths.compare(&format!("tamanho do {doc}"), &engine_map.get(doc).copied(), &Some(*len));
+    let engine_map: HashMap<DocId, (u32, u32)> = engine_lens.into_iter().collect();
+    for (doc, lens) in &oracle_lens {
+        lengths.compare(&format!("tamanhos (inteiro, título) do {doc}"), &engine_map.get(doc).copied(), &Some(*lens));
     }
     let stats = engine.stats()?;
     lengths.compare("doc_count", &stats.doc_count, &(o.lens.len() as u64));
     lengths.compare("total_len", &stats.total_len, &o.total_len);
+    lengths.compare("total_title_len", &stats.total_title_len, &o.total_title_len);
     if repeated > 0 {
         lengths.notes.push(format!("{repeated} IDs repetidos no corpus (a última versão vence)"));
     }
@@ -1665,7 +1872,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
                         for (_, t, _) in &parts[1..] {
                             docs = fire_flower::internals::intersect(&docs, &t.docs);
                         }
-                        docs.retain(|&d| Oracle::phrase_count(&parts, d) > 0);
+                        docs.retain(|&d| Oracle::phrase_count(&parts, d, 0).0 > 0);
                         docs
                     }
                     None => Vec::new(),
@@ -1689,7 +1896,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
             (format!("total {} {g:?}", got.total), format!("total {total} {want:?}"))
         });
     }
-    ranking.notes.push("termo frequente, termo qualquer, E, termo + prefixo e frase; notas com diferença relativa < 1e-4".into());
+    ranking.notes.push("termo frequente, termo qualquer, E, termo + prefixo, frase e título; BM25F; notas com diferença relativa < 1e-4".into());
     checks.push(ranking);
 
     // Relatório.
@@ -1724,6 +1931,300 @@ fn oracle(args: OracleArgs) -> AnyResult {
     if total > 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+// ================================================================== relevância
+
+/// Uma consulta com resposta conhecida: algum dos `expected` tem que vir no topo.
+struct RelCase {
+    query: String,
+    expected: Vec<DocId>,
+    /// O título esperado (só para mostrar).
+    title: String,
+}
+
+/// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
+/// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
+const REL_SETS: [(&str, usize); 4] = [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10)];
+
+fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "# consulta\tIDs esperados\ttítulo (gerado por `wiki relevancia`)")?;
+    for c in cases {
+        let ids: Vec<String> = c.expected.iter().map(u64::to_string).collect();
+        writeln!(w, "{}\t{}\t{}", c.query, ids.join(","), c.title)?;
+    }
+    Ok(())
+}
+
+fn read_rel_set(path: &Path) -> AnyResult<Vec<RelCase>> {
+    let mut out = Vec::new();
+    for (i, line) in std::fs::read_to_string(path)?.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (Some(query), Some(ids)) = (cols.next(), cols.next()) else {
+            return Err(format!("{}:{}: linha sem IDs", path.display(), i + 1).into());
+        };
+        let expected = ids
+            .split(',')
+            .map(|id| id.trim().parse::<DocId>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
+        out.push(RelCase { query: query.to_string(), expected, title: cols.next().unwrap_or("").to_string() });
+    }
+    Ok(out)
+}
+
+/// Reservatório: guarda `n` itens sorteados de um fluxo de tamanho desconhecido.
+fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usize, item: impl FnOnce() -> T) {
+    if kept.len() < n {
+        kept.push(item());
+    } else if rng.below(seen) < n {
+        let j = rng.below(n);
+        kept[j] = item();
+    }
+}
+
+/// Gera os conjuntos rel-* a partir do corpus (seed fixa: mesmas consultas).
+///
+/// - `rel-titulo`: o título inteiro → o artigo.
+/// - `rel-digitando`: o título com a última palavra cortada em ~60% e `*`,
+///   como o TUI busca enquanto se digita (`coreia do nor*`).
+/// - `rel-hub`: títulos cujos termos aparecem em ≥ 3 outros títulos
+///   ("Coreia do Norte" ⊂ "Bandeira da Coreia do Norte"): o artigo principal
+///   tem que vir em 1º, acima dos derivados.
+/// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
+///   artigo no top-10. Segura o exagero do peso do título.
+fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, seed: u64, per_set: usize) -> AnyResult<Vec<(&'static str, Vec<RelCase>)>> {
+    let mut rng = Rng(seed);
+    let mut titles: Vec<(DocId, String, Vec<String>)> = Vec::new();
+    let mut df: HashMap<String, u32> = HashMap::default();
+    let mut by_title: Vec<RelCase> = Vec::new();
+    let mut typing: Vec<RelCase> = Vec::new();
+    let mut body_docs: Vec<(DocId, String, Vec<String>)> = Vec::new();
+    let (mut seen, mut seen_typing) = (0usize, 0usize);
+    for doc in Corpus::open(corpus, 0, take, false)? {
+        let doc = doc?;
+        let title_terms = index_terms(&doc.title, stopwords);
+        let body_terms = index_terms(&doc.body, stopwords);
+        for t in &body_terms {
+            *df.entry(t.clone()).or_insert(0) += 1;
+        }
+        if title_terms.is_empty() {
+            continue;
+        }
+        seen += 1;
+        let case = || RelCase { query: doc.title.clone(), expected: vec![doc.id], title: doc.title.clone() };
+        reservoir(&mut rng, &mut by_title, seen, per_set, case);
+
+        // Digitando: a última palavra do título, se for indexável e tiver ≥ 5 letras.
+        let tokens = tokenize(&doc.title);
+        if let Some(last) = tokens.last()
+            && !stopwords.contains(last)
+            && last.chars().count() >= 5
+        {
+            seen_typing += 1;
+            let n = last.chars().count();
+            let cut: String = last.chars().take((n * 6).div_ceil(10).max(3).min(n - 1)).collect();
+            let mut words = tokens[..tokens.len() - 1].to_vec();
+            words.push(format!("{cut}*"));
+            let query = words.join(" ");
+            reservoir(&mut rng, &mut typing, seen_typing, per_set, || RelCase { query, expected: vec![doc.id], title: doc.title.clone() });
+        }
+
+        let outside: Vec<String> = body_terms.into_iter().filter(|t| title_terms.binary_search(t).is_err()).collect();
+        reservoir(&mut rng, &mut body_docs, seen, per_set * 3, || (doc.id, doc.title.clone(), outside));
+        titles.push((doc.id, doc.title, title_terms));
+    }
+
+    // Hubs: índice invertido só dos títulos.
+    let mut title_index: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (i, (_, _, terms)) in titles.iter().enumerate() {
+        for t in terms {
+            title_index.entry(t.as_str()).or_default().push(i as u32);
+        }
+    }
+    let mut same_terms: HashMap<&[String], u32> = HashMap::default();
+    for (_, _, terms) in &titles {
+        *same_terms.entry(terms.as_slice()).or_insert(0) += 1;
+    }
+    let mut hubs: Vec<RelCase> = Vec::new();
+    let mut seen_hubs = 0usize;
+    for (id, title, terms) in &titles {
+        // Outro título com exatamente os mesmos termos deixaria a resposta ambígua.
+        if same_terms[terms.as_slice()] > 1 {
+            continue;
+        }
+        let mut lists: Vec<&Vec<u32>> = terms.iter().map(|t| &title_index[t.as_str()]).collect();
+        lists.sort_by_key(|l| l.len());
+        if lists[0].len() < 4 {
+            continue;
+        }
+        let mut containing: Vec<u32> = lists[0].clone();
+        for l in &lists[1..] {
+            containing.retain(|i| l.binary_search(i).is_ok());
+            if containing.len() < 4 {
+                break;
+            }
+        }
+        if containing.len() >= 4 {
+            seen_hubs += 1;
+            reservoir(&mut rng, &mut hubs, seen_hubs, per_set, || RelCase { query: title.clone(), expected: vec![*id], title: title.clone() });
+        }
+    }
+
+    // Corpo: 2 termos com df entre 20 e 2000 que não estão no título.
+    let mut body_cases: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if body_cases.len() >= per_set {
+            break;
+        }
+        let mid: Vec<&String> = terms.iter().filter(|t| (20..=2000).contains(&df[*t])).collect();
+        if mid.len() < 2 {
+            continue;
+        }
+        let a = rng.below(mid.len());
+        let mut b = rng.below(mid.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        body_cases.push(RelCase { query: format!("{} {}", mid[a], mid[b]), expected: vec![*id], title: title.clone() });
+    }
+    Ok(vec![("rel-titulo", by_title), ("rel-digitando", typing), ("rel-hub", hubs), ("rel-corpo", body_cases)])
+}
+
+/// Consultas à mão: `consulta \t títulos esperados (|) \t nota`. Os títulos
+/// viram IDs pelo corpus; consultas sem nenhum artigo no corpus são puladas.
+fn read_manual(path: &Path, corpus: &Path, take: Option<u64>) -> AnyResult<Vec<RelCase>> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let query = cols.next().unwrap_or("").to_string();
+        let titles = cols.next().unwrap_or("").split('|').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        wanted.push((query, titles));
+    }
+    let all: HashSet<&str> = wanted.iter().flat_map(|(_, ts)| ts.iter().map(String::as_str)).collect();
+    let mut ids: HashMap<String, DocId> = HashMap::default();
+    for doc in Corpus::open(corpus, 0, take, false)? {
+        let doc = doc?;
+        if all.contains(doc.title.as_str()) {
+            ids.insert(doc.title, doc.id);
+        }
+    }
+    let mut out = Vec::new();
+    for (query, titles) in wanted {
+        let expected: Vec<DocId> = titles.iter().filter_map(|t| ids.get(t).copied()).collect();
+        if expected.is_empty() {
+            // Numa fatia pequena o artigo pode não existir: a consulta não conta.
+            eprintln!("consulta à mão ignorada (artigo fora do corpus): {query} → {}", titles.join(" | "));
+            continue;
+        }
+        out.push(RelCase { query, expected, title: titles.join(" | ") });
+    }
+    Ok(out)
+}
+
+/// Posição (0 = primeiro) do primeiro esperado nos 1000 melhores, e o top 3.
+fn rank_of(engine: &Engine, case: &RelCase) -> AnyResult<(Option<usize>, Vec<DocId>)> {
+    let hits = engine.search_top(&case.query, 1000)?;
+    let pos = hits.iter().position(|h| case.expected.contains(&h.doc));
+    Ok((pos, hits.iter().take(3).map(|h| h.doc).collect()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relevancia(
+    db: &Path,
+    corpus: &Path,
+    sets_dir: &Path,
+    manual: &Path,
+    take: Option<u64>,
+    seed: u64,
+    per_set: usize,
+    gerar: bool,
+    config: Config,
+    resumo: bool,
+    label: Option<String>,
+) -> AnyResult {
+    let started = Instant::now();
+    let engine = Engine::open(db, config)?;
+    let stopwords = engine.stopwords().clone();
+    std::fs::create_dir_all(sets_dir)?;
+
+    let missing = REL_SETS.iter().any(|(name, _)| !sets_dir.join(format!("{name}.tsv")).exists());
+    if gerar || missing {
+        eprintln!("gerando conjuntos em {}", sets_dir.display());
+        for (name, cases) in generate_rel_sets(corpus, take, &stopwords, seed, per_set)? {
+            write_rel_set(&sets_dir.join(format!("{name}.tsv")), &cases)?;
+        }
+    }
+    let mut sets: Vec<(String, usize, Vec<RelCase>)> = Vec::new();
+    for (name, hit_at) in REL_SETS {
+        sets.push((name.to_string(), hit_at, read_rel_set(&sets_dir.join(format!("{name}.tsv")))?));
+    }
+    sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
+
+    let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
+    let mut results = Vec::new();
+    println!("{:<14} {:>8} {:>7} {:>7} {:>7} {:>7} {:>9}", "conjunto", "consultas", "top-1", "top-3", "top-10", "MRR", "fora 1000");
+    let mut manual_lines = Vec::new();
+    for (name, hit_at, cases) in &sets {
+        let (mut t1, mut t3, mut t10, mut rr, mut out) = (0usize, 0usize, 0usize, 0.0f64, 0usize);
+        let mut misses: Vec<Value> = Vec::new();
+        for case in cases {
+            let (pos, top3) = rank_of(&engine, case)?;
+            match pos {
+                Some(i) => {
+                    t1 += usize::from(i < 1);
+                    t3 += usize::from(i < 3);
+                    t10 += usize::from(i < 10);
+                    rr += 1.0 / (i + 1) as f64;
+                }
+                None => out += 1,
+            }
+            let hit = pos.is_some_and(|i| i < *hit_at);
+            if name == "rel-manual" {
+                let mark = if hit { "✔" } else { "✗" };
+                let shown: Vec<String> = top3.iter().map(|&d| title_of(d)).collect();
+                manual_lines.push(format!(
+                    "  {mark} {:<26} {:>6}  → {}",
+                    case.query,
+                    pos.map_or("—".into(), |i| format!("{}º", i + 1)),
+                    shown.join(" · ")
+                ));
+            }
+            if !hit && misses.len() < 8 {
+                misses.push(json!({ "consulta": case.query, "esperado": case.title, "posicao": pos.map(|i| i + 1),
+                                    "top3": top3.iter().map(|&d| title_of(d)).collect::<Vec<_>>() }));
+            }
+        }
+        let n = cases.len().max(1) as f64;
+        let (top1, top3, top10, mrr) = (t1 as f64 / n, t3 as f64 / n, t10 as f64 / n, rr / n);
+        println!("{name:<14} {:>8} {:>6.1}% {:>6.1}% {:>6.1}% {mrr:>7.3} {out:>9}", cases.len(), top1 * 100.0, top3 * 100.0, top10 * 100.0);
+        results.push(json!({ "conjunto": name, "consultas": cases.len(), "acerto_ate": hit_at, "top1": top1, "top3": top3,
+                             "top10": top10, "mrr": mrr, "fora_do_top1000": out, "erros": misses }));
+    }
+    if !resumo {
+        println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
+        for line in &manual_lines {
+            println!("{line}");
+        }
+    }
+    println!("\n{:.1}s", started.elapsed().as_secs_f64());
+
+    let label = label.unwrap_or_else(|| stem(sets_dir));
+    save_result(
+        "relevancia",
+        &label,
+        json!({ "db": db, "corpus": corpus, "take": take, "seed": seed, "config": config_json(engine.config()),
+                "conjuntos": results }),
+    )?;
     Ok(())
 }
 
@@ -1904,9 +2405,8 @@ fn drop_os_caches() -> AnyResult {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, cache_mb: usize, label: Option<String>) -> AnyResult {
+fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, config: Config, label: Option<String>) -> AnyResult {
     let sets = read_query_sets(paths)?;
-    let config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
     // O enum do crate também está deslocado: `EnableTime` corresponde a medir tempos no RocksDB 10.
     let level = if perf_time { PerfStatsLevel::EnableTime } else { PerfStatsLevel::EnableCount };
     let mut engine = if cold { None } else { Some(Engine::open(db, config.clone())?) };
@@ -2065,6 +2565,7 @@ fn digest(db: &Path) -> AnyResult {
         for p in engine.term_postings_of_node(*node)? {
             h.write(&p.doc.to_le_bytes());
             h.write(&p.tf.to_le_bytes());
+            h.write(&p.title_tf.to_le_bytes());
             postings += 1;
         }
         h.write(&[0xfe]);
@@ -2079,15 +2580,17 @@ fn digest(db: &Path) -> AnyResult {
         h.write(&[0xff]);
     }
     let mut lens = Vec::new();
-    engine.for_each_doc_len(|doc, len| lens.push((doc, len)))?;
+    engine.for_each_doc_len(|doc, len, title_len| lens.push((doc, len, title_len)))?;
     lens.sort_unstable();
-    for (doc, len) in &lens {
+    for (doc, len, title_len) in &lens {
         h.write(&doc.to_le_bytes());
         h.write(&len.to_le_bytes());
+        h.write(&title_len.to_le_bytes());
     }
     let stats = engine.stats()?;
     h.write(&stats.doc_count.to_le_bytes());
     h.write(&stats.total_len.to_le_bytes());
+    h.write(&stats.total_title_len.to_le_bytes());
     println!(
         "{}",
         json!({ "db": db, "termos": nodes.len(), "postagens": postings, "posicoes": positions,
@@ -2149,7 +2652,7 @@ fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queri
     let mut batch = engine.batch();
     for doc in Corpus::open(corpus_path, skip, take, false)? {
         let doc = doc?;
-        batch.add_document(doc.id, &doc.body)?;
+        batch.add_titled(doc.id, &doc.title, &doc.text)?;
         batch.set_label(doc.id, &doc.title);
         docs += 1;
         bytes += doc.bytes as u64;

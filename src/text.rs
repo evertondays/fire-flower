@@ -126,24 +126,51 @@ pub struct Analyzer {
     starts: Vec<u32>,
     /// Posições agrupadas por termo, cada grupo em ordem crescente.
     positions: Vec<u32>,
+    /// Posições do título: 0…`title_span` − 1 (stopwords contam).
+    title_span: u32,
 }
+
+/// Vão entre o título e o texto nas posições: uma frase não casa
+/// atravessando o fim do título e o começo do texto (o Elasticsearch usa o
+/// mesmo valor no `position_increment_gap`).
+pub const TITLE_GAP: u32 = 100;
 
 impl Analyzer {
     /// Analisa `text` e devolve o tamanho do documento (tokens sem stopwords).
     /// Os termos ficam disponíveis em [`Analyzer::terms`] até a próxima chamada.
     pub fn run(&mut self, text: &str, stopwords: &Stopwords) -> u32 {
-        let Self { text: buf, tokens, group_of, groups, starts, positions } = self;
+        self.run_fields("", text, stopwords).0
+    }
+
+    /// Analisa um documento com título. O título ocupa as posições
+    /// 0…T − 1 e o texto começa em T + [`TITLE_GAP`] (ou em 0, sem título).
+    /// Devolve (tamanho do documento inteiro, tamanho do título), sem stopwords.
+    pub fn run_fields(&mut self, title: &str, text: &str, stopwords: &Stopwords) -> (u32, u32) {
+        let Self { text: buf, tokens, group_of, groups, starts, positions, title_span } = self;
         buf.clear();
         tokens.clear();
         group_of.clear();
         groups.clear();
-        for_each_token(text, |t, p| {
-            if !stopwords.contains(t) {
+        let (mut span, mut title_len) = (0u32, 0u32);
+        // Devolve se o token entrou (não é stopword).
+        let mut push = |t: &str, p: u32| {
+            let kept = !stopwords.contains(t);
+            if kept {
                 let start = buf.len() as u32;
                 buf.push_str(t);
                 tokens.push((start, buf.len() as u32, p));
             }
+            kept
+        };
+        for_each_token(title, |t, p| {
+            span = p + 1;
+            title_len += u32::from(push(t, p));
         });
+        let offset = if span > 0 { span + TITLE_GAP } else { 0 };
+        for_each_token(text, |t, p| {
+            push(t, offset + p);
+        });
+        *title_span = span;
 
         // Termo -> grupo. O mapa empresta `buf`, então nasce a cada documento
         // (uma alocação só, já no tamanho certo).
@@ -173,7 +200,17 @@ impl Analyzer {
             positions[cursor[g as usize] as usize] = p;
             cursor[g as usize] += 1;
         }
-        tokens.len() as u32
+        (tokens.len() as u32, title_len)
+    }
+
+    /// Posições ocupadas pelo título do último documento (stopwords inclusive).
+    pub fn title_span(&self) -> u32 {
+        self.title_span
+    }
+
+    /// Quantas das `positions` (de um termo do último documento) estão no título.
+    pub fn title_tf(&self, positions: &[u32]) -> u32 {
+        positions.partition_point(|&p| p < self.title_span) as u32
     }
 
     /// Termos distintos do último documento, na ordem da primeira ocorrência.

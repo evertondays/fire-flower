@@ -44,7 +44,7 @@ enum Command {
         /// Arquivo .jsonl
         arquivo: PathBuf,
         /// Documentos por commit
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = 10000)]
         lote: usize,
         /// Pula as N primeiras linhas (para retomar uma carga interrompida)
         #[arg(long, default_value_t = 0)]
@@ -203,7 +203,9 @@ fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>, posicoes: 
         if is_html(path) {
             content = text::strip_html(&content);
         }
-        batch.add_labeled(&path.display().to_string(), &content)?;
+        // O nome do arquivo (sem extensão) é o título: pesa mais no ranking.
+        let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        batch.add_labeled_titled(&path.display().to_string(), &title, &content)?;
         indexed += 1;
         if batch.len() >= DOCS_PER_COMMIT {
             batch.commit()?;

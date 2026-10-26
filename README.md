@@ -15,8 +15,9 @@ Suporta:
 - busca por prefixo (`program*`);
 - busca por **frase** (`"casa de papel"`): os termos em sequência, com as
   stopwords contando como buraco;
-- **ranking BM25**: os resultados saem por relevância (`search_top`), com
-  `k1 = 1,2` e `b = 0,75`; `search` continua devolvendo todos os IDs em ordem;
+- **ranking BM25F**: os resultados saem por relevância (`search_top`), com o
+  título como campo de peso próprio (`add_titled`; `k1 = 1,2`, `b = 0,75`,
+  peso do título 50); `search` continua devolvendo todos os IDs em ordem;
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
 - indexação em lotes atômicos, com buscas rodando em paralelo.
 
@@ -71,8 +72,11 @@ Por padrão lê `~/datasets/ptwiki/ptwiki.jsonl` e grava em
 `~/bench-db/ptwiki-full`, apagando o banco anterior (pede confirmação). O
 painel mostra artigos/s, MB/s, tempo restante, memória e tamanho do banco.
 `Ctrl+C` interrompe e mostra o comando `--pular N` para continuar de onde
-parou. No fim, um resumo vai para `~/bench-db/ptwiki-full.carga.json`. Veja
-`--help` para `--corpus`, `--banco`, `--lote` e `--compactar`.
+parou. No fim, o banco é compactado (~10 s; deixa as buscas 30–50% mais
+rápidas) e um resumo vai para `~/bench-db/ptwiki-full.carga.json`. A carga
+inteira leva ~2 minutos, com lotes de 10 mil artigos e pico de ~1,4 GB de
+memória. Veja `--help` para `--corpus`, `--banco`, `--lote` e
+`--sem-compactar`.
 
 Por baixo, o script chama:
 
@@ -80,8 +84,10 @@ Por baixo, o script chama:
 ./target/release/fire-flower index-jsonl ~/bench-db/ptwiki-full ~/datasets/ptwiki/ptwiki.jsonl
 ```
 
-Cada linha do JSONL é `{"id", "title", "text"}`: indexa `title + texto` sob o
-`id` e guarda o título como rótulo.
+Cada linha do JSONL é `{"id", "title", "text"}`: indexa o texto e o título
+(como campo próprio, que pesa mais no ranking) sob o `id`, e guarda o título
+como rótulo. No `index` de arquivos, o título é o nome do arquivo sem a
+extensão.
 
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
 usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
@@ -149,23 +155,27 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 ### Chaves no RocksDB
 
-Formato v2 (`meta:format = 2`). Um banco do formato anterior não abre: o
-`open` diz "formato antigo; recarregue o banco".
+Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
+`open` diz em que formato ele está e pede para recarregar.
 
 | Chave | Valor |
 |---|---|
 | `node:<id>` | nó da Trie: flag de fim de palavra + filhos (`caractere → id`). `node:0` é a raiz |
-| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: `(Δdoc, tf)` por documento |
-| `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições) |
-| `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco` |
+| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: `(Δdoc, tf << 1 \| tem título, [tf no título])` por documento |
+| `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições); o título vem primeiro e o texto começa 100 posições depois |
+| `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco`, e o do título |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
-| `meta:doc_count`, `meta:total_len` | total de documentos e soma dos tamanhos (BM25) |
+| `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
 | `meta:format`, `meta:positions`, `meta:languages` | formato, se grava posições e idiomas das stopwords |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
-em chaves separadas para que a busca comum não leia posições.
+em chaves separadas para que a busca comum não leia posições. Listas com mais
+de 256 documentos têm, antes das entradas, uma tabela de saltos (último
+documento, tamanho e quantidade de entradas de cada bloco, 128 na gravação):
+o E e as frases vão direto ao bloco de um documento, sem decodificar a lista
+inteira, e o merge só concatena as tabelas dos pedaços.
 
 ### Configuração do RocksDB
 
@@ -182,7 +192,10 @@ em chaves separadas para que a busca comum não leia posições.
 ## Performance
 
 O plano de medição está em [docs/plano-performance.md](docs/plano-performance.md)
-e os resultados mais recentes em [bench/RESULTADOS.md](bench/RESULTADOS.md).
+e os resultados ficam num repositório separado,
+[fire-flower-bench](https://github.com/evertondays/fire-flower-bench), que o `perf.py` espera clonado ao
+lado deste (`../fire-flower-bench`, ou `FF_BENCH_DIR`); os mais recentes estão em
+[RESULTADOS.md](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md).
 
 ```bash
 python3 scripts/perf.py tudo --escala 10k
@@ -196,13 +209,14 @@ python3 scripts/perf.py tudo --escala 10k
    `merge`, e o RocksDB une os pedaços na leitura e na compactação.
 2. **Sem `PostingsListID` separado.** A lista de um termo fica em `post:<id do
    nó terminal>`; não é preciso um segundo contador nem guardar o ID no nó.
-3. **Filhos guardam IDs numéricos** (`BTreeMap<char, u64>`), não strings
-   `"node:124"`. O `BTreeMap` deixa o autocompletar em ordem alfabética.
+3. **Filhos guardam IDs numéricos** (um vetor ordenado de `(char, u64)`), não
+   strings `"node:124"`. A ordem deixa o autocompletar em ordem alfabética.
 4. **Lote invertido, com cache de nós.** O lote junta termo → documentos e só
    percorre a Trie no commit, uma vez por termo distinto (e não uma vez por
    documento). Os nós lidos ou criados ficam num cache do escritor que passa de
-   um lote para o outro (`Config::writer_cache_nodes`, 1 milhão de nós por
-   padrão), então a raiz e os termos comuns não são relidos a cada commit.
+   um lote para o outro (`Config::writer_cache_nodes`, 3 milhões de nós por
+   padrão; ficam os usados mais recentemente), então os nós dos termos comuns
+   não são relidos a cada commit.
 5. **Serialização binária própria** em vez de Gob/JSON (menor e sem
    dependências).
 
@@ -211,25 +225,25 @@ python3 scripts/perf.py tudo --escala 10k
 - **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID troca o
   tf, as posições e o tamanho dele (e não conta o documento duas vezes), mas
   termos que saíram do texto continuam apontando para ele.
-- **Título sem peso maior.** O BM25 olha o documento como um texto só; buscar
-  "Brasil" não garante o artigo "Brasil" em primeiro (campos/BM25F ficam para
-  depois).
+- **Peso do título ajustado para a Wikipédia.** O peso 50 saiu de consultas
+  com resposta conhecida na Wikipédia, onde o título descreve o artigo; em
+  outro tipo de corpus, ajuste `Config::title_weight`. Páginas de
+  desambiguação podem passar à frente do artigo principal.
 - **Frases:** uma stopword dentro da frase só conta a distância (`"casa de
   papel"` também casa "casa da papel"); frase só de stopwords fica vazia; não
   há prefixo dentro de frase (`"revolução franc*"`).
 - **Posições custam espaço.** Na fatia de 10k da Wikipédia, o banco
   compactado tem ~51 MB com posições e ~21 MB sem; use `--sem-posicoes` se
   não precisar de frases.
-- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 9 `Get`s
-  (a raiz e os dois níveis seguintes vêm do cache de nós das buscas,
+- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 7 `Get`s
+  (a raiz e os quatro níveis seguintes vêm do cache de nós das buscas,
   `Config::reader_cache_depth`). Com o block cache quente isso fica em
-  microssegundos, mas um índice de termos
-  ordenado (`term:<palavra>` com iterador de prefixo do RocksDB) faria o mesmo
-  com 1 leitura, e o autocompletar com um único scan.
+  microssegundos. Os prefixos curtos são a consulta mais cara (~3 ms na
+  Wikipédia inteira): visitam centenas de nós e unem até 256 listas.
 - **Prefixos muito curtos** (`a*`) expandem no máximo
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
-  ranking, um documento que casa com vários termos do prefixo fica com a nota
-  do melhor deles (não a soma).
+  ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
+  que têm alguma completação, e o tf é a soma das completações no documento.
 - **Sem stemming** ("casa" e "casas" são termos diferentes).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam

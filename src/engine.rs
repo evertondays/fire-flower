@@ -1,31 +1,37 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v2; a codificação está em `codec.rs`):
+//! Espaços de chave (formato v3; a codificação está em `codec.rs`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
-//! - `post:<id>`    -> (documento, tf) do termo que termina no nó `<id>`
-//! - `pos:<id>`     -> posições do termo em cada documento (só com posições)
-//! - `norm:<bloco>` -> tamanho de cada documento com `id ÷ 1024 = bloco`
+//! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
+//! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
+//!   o título vem primeiro, e o texto começa `TITLE_GAP` posições depois
+//! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
 //! - `meta:*`       -> formato, contadores de ID, estatísticas e idiomas
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::Instant;
 
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, MergeOperands, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
-use crate::codec::{self, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, TrieNode};
+use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, PostingsCursor, TrieNode};
 use crate::stopwords::{self, Language, Stopwords};
 use crate::text::{Analyzer, Clause, normalize_term, parse_query};
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 2;
+pub const FORMAT_VERSION: u64 = 5;
+/// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
+/// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
+/// ser aberto para escrita.
+const MERGE_OPERATOR: &str = "fire_flower_v5";
 
 const META_FORMAT: &[u8] = b"meta:format";
 /// `1` se o banco grava posições (`pos:`), `0` se não.
@@ -34,6 +40,7 @@ const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
 const META_DOC_COUNT: &[u8] = b"meta:doc_count";
 const META_TOTAL_LEN: &[u8] = b"meta:total_len";
+const META_TOTAL_TITLE_LEN: &[u8] = b"meta:total_title_len";
 /// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
 const META_LANGUAGES: &[u8] = b"meta:languages";
 
@@ -89,15 +96,24 @@ pub struct Config {
     /// Custa um pouco de CPU; use em medições, não em produção.
     pub statistics: bool,
     /// Quantos nós da Trie o escritor mantém em memória entre um lote e
-    /// outro (~200 bytes cada). Sem isso, todo lote relê do banco a raiz e os
-    /// nós dos termos comuns. Passando do limite, saem primeiro os nós que o
-    /// último lote não usou e depois os mais fundos. 0 desliga o cache.
+    /// outro (~130 bytes cada; o cache só cresce até o tamanho da Trie).
+    /// Sem isso, todo lote relê do banco os nós dos termos que aparecem.
+    /// Passando do limite, ficam os usados mais recentemente. 0 desliga.
+    ///
+    /// 3 milhões (~400 MB) cobrem 40% da Trie da Wikipédia inteira (7,3 M
+    /// nós): a carga cai de 139 s para 115 s com lote de 10 mil, e as
+    /// leituras do escritor, de 7,5 para 1,7 por artigo.
     pub writer_cache_nodes: usize,
     /// Até que profundidade da Trie as buscas guardam os nós já decodificados,
     /// compartilhados entre elas (0 = só a raiz). Toda busca começa pela raiz,
-    /// que tem um filho por caractere inicial e cresce com o índice (13 KB com
-    /// 100 mil artigos da Wikipédia): sem o cache, cada busca a decodificava
-    /// inteira. `None` desliga.
+    /// que tem um filho por caractere inicial e cresce com o índice (37 KB na
+    /// Wikipédia inteira): sem o cache, cada busca a decodificava inteira.
+    /// `None` desliga.
+    ///
+    /// O cache não descarta: guarda no máximo os nós até essa profundidade.
+    /// Na Wikipédia inteira são 365 mil nós (~48 MB) até a profundidade 4 (o
+    /// padrão; autocompletar de 2 letras de 44 para 11 µs), ~125 MB até a 5 e
+    /// ~260 MB até a 6 (prefixos curtos ~30% mais rápidos).
     pub reader_cache_depth: Option<usize>,
     /// Idiomas das stopwords (palavras comuns que não entram no índice).
     ///
@@ -121,8 +137,34 @@ pub struct Config {
     pub partition_filters: bool,
     /// Parâmetro `k1` do BM25: quanto a nota cresce com a frequência do termo.
     pub bm25_k1: f64,
-    /// Parâmetro `b` do BM25: quanto o tamanho do documento pesa (0 a 1).
+    /// Parâmetro `b` do BM25: quanto o tamanho do texto pesa (0 a 1).
     pub bm25_b: f64,
+    /// Quanto uma ocorrência no título vale em relação a uma no texto, no
+    /// BM25F (ver `docs/plano-relevancia.md`). 0 ignora o título.
+    pub title_weight: f64,
+    /// `b` do título: quanto um título longo perde para um curto (0 a 1).
+    pub title_b: f64,
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        let in_unit = |v: f64| (0.0..=1.0).contains(&v);
+        let ok = self.bm25_k1.is_finite()
+            && self.bm25_k1 >= 0.0
+            && in_unit(self.bm25_b)
+            && in_unit(self.title_b)
+            && self.title_weight.is_finite()
+            && self.title_weight >= 0.0;
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Config(format!(
+                "parâmetros de ranking inválidos: k1 = {}, b = {}, peso do título = {}, b do título = {} \
+                 (k1 e peso ≥ 0; b entre 0 e 1)",
+                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b
+            )))
+        }
+    }
 }
 
 impl Default for Config {
@@ -132,14 +174,19 @@ impl Default for Config {
             bloom_bits_per_key: 10.0,
             max_prefix_terms: 256,
             statistics: false,
-            writer_cache_nodes: 1_000_000,
-            reader_cache_depth: Some(2),
+            writer_cache_nodes: 3_000_000,
+            reader_cache_depth: Some(4),
             languages: None,
             positions: None,
             partition_filters: true,
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,
             bm25_b: 0.75,
+            // Escolhidos pela grade da Fase 4 do plano de relevância (100k da
+            // Wikipédia, confirmada com outra amostra): a qualidade sobe até
+            // ~50 e depois quase não muda; b 0,9 mantém o limite do corte finito.
+            title_weight: 50.0,
+            title_b: 0.9,
         }
     }
 }
@@ -260,6 +307,7 @@ impl<T> EpochCache<T> {
 impl Engine {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let path = path.as_ref();
+        config.validate()?;
         let mut table = BlockBasedOptions::default();
         table.set_bloom_filter(config.bloom_bits_per_key, false);
         table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
@@ -282,7 +330,7 @@ impl Engine {
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_merge_operator_associative("fire_flower_v2", merge_operator);
+        opts.set_merge_operator_associative(MERGE_OPERATOR, merge_operator);
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
         if config.statistics {
@@ -290,16 +338,24 @@ impl Engine {
             opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptTimers);
         }
 
-        // Antes de abrir para escrita: a recuperação do WAL de um banco v1
-        // rodaria o merge operator novo sobre listas antigas.
-        if was_opened_as_v1(path) {
-            return Err(old_format());
+        // Antes de abrir para escrita: a recuperação do WAL de um banco de
+        // outro formato rodaria o merge operator novo sobre listas antigas.
+        if let Some(name) = previous_merge_operator(path)
+            && name != MERGE_OPERATOR
+        {
+            return Err(stored_format_error(path).unwrap_or_else(|| {
+                Error::Config(format!("banco de outro formato (merge operator {name}); recarregue o banco"))
+            }));
         }
-        let db = match DB::open(&opts, path) {
+        // Com a família padrão explícita, `cf_handle("default")` existe (o
+        // `MultiGet` em lote do crate precisa dela). Para o RocksDB é o mesmo
+        // banco; o descritor leva as mesmas opções (merge operator, cache…).
+        let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
+        let db = match DB::open_cf_descriptors(&opts, path, [default_cf]) {
             Ok(db) => db,
-            // Um banco v1 com merges pendentes no WAL falha já na recuperação,
-            // porque o merge operator não entende o formato antigo.
-            Err(e) => return Err(old_format_error(path).unwrap_or(Error::Db(e))),
+            // Um banco antigo com merges pendentes no WAL falha já na
+            // recuperação, porque o merge operator não entende o formato antigo.
+            Err(e) => return Err(stored_format_error(path).unwrap_or(Error::Db(e))),
         };
         let positions = resolve_format(&db, config.positions)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
@@ -307,6 +363,7 @@ impl Engine {
         let stats = IndexStats {
             doc_count: read_counter(&db, META_DOC_COUNT)?.unwrap_or(0),
             total_len: read_counter(&db, META_TOTAL_LEN)?.unwrap_or(0),
+            total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
         };
         let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
         let writer = Mutex::new(WriterState { next_node_id, next_doc_id, stats, cache: NodeCache::default() });
@@ -499,8 +556,9 @@ impl Engine {
         }
     }
 
-    /// Percorre o tamanho de todos os documentos (em ordem de bloco).
-    pub fn for_each_doc_len(&self, mut f: impl FnMut(DocId, u32)) -> Result<()> {
+    /// Percorre os tamanhos de todos os documentos (em ordem de bloco):
+    /// `f(documento, tamanho inteiro, tamanho do título)`.
+    pub fn for_each_doc_len(&self, mut f: impl FnMut(DocId, u32, u32)) -> Result<()> {
         let mode = rocksdb::IteratorMode::From(NORM, rocksdb::Direction::Forward);
         for item in self.db.iterator(mode) {
             let (key, value) = item?;
@@ -509,8 +567,8 @@ impl Engine {
                 .ok()
                 .and_then(|b| b.parse().ok())
                 .ok_or_else(|| Error::Corrupt("chave norm: inválida".into()))?;
-            for (offset, len) in NormBlock::decode(&value)?.iter() {
-                f(block * NORM_BLOCK_DOCS + u64::from(offset), len);
+            for (offset, l) in NormBlock::decode(&value)?.iter() {
+                f(block * NORM_BLOCK_DOCS + u64::from(offset), l.len, u32::from(l.title_len));
             }
         }
         Ok(())
@@ -563,32 +621,73 @@ struct View<'a> {
 /// Uma parte da consulta já carregada, para o ranking. `weight` é
 /// idf · (k1 + 1), a parte da nota que não depende do documento.
 enum Scorer {
-    /// Termo exato: a lista `list` em `lists`.
+    /// Termo exato, ou prefixo tratado como um termo só (R1 do plano de
+    /// relevância): a lista `list` em `lists`.
     Term { weight: f64, list: usize, bound: Bound },
-    /// Prefixo: as listas dos termos expandidos, juntas e ordenadas por
-    /// documento (um documento aparece uma vez por termo que contém).
-    /// `term_of[i]` diz de qual termo é a entrada `i`; vale a maior nota (D8).
-    Prefix { list: usize, weights: Vec<f64>, term_of: Vec<u32>, bound: Bound },
-    /// Frase: entra na nota como um termo, com tf = ocorrências da frase e
-    /// idf = soma dos idfs dos termos (como o Lucene).
+    /// Frase: entra na nota como um termo, com tf = ocorrências da frase (no
+    /// texto e no título, pela posição) e idf = soma dos idfs dos termos
+    /// (como o Lucene).
     Phrase { weight: f64, phrase: usize, bound: Bound },
 }
 
-/// Os parâmetros do BM25 para uma busca.
-struct Bm25 {
-    k1: f64,
-    n: f64,
-    /// k1 · (1 − b): o fator de um documento de tamanho 0.
+/// Normalização de um campo pelo tamanho: `B(len) = 1 − b + b · len / média`.
+#[derive(Clone, Copy)]
+struct FieldNorm {
     base: f64,
-    /// k1 · b / média: quanto cada token a mais pesa no fator.
     slope: f64,
 }
 
+impl FieldNorm {
+    fn new(b: f64, avg: f64) -> Self {
+        Self { base: 1.0 - b, slope: if avg > 0.0 { b / avg } else { 0.0 } }
+    }
+
+    #[inline]
+    fn of(&self, len: f64) -> f64 {
+        self.base + self.slope * len
+    }
+}
+
+/// Os parâmetros do BM25F para uma busca (seção 1 de `plano-relevancia.md`):
+///
+/// ```text
+/// B_f(d) = 1 − b_f + b_f · len_f(d) / média_f      (f = texto, título)
+/// tf~    = tf_texto / B_texto  +  w · tf_título / B_título
+/// nota   = idf · tf~ · (k1 + 1) / (tf~ + k1)
+/// ```
+///
+/// O título multiplica o tf antes da saturação: uma ocorrência nele vale
+/// `w` no texto, e um título curto vale mais que um longo. Sem título
+/// (`tf_título = 0`) é exatamente o BM25 de antes.
+struct Bm25 {
+    k1: f64,
+    n: f64,
+    body: FieldNorm,
+    title: FieldNorm,
+    title_weight: f64,
+    /// Maior `1 / B_texto` (documento de tamanho 0): para o limite superior.
+    max_body: f64,
+    /// Quanto uma ocorrência no título vale, no máximo, em ocorrências do
+    /// texto num documento de tamanho 0: `(w / (1 − b_título)) / max_body`.
+    title_ratio: f64,
+}
+
+/// Os pesos de um documento: `1 / B_texto` e `w / B_título`.
+#[derive(Clone, Copy)]
+struct DocNorm {
+    body: f64,
+    title: f64,
+}
+
 impl Bm25 {
-    fn new(k1: f64, b: f64, stats: IndexStats) -> Self {
-        let avg = stats.avg_len();
-        let slope = if avg > 0.0 { k1 * b / avg } else { 0.0 };
-        Self { k1, n: stats.doc_count as f64, base: k1 * (1.0 - b), slope }
+    fn new(config: &Config, stats: IndexStats) -> Self {
+        let body = FieldNorm::new(config.bm25_b, stats.avg_body_len());
+        let title = FieldNorm::new(config.title_b, stats.avg_title_len());
+        let inv = |x: f64| if x > 0.0 { 1.0 / x } else { f64::INFINITY };
+        let max_body = inv(body.base);
+        let max_title = if config.title_weight > 0.0 { config.title_weight * inv(title.base) } else { 0.0 };
+        let title_ratio = if max_body.is_finite() { max_title / max_body } else { 0.0 };
+        Self { k1: config.bm25_k1, n: stats.doc_count as f64, body, title, title_weight: config.title_weight, max_body, title_ratio }
     }
 
     fn idf(&self, df: usize) -> f64 {
@@ -601,154 +700,293 @@ impl Bm25 {
         idf * (self.k1 + 1.0)
     }
 
-    /// Parte do denominador que só depende do documento:
-    /// k1 · (1 − b + b · |d| / média), sem divisão. Nunca é menor que `base`.
+    /// Os pesos de um documento, uma vez por documento.
     #[inline]
-    fn doc_factor(&self, len: u32) -> f64 {
-        self.base + self.slope * f64::from(len)
+    fn doc_norm(&self, lens: DocLens) -> DocNorm {
+        let title_len = f64::from(lens.title_len);
+        let body_len = f64::from(lens.len) - title_len;
+        // B = 0 só com b = 1 e o campo vazio: aí o tf do campo é 0 também.
+        let b_body = self.body.of(body_len);
+        let b_title = self.title.of(title_len);
+        DocNorm {
+            body: if b_body > 0.0 { 1.0 / b_body } else { 0.0 },
+            title: if b_title > 0.0 { self.title_weight / b_title } else { 0.0 },
+        }
     }
 
-    /// idf · tf · (k1 + 1) / (tf + doc_factor).
+    /// tf~: as ocorrências no texto e no título, cada uma normalizada pelo seu campo.
     #[inline]
-    fn score(weight: f64, tf: u32, doc_factor: f64) -> f64 {
-        let tf = f64::from(tf);
-        weight * tf / (tf + doc_factor)
+    fn pseudo_tf(norm: DocNorm, tf: u32, title_tf: u32) -> f64 {
+        f64::from(tf - title_tf) * norm.body + f64::from(title_tf) * norm.title
+    }
+
+    /// idf · tf~ · (k1 + 1) / (tf~ + k1).
+    #[inline]
+    fn score(&self, weight: f64, pseudo_tf: f64) -> f64 {
+        weight * pseudo_tf / (pseudo_tf + self.k1)
     }
 }
 
-/// Maior nota possível de uma parte para cada tf: a de um documento de
-/// tamanho 0 (fator `base`). Tabelada para os tf comuns: conferir o limite
-/// fica sem divisão. É exato porque `score` cresce com o peso e diminui com o
-/// fator, e o arredondamento de ponto flutuante preserva essa ordem.
+/// Maior nota possível de uma parte, pela chave (ocorrências equivalentes
+/// do texto num documento de tamanho 0, arredondadas para cima): sem título
+/// a chave é o próprio tf. Tabelada para as chaves comuns: conferir o limite
+/// fica sem divisão. A margem relativa cobre o arredondamento de ponto
+/// flutuante, então o corte continua exato.
 struct Bound {
     weight: f64,
-    base: f64,
+    k1: f64,
+    max_body: f64,
+    title_ratio: f64,
     table: [f64; BOUND_TF + 1],
 }
 
 const BOUND_TF: usize = 32;
+const BOUND_MARGIN: f64 = 1.0 + 1e-12;
 
 impl Bound {
-    fn new(weight: f64, base: f64) -> Self {
-        Self { weight, base, table: std::array::from_fn(|tf| Bm25::score(weight, tf as u32, base)) }
+    fn new(weight: f64, bm25: &Bm25) -> Self {
+        let mut b = Self { weight, k1: bm25.k1, max_body: bm25.max_body, title_ratio: bm25.title_ratio, table: [0.0; BOUND_TF + 1] };
+        b.table = std::array::from_fn(|key| b.compute(key as u32));
+        b
+    }
+
+    fn compute(&self, key: u32) -> f64 {
+        if !self.max_body.is_finite() {
+            return self.weight * BOUND_MARGIN; // b = 1: sem limite útil (a nota nunca passa do peso)
+        }
+        let p = self.max_body * f64::from(key);
+        self.weight * p / (p + self.k1) * BOUND_MARGIN
+    }
+
+    /// A chave de uma entrada: o tf, se não houver título; senão o tf do
+    /// texto mais o do título convertido, arredondado para cima.
+    #[inline]
+    fn key(&self, tf: u32, title_tf: u32) -> u32 {
+        if title_tf == 0 {
+            return tf;
+        }
+        let x = f64::from(tf - title_tf) + self.title_ratio * f64::from(title_tf);
+        if x.is_finite() && x < f64::from(u32::MAX - 1) { (x + 1e-9).ceil() as u32 } else { u32::MAX }
     }
 
     #[inline]
-    fn get(&self, tf: u32) -> f64 {
-        match self.table.get(tf as usize) {
+    fn get_key(&self, key: u32) -> f64 {
+        match self.table.get(key as usize) {
             Some(&b) => b,
-            None => Bm25::score(self.weight, tf, self.base),
+            None => self.compute(key),
         }
+    }
+
+    #[inline]
+    fn get(&self, tf: u32, title_tf: u32) -> f64 {
+        self.get_key(self.key(tf, title_tf))
     }
 }
 
-/// Nota de `doc` (já posicionado em todas as listas): soma das partes, na
-/// ordem da consulta.
+/// Nota de um documento (já posicionado em todas as listas): soma das
+/// partes, na ordem da consulta.
 #[inline]
-fn doc_score(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], doc: DocId, factor: f64) -> f64 {
+fn doc_score(bm25: &Bm25, scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)], norm: DocNorm) -> f64 {
     let mut score = 0.0;
     for scorer in scorers {
         score += match scorer {
-            Scorer::Term { weight, list, .. } => Bm25::score(*weight, lists[*list][at[*list]].tf, factor),
-            Scorer::Prefix { list, weights, term_of, .. } => {
-                let entries = &lists[*list];
-                let mut best = 0.0f64;
-                let mut e = at[*list];
-                while e < entries.len() && entries[e].doc == doc {
-                    best = best.max(Bm25::score(weights[term_of[e] as usize], entries[e].tf, factor));
-                    e += 1;
-                }
-                best
+            Scorer::Term { weight, list, .. } => {
+                let p = sources[*list].current();
+                bm25.score(*weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf))
             }
-            Scorer::Phrase { weight, phrase, .. } => Bm25::score(*weight, counts[*phrase], factor),
+            Scorer::Phrase { weight, phrase, .. } => {
+                let (tf, title_tf) = counts[*phrase];
+                bm25.score(*weight, Bm25::pseudo_tf(norm, tf, title_tf))
+            }
         };
     }
     score
 }
 
 /// Limite superior de [`doc_score`]: a mesma soma, com o maior valor
-/// possível de cada parte. Soma de limites é limite da soma (arredondamento
-/// monótono de novo).
+/// possível de cada parte.
 #[inline]
-fn doc_bound(scorers: &[Scorer], lists: &[Vec<Posting>], at: &[usize], counts: &[u32], doc: DocId) -> f64 {
+fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {
-            Scorer::Term { list, bound, .. } => bound.get(lists[*list][at[*list]].tf),
-            Scorer::Prefix { list, bound, .. } => {
-                let entries = &lists[*list];
-                let mut best = 0.0f64;
-                let mut e = at[*list];
-                while e < entries.len() && entries[e].doc == doc {
-                    best = best.max(bound.get(entries[e].tf));
-                    e += 1;
-                }
-                best
+            Scorer::Term { list, bound, .. } => {
+                let p = sources[*list].current();
+                bound.get(p.tf, p.title_tf)
             }
-            Scorer::Phrase { phrase, bound, .. } => bound.get(counts[*phrase]),
+            Scorer::Phrase { phrase, bound, .. } => {
+                let (tf, title_tf) = counts[*phrase];
+                bound.get(tf, title_tf)
+            }
         };
     }
     bound
 }
 
+/// Uma lista do E, antes de escolher quem conduz: os bytes de `post:` (ainda
+/// não decodificados; o tamanho vem do cabeçalho) ou uma lista já
+/// decodificada (a união das completações de um prefixo).
+enum Member<T> {
+    Bytes { idx: usize, len: usize },
+    Decoded(Vec<T>),
+}
+
+impl<T> Member<T> {
+    fn len(&self) -> usize {
+        match self {
+            Member::Bytes { len, .. } => *len,
+            Member::Decoded(list) => list.len(),
+        }
+    }
+}
+
+/// Uma lista do E no ranking, já posicionada: decodificada (a que conduz e as
+/// uniões de prefixo) ou um cursor que salta blocos pela tabela de saltos.
+enum AndList<'s> {
+    Decoded { list: Vec<Posting>, at: usize },
+    Cursor { cursor: PostingsCursor<'s>, current: Posting },
+}
+
+impl AndList<'_> {
+    /// A entrada do documento da última busca bem-sucedida.
+    #[inline]
+    fn current(&self) -> Posting {
+        match self {
+            AndList::Decoded { list, at } => list[*at],
+            AndList::Cursor { current, .. } => *current,
+        }
+    }
+
+    /// Avança até `doc` (os alvos só crescem) e diz se ele está na lista.
+    #[inline]
+    fn seek(&mut self, doc: DocId) -> Result<bool> {
+        match self {
+            AndList::Decoded { list, at } => Ok(seek(list, at, doc)),
+            AndList::Cursor { cursor, current } => match cursor.seek(doc)? {
+                Some(p) if p.doc == doc => {
+                    *current = p;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+        }
+    }
+}
+
 impl View<'_> {
+    /// Bytes da lista `post:` de um nó, presos ao snapshot (sem cópia).
+    fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+        self.snap.get_bytes(Key::new(POST, node).as_ref())
+    }
+
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
         let clauses = parse_query(query, &self.engine.stopwords);
         self.check_phrases(&clauses)?;
-        let mut lists: Vec<Vec<DocId>> = Vec::new();
+        // Listas exatas ficam como bytes até se saber quem conduz o E.
+        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut members: Vec<Member<DocId>> = Vec::new();
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         for clause in &clauses {
             match clause {
-                Clause::Term(t) => {
-                    let list = if t.prefix { self.prefix_docs(&t.text)? } else { self.term_docs(&t.text)? };
+                Clause::Term(t) if t.prefix => {
+                    let list = self.prefix_docs(&t.text)?;
                     if list.is_empty() {
                         return Ok(Vec::new());
                     }
-                    lists.push(list);
+                    members.push(Member::Decoded(list));
+                }
+                Clause::Term(t) => {
+                    if self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut members)? == 0 {
+                        return Ok(Vec::new());
+                    }
                 }
                 Clause::Phrase(parts) => {
                     // Os termos da frase entram no E como termos comuns; as
                     // posições só são conferidas nos documentos que sobrarem.
                     let mut nodes = Vec::with_capacity(parts.len());
                     for part in parts {
-                        let Some(node) = self.term_node(&part.text)? else { return Ok(Vec::new()) };
-                        let list = self.load_docs(node)?;
-                        if list.is_empty() {
+                        let node = self.term_node(&part.text)?;
+                        if self.add_exact(node, &mut bytes, &mut members)? == 0 {
                             return Ok(Vec::new());
                         }
-                        lists.push(list);
-                        nodes.push((part.offset, node));
+                        nodes.push((part.offset, node.unwrap_or_default()));
                     }
                     phrases.push(nodes);
                 }
             }
         }
+        if members.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // Interseção começando pela lista menor: o resultado só encolhe.
-        lists.sort_by_key(Vec::len);
-        let mut lists = lists.into_iter();
-        let Some(mut result) = lists.next() else { return Ok(Vec::new()) };
-        for list in lists {
-            result = intersect(&result, &list);
-            if result.is_empty() {
-                return Ok(result);
+        // A lista menor conduz e é a única decodificada inteira; nas outras,
+        // cada documento dela é procurado por saltos (das menores para as
+        // maiores, que descartam mais cedo).
+        members.sort_by_key(Member::len);
+        let mut members = members.into_iter();
+        let mut result = match members.next().expect("há pelo menos uma lista") {
+            Member::Bytes { idx, .. } => codec::decode_docs(&bytes[idx])?,
+            Member::Decoded(list) => list,
+        };
+        let mut cursors: Vec<PostingsCursor<'_>> = Vec::new();
+        let mut decoded: Vec<(Vec<DocId>, usize)> = Vec::new();
+        for m in members {
+            match m {
+                Member::Bytes { idx, len } if use_cursor(len, result.len()) => {
+                    cursors.push(PostingsCursor::new(&bytes[idx])?)
+                }
+                Member::Bytes { idx, .. } => decoded.push((codec::decode_docs(&bytes[idx])?, 0)),
+                Member::Decoded(list) => decoded.push((list, 0)),
             }
         }
+        if !cursors.is_empty() || !decoded.is_empty() {
+            let mut kept = Vec::with_capacity(result.len());
+            'docs: for &doc in &result {
+                for c in cursors.iter_mut() {
+                    if c.seek(doc)?.is_none_or(|p| p.doc != doc) {
+                        continue 'docs;
+                    }
+                }
+                for (list, at) in decoded.iter_mut() {
+                    if !seek_docs(list, at, doc) {
+                        continue 'docs;
+                    }
+                }
+                kept.push(doc);
+            }
+            result = kept;
+        }
         for phrase in &phrases {
+            if result.is_empty() {
+                break;
+            }
             let slices = self.load_positions(phrase)?;
             let mut matcher = PhraseMatcher::new(phrase, &slices)?;
             let mut kept = Vec::with_capacity(result.len());
             for &doc in &result {
-                if matcher.count(doc, true)? > 0 {
+                if matcher.count(doc, true, 0)?.0 > 0 {
                     kept.push(doc);
                 }
             }
             result = kept;
-            if result.is_empty() {
-                break;
-            }
         }
         Ok(result)
+    }
+
+    /// Guarda os bytes da lista `post:` do termo e devolve o df (0 se o termo
+    /// não existe).
+    fn add_exact<'s, T>(
+        &'s self,
+        node: Option<u64>,
+        bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+        members: &mut Vec<Member<T>>,
+    ) -> Result<usize> {
+        let Some(node) = node else { return Ok(0) };
+        let Some(value) = self.post_bytes(node)? else { return Ok(0) };
+        let len = codec::list_len(&value)? as usize;
+        members.push(Member::Bytes { idx: bytes.len(), len });
+        bytes.push(value);
+        Ok(len)
     }
 
     fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
@@ -759,61 +997,52 @@ impl View<'_> {
         }
         let stats = self.stats()?;
         let config = &self.engine.config;
-        let bm25 = Bm25::new(config.bm25_k1, config.bm25_b, stats);
+        let bm25 = Bm25::new(config, stats);
 
-        // 1. Carrega as listas. Todas entram no E; cada parte da consulta
-        //    sabe quais são as suas.
-        let mut lists: Vec<Vec<Posting>> = Vec::new();
+        // 1. As listas. Todas entram no E; cada parte da consulta sabe quais
+        //    são as suas. As exatas ficam como bytes (o df vem do cabeçalho)
+        //    até se saber quem conduz.
+        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut lists: Vec<Member<Posting>> = Vec::new();
         let mut scorers: Vec<Scorer> = Vec::with_capacity(clauses.len());
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         for clause in &clauses {
             match clause {
                 Clause::Term(t) if !t.prefix => {
-                    let list = match self.term_node(&t.text)? {
-                        Some(node) => self.load_postings(node)?,
-                        None => Vec::new(),
-                    };
+                    let df = self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut lists)?;
+                    if df == 0 {
+                        return Ok(TopHits::default());
+                    }
+                    let weight = bm25.weight(bm25.idf(df));
+                    scorers.push(Scorer::Term { weight, list: lists.len() - 1, bound: Bound::new(weight, &bm25) });
+                }
+                Clause::Term(t) => {
+                    // Prefixo como um termo só: um documento por entrada, com o
+                    // tf somado das completações que ele contém, e o idf do
+                    // conjunto. Uma completação rara não vale mais que a
+                    // palavra comum (R1 do plano de relevância).
+                    let list = self.prefix_postings(&t.text)?;
                     if list.is_empty() {
                         return Ok(TopHits::default());
                     }
                     let weight = bm25.weight(bm25.idf(list.len()));
-                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, bm25.base) });
-                    lists.push(list);
-                }
-                Clause::Term(t) => {
-                    let words = self.words_with_prefix(&t.text, config.max_prefix_terms)?;
-                    let mut weights = Vec::with_capacity(words.len());
-                    let mut all: Vec<(DocId, u32, u32)> = Vec::new();
-                    for (term, (_, node)) in words.iter().enumerate() {
-                        let list = self.load_postings(*node)?;
-                        weights.push(bm25.weight(bm25.idf(list.len())));
-                        all.extend(list.into_iter().map(|p| (p.doc, term as u32, p.tf)));
-                    }
-                    if all.is_empty() {
-                        return Ok(TopHits::default());
-                    }
-                    all.sort_unstable_by_key(|&(doc, term, _)| (doc, term));
-                    let term_of = all.iter().map(|e| e.1).collect();
-                    // Limite com o maior peso: vale para qualquer termo do prefixo.
-                    let bound = Bound::new(weights.iter().copied().fold(0.0, f64::max), bm25.base);
-                    scorers.push(Scorer::Prefix { list: lists.len(), weights, term_of, bound });
-                    lists.push(all.into_iter().map(|(doc, _, tf)| Posting { doc, tf }).collect());
+                    scorers.push(Scorer::Term { weight, list: lists.len(), bound: Bound::new(weight, &bm25) });
+                    lists.push(Member::Decoded(list));
                 }
                 Clause::Phrase(parts) => {
                     let mut idf = 0.0;
                     let mut nodes = Vec::with_capacity(parts.len());
                     for part in parts {
-                        let Some(node) = self.term_node(&part.text)? else { return Ok(TopHits::default()) };
-                        let list = self.load_postings(node)?;
-                        if list.is_empty() {
+                        let node = self.term_node(&part.text)?;
+                        let df = self.add_exact(node, &mut bytes, &mut lists)?;
+                        if df == 0 {
                             return Ok(TopHits::default());
                         }
-                        idf += bm25.idf(list.len());
-                        nodes.push((part.offset, node));
-                        lists.push(list);
+                        idf += bm25.idf(df);
+                        nodes.push((part.offset, node.unwrap_or_default()));
                     }
                     let weight = bm25.weight(idf);
-                    scorers.push(Scorer::Phrase { weight, phrase: phrases.len(), bound: Bound::new(weight, bm25.base) });
+                    scorers.push(Scorer::Phrase { weight, phrase: phrases.len(), bound: Bound::new(weight, &bm25) });
                     phrases.push(nodes);
                 }
             }
@@ -822,39 +1051,66 @@ impl View<'_> {
             phrases.iter().map(|p| self.load_positions(p)).collect::<Result<_>>()?;
         let mut matchers: Vec<PhraseMatcher<'_>> =
             phrases.iter().zip(&slices).map(|(p, s)| PhraseMatcher::new(p, s)).collect::<Result<_>>()?;
-        let mut counts = vec![0u32; matchers.len()];
+        // (ocorrências da frase, quantas no título), por frase.
+        let mut counts = vec![(0u32, 0u32); matchers.len()];
 
-        if let [Scorer::Term { weight, list, bound }] = scorers.as_slice()
+        // Decodifica uma lista inteira.
+        let decode = |m: Member<Posting>| -> Result<Vec<Posting>> {
+            match m {
+                Member::Bytes { idx, .. } => codec::decode_postings(&bytes[idx]),
+                Member::Decoded(list) => Ok(list),
+            }
+        };
+        if let [Scorer::Term { weight, bound, .. }] = scorers.as_slice()
             && matchers.is_empty()
         {
-            let hits = self.top_single_term(&lists[*list], *weight, bound, &bm25, k)?;
-            return Ok(TopHits { hits, total: lists[*list].len() });
+            let list = decode(lists.pop().expect("um termo, uma lista"))?;
+            let hits = self.top_single_term(&list, *weight, bound, &bm25, k)?;
+            return Ok(TopHits { hits, total: list.len() });
         }
 
-        // 2. E pelas listas: a menor conduz, as outras avançam por saltos.
+        // 2. E pelas listas: a menor conduz (decodificada inteira); nas
+        //    outras, cada documento dela é procurado por saltos, sem
+        //    decodificar os blocos do meio.
         let driver = (0..lists.len()).min_by_key(|&i| lists[i].len()).unwrap_or(0);
-        let mut at = vec![0usize; lists.len()];
+        let driver_len = lists[driver].len();
+        let mut sources: Vec<AndList<'_>> = Vec::with_capacity(lists.len());
+        for (i, m) in lists.into_iter().enumerate() {
+            sources.push(match m {
+                Member::Bytes { idx, len } if i != driver && use_cursor(len, driver_len) => {
+                    AndList::Cursor { cursor: PostingsCursor::new(&bytes[idx])?, current: Posting { doc: 0, tf: 1, title_tf: 0 } }
+                }
+                m => AndList::Decoded { list: decode(m)?, at: 0 },
+            });
+        }
+        let driver_docs: Vec<DocId> = match &sources[driver] {
+            AndList::Decoded { list, .. } => list.iter().map(|p| p.doc).collect(),
+            AndList::Cursor { .. } => unreachable!("quem conduz é decodificada"),
+        };
         let mut norms = NormCursor::new(self);
         let mut top = TopK::new(k);
         let mut total = 0usize;
-        let mut prev: Option<DocId> = None;
-        'docs: for i in 0..lists[driver].len() {
-            let doc = lists[driver][i].doc;
-            if prev == Some(doc) {
-                continue; // prefixo: o mesmo documento por outro termo
+        'docs: for (i, &doc) in driver_docs.iter().enumerate() {
+            if let AndList::Decoded { at, .. } = &mut sources[driver] {
+                *at = i;
             }
-            prev = Some(doc);
-            at[driver] = i;
-            for (j, list) in lists.iter().enumerate() {
-                if j != driver && !seek(list, &mut at[j], doc) {
+            for (j, source) in sources.iter_mut().enumerate() {
+                if j != driver && !source.seek(doc)? {
                     continue 'docs;
                 }
             }
-            for (m, matcher) in matchers.iter_mut().enumerate() {
-                counts[m] = matcher.count(doc, false)?;
-                if counts[m] == 0 {
-                    continue 'docs;
+            // Com frase, o tamanho vem antes: a extensão do título diz quais
+            // ocorrências estão nele.
+            let mut lens = None;
+            if !matchers.is_empty() {
+                let l = norms.lens(doc)?;
+                for (m, matcher) in matchers.iter_mut().enumerate() {
+                    counts[m] = matcher.count(doc, false, u32::from(l.title_span))?;
+                    if counts[m].0 == 0 {
+                        continue 'docs;
+                    }
                 }
+                lens = Some(l);
             }
             total += 1;
             if k == 0 {
@@ -865,21 +1121,26 @@ impl View<'_> {
             //    passaria do pior não precisa do tamanho (nem da nota exata).
             //    Empate também perde: os IDs chegam em ordem crescente.
             if let Some(worst) = top.threshold()
-                && doc_bound(&scorers, &lists, &at, &counts, doc) <= worst
+                && doc_bound(&scorers, &sources, &counts) <= worst
             {
                 continue;
             }
-            let factor = bm25.doc_factor(norms.len(doc)?);
-            top.push(Hit { doc, score: doc_score(&scorers, &lists, &at, &counts, doc, factor) });
+            let lens = match lens {
+                Some(l) => l,
+                None => norms.lens(doc)?,
+            };
+            let score = doc_score(&bm25, &scorers, &sources, &counts, bm25.doc_norm(lens));
+            top.push(Hit { doc, score });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
     }
 
-    /// Um termo só: a nota depende só do tf e do tamanho, e o limite só do tf.
+    /// Um termo só: a nota depende só dos tf e dos tamanhos, e o limite só
+    /// da chave (`Bound::key`: o tf, sem título).
     ///
-    /// Os documentos são agrupados em níveis de tf (nível 0 = tf ≥ `CAP`,
-    /// nível `CAP − tf` para o resto), e o limite de um nível vale para todos
-    /// os níveis abaixo dele. A lista não é reordenada: cada faixa de níveis é
+    /// Os documentos são agrupados em níveis de chave (nível 0 = chave ≥
+    /// `CAP`, nível `CAP − chave` para o resto), e o limite de um nível vale
+    /// para todos os níveis abaixo dele. A lista não é reordenada: cada faixa de níveis é
     /// uma passada sequencial em ordem de ID, o que mantém a leitura dos
     /// tamanhos em ordem de bloco.
     ///
@@ -898,12 +1159,12 @@ impl View<'_> {
             return Ok(Vec::new());
         }
         const CAP: usize = 64;
-        let level = |tf: u32| CAP - (tf as usize).min(CAP);
-        // Menor tf de um nível: o limite do nível inteiro.
-        let level_tf = |l: usize| (CAP - l) as u32;
+        let level = |p: &Posting| CAP - (bound.key(p.tf, p.title_tf) as usize).min(CAP);
+        // Menor chave de um nível: o limite do nível inteiro.
+        let level_key = |l: usize| (CAP - l) as u32;
         let mut count = [0usize; CAP + 1];
         for p in list {
-            count[level(p.tf)] += 1;
+            count[level(p)] += 1;
         }
 
         let mut top = TopK::new(k);
@@ -926,7 +1187,7 @@ impl View<'_> {
             while hi <= CAP {
                 if count[hi] > 0 {
                     if top.worst().is_some() {
-                        if hi > 0 && loses(&top, bound.get(level_tf(hi)), 0) {
+                        if hi > 0 && loses(&top, bound.get_key(level_key(hi)), 0) {
                             break;
                         }
                     } else if gathered >= k {
@@ -940,12 +1201,12 @@ impl View<'_> {
                 break; // o nível `lo` já não alcança o pior
             }
             for p in list {
-                let l = level(p.tf);
-                if l < lo || l >= hi || loses(&top, bound.get(p.tf), p.doc) {
+                let l = level(p);
+                if l < lo || l >= hi || loses(&top, bound.get(p.tf, p.title_tf), p.doc) {
                     continue;
                 }
-                let factor = bm25.doc_factor(norms.len(p.doc)?);
-                top.push(Hit { doc: p.doc, score: Bm25::score(weight, p.tf, factor) });
+                let norm = bm25.doc_norm(norms.lens(p.doc)?);
+                top.push(Hit { doc: p.doc, score: bm25.score(weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf)) });
             }
             lo = hi;
         }
@@ -963,7 +1224,11 @@ impl View<'_> {
         let get = |key: &[u8]| -> Result<u64> {
             self.snap.get_bytes(key)?.map(|v| codec::get_varint(&v)).transpose().map(|v| v.unwrap_or(0))
         };
-        Ok(IndexStats { doc_count: get(META_DOC_COUNT)?, total_len: get(META_TOTAL_LEN)? })
+        Ok(IndexStats {
+            doc_count: get(META_DOC_COUNT)?,
+            total_len: get(META_TOTAL_LEN)?,
+            total_title_len: get(META_TOTAL_TITLE_LEN)?,
+        })
     }
 
     /// `term` já deve estar normalizado.
@@ -974,42 +1239,134 @@ impl View<'_> {
         })
     }
 
-    fn term_docs(&self, term: &str) -> Result<Vec<DocId>> {
-        match self.term_node(term)? {
-            Some(node) => self.load_docs(node),
-            None => Ok(Vec::new()),
+
+    /// Listas das completações de `prefix` unidas por documento, com o tf
+    /// somado: o prefixo como se fosse um termo só.
+    fn prefix_postings(&self, prefix: &str) -> Result<Vec<Posting>> {
+        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
+        let mut all: Vec<Posting> = Vec::new();
+        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+            all.extend(codec::decode_postings(&value)?);
         }
+        // `all` é a concatenação de listas já ordenadas: a ordenação estável
+        // detecta os trechos ordenados e só os intercala (o `sort_unstable`
+        // ordenava tudo de novo).
+        all.sort_by_key(|p| p.doc);
+        let mut merged: Vec<Posting> = Vec::with_capacity(all.len());
+        for p in all {
+            match merged.last_mut() {
+                Some(last) if last.doc == p.doc => {
+                    last.tf = last.tf.saturating_add(p.tf);
+                    last.title_tf = last.title_tf.saturating_add(p.title_tf);
+                }
+                _ => merged.push(p),
+            }
+        }
+        Ok(merged)
     }
 
     fn prefix_docs(&self, prefix: &str) -> Result<Vec<DocId>> {
+        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
         let mut all = Vec::new();
-        for (_, node_id) in self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)? {
-            all.extend(self.load_docs(node_id)?);
+        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+            all.extend(codec::decode_docs(&value)?);
         }
-        all.sort_unstable();
+        all.sort(); // trechos já ordenados: ver `prefix_postings`
         all.dedup();
         Ok(all)
     }
 
-    /// Busca em largura a partir do nó do prefixo. Retorna (palavra, id do nó).
+    /// Busca em largura a partir do nó do prefixo, até `limit` palavras, das
+    /// mais curtas para as mais longas e, no mesmo comprimento, em ordem
+    /// alfabética. Retorna (palavra, id do nó).
+    ///
+    /// Percorre nível a nível (a mesma ordem de uma fila) e lê os nós que não
+    /// estão no cache em lotes de até `WORDS_CHUNK` com um `MultiGet`: um
+    /// prefixo curto visita centenas de nós, e um `Get` por nó custava metade
+    /// do tempo de `p-2*` na Wikipédia inteira.
     fn words_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        const WORDS_CHUNK: usize = 64;
         let mut out = Vec::new();
-        let Some((start, _)) = self.find_node(prefix)? else { return Ok(out) };
-        let depth = prefix.chars().count();
-        let mut queue = VecDeque::from([(prefix.to_string(), start, depth)]);
-        while out.len() < limit {
-            let Some((word, id, depth)) = queue.pop_front() else { break };
-            let node = self.require_node(id, depth)?;
-            for (&ch, &child) in &node.children {
-                let mut next = word.clone();
-                next.push(ch);
-                queue.push_back((next, child, depth + 1));
+        let Some((start, start_node)) = self.find_node(prefix)? else { return Ok(out) };
+        let mut depth = prefix.chars().count();
+        let mut level: Vec<(String, u64)> = vec![(prefix.to_string(), start)];
+        let mut first = Some(start_node);
+        while !level.is_empty() && out.len() < limit {
+            let mut next = Vec::new();
+            let mut at = 0;
+            'level: while at < level.len() {
+                // Lote do tamanho do que ainda falta (o autocompletar pede 10
+                // palavras: ler 64 nós de uma vez desperdiçaria leituras).
+                let size = (2 * (limit - out.len())).clamp(4, WORDS_CHUNK);
+                let chunk = &level[at..(at + size).min(level.len())];
+                at += chunk.len();
+                let nodes = match first.take() {
+                    Some(node) => vec![node],
+                    None => self.nodes_many(chunk.iter().map(|(_, id)| *id), depth)?,
+                };
+                for ((word, id), node) in chunk.iter().zip(nodes) {
+                    if out.len() >= limit {
+                        break 'level;
+                    }
+                    for (&ch, &child) in &node.children {
+                        let mut w = String::with_capacity(word.len() + ch.len_utf8());
+                        w.push_str(word);
+                        w.push(ch);
+                        next.push((w, child));
+                    }
+                    if node.is_end_of_word {
+                        out.push((word.clone(), *id));
+                    }
+                }
             }
-            if node.is_end_of_word {
-                out.push((word, id));
-            }
+            level = next;
+            depth += 1;
         }
         Ok(out)
+    }
+
+    /// Vários nós à mesma `depth`, na ordem de `ids`: os rasos do cache, o
+    /// resto num `MultiGet` só.
+    fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
+        let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
+        let mut out: Vec<Option<Arc<TrieNode>>> = Vec::new();
+        let mut missing: Vec<(usize, u64)> = Vec::new();
+        for id in ids {
+            match cached.then(|| self.engine.nodes.get(id, self.epoch)).flatten() {
+                Some(node) => out.push(Some(node)),
+                None => {
+                    missing.push((out.len(), id));
+                    out.push(None);
+                }
+            }
+        }
+        let values = self.get_many(NODE, missing.iter().map(|&(_, id)| id))?;
+        for ((slot, id), value) in missing.into_iter().zip(values) {
+            let node = Arc::new(TrieNode::decode(&value.ok_or_else(|| missing_node(id))?)?);
+            if cached {
+                self.engine.nodes.offer(id, self.epoch, &node);
+            }
+            out[slot] = Some(node);
+        }
+        Ok(out.into_iter().map(|n| n.expect("todo nó foi preenchido")).collect())
+    }
+
+    /// `<prefixo><id>` para cada id, num `MultiGet` em lote sobre o snapshot,
+    /// na ordem de `ids`.
+    fn get_many(&self, prefix: &[u8], ids: impl Iterator<Item = u64>) -> Result<Vec<Option<rocksdb::DBPinnableSlice<'_>>>> {
+        let keys: Vec<Key> = ids.map(|id| Key::new(prefix, id)).collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        READS.with(|r| r.set(r.get() + keys.len() as u64));
+        let db = &self.engine.db;
+        let cf = db.cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_snapshot(&self.snap);
+        db.batched_multi_get_cf_opt(cf, keys.iter().map(|k| k.as_ref()), false, &opts)
+            .into_iter()
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
     /// Percorre a Trie caractere a caractere: um `Get` no RocksDB por nível,
@@ -1080,6 +1437,38 @@ impl View<'_> {
     }
 }
 
+/// Procurar documento a documento com o cursor só compensa quando a lista é
+/// bem maior que a que conduz: aí a maioria dos blocos de `SKIP_BLOCK`
+/// entradas não tem nenhum candidato e é pulada sem decodificar. Com tamanhos
+/// parecidos, decodificar a lista inteira e andar nela em sequência é mais
+/// barato (E de dois termos frequentes: +16% com cursor).
+fn use_cursor(len: usize, driver_len: usize) -> bool {
+    len >= 32 * driver_len
+}
+
+/// Como [`seek`], numa lista só de IDs.
+#[inline]
+fn seek_docs(list: &[DocId], at: &mut usize, target: DocId) -> bool {
+    let mut lo = *at;
+    if lo >= list.len() {
+        return false;
+    }
+    if list[lo] >= target {
+        return list[lo] == target;
+    }
+    let mut step = 1;
+    let mut hi = lo + 1;
+    while hi < list.len() && list[hi] < target {
+        lo = hi;
+        step *= 2;
+        hi = lo + step;
+    }
+    let hi = hi.min(list.len());
+    let found = lo + 1 + list[lo + 1..hi].partition_point(|&d| d < target);
+    *at = found;
+    found < list.len() && list[found] == target
+}
+
 /// Avança `at` até a primeira entrada com documento ≥ `target` (busca
 /// exponencial a partir da posição atual) e diz se ela é `target`.
 #[inline]
@@ -1124,22 +1513,24 @@ impl<'s> PhraseMatcher<'s> {
         })
     }
 
-    /// Quantas vezes a frase aparece em `doc`. `first_only` para na primeira.
-    fn count(&mut self, doc: DocId, first_only: bool) -> Result<u32> {
+    /// Quantas vezes a frase aparece em `doc`, e quantas dessas no título
+    /// (as que começam antes de `title_span`). `first_only` para na primeira.
+    fn count(&mut self, doc: DocId, first_only: bool, title_span: u32) -> Result<(u32, u32)> {
         for (cursor, positions) in self.cursors.iter_mut().zip(&mut self.positions) {
             if !cursor.seek(doc, positions)? {
-                return Ok(0);
+                return Ok((0, 0));
             }
         }
-        Ok(count_phrase(&self.offsets, &self.positions, &mut self.at, first_only))
+        Ok(count_phrase(&self.offsets, &self.positions, &mut self.at, first_only, title_span))
     }
 }
 
-/// Quantos `p` existem com o termo `i` na posição `p + offsets[i]`, para todo `i`.
-/// As listas estão em ordem crescente, então basta um ponteiro por termo.
-fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool) -> u32 {
+/// Quantos `p` existem com o termo `i` na posição `p + offsets[i]`, para todo
+/// `i`, e quantos desses `p` ficam antes de `title_span` (no título). As listas
+/// estão em ordem crescente, então basta um ponteiro por termo.
+fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool, title_span: u32) -> (u32, u32) {
     at.fill(0);
-    let mut count = 0;
+    let (mut count, mut in_title) = (0, 0);
     'anchors: for &p0 in &positions[0] {
         let Some(start) = p0.checked_sub(offsets[0]) else { continue };
         for i in 1..positions.len() {
@@ -1156,11 +1547,12 @@ fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first
             }
         }
         count += 1;
+        in_title += u32::from(start < title_span);
         if first_only {
             break;
         }
     }
-    count
+    (count, in_title)
 }
 
 /// Tamanho dos documentos de uma busca, um bloco de `norm:` por vez. Rápido
@@ -1180,7 +1572,7 @@ impl<'v, 'a> NormCursor<'v, 'a> {
     }
 
     #[inline]
-    fn len(&mut self, doc: DocId) -> Result<u32> {
+    fn lens(&mut self, doc: DocId) -> Result<DocLens> {
         let block_id = doc / NORM_BLOCK_DOCS;
         if block_id != self.block_id {
             self.block = match self.seen.get(&block_id) {
@@ -1196,7 +1588,7 @@ impl<'v, 'a> NormCursor<'v, 'a> {
         let offset = (doc % NORM_BLOCK_DOCS) as u16;
         self.block
             .as_ref()
-            .and_then(|b| b.get(offset))
+            .and_then(|b| b.get_lens(offset))
             .ok_or_else(|| Error::Corrupt(format!("documento {doc} sem tamanho em norm:")))
     }
 }
@@ -1284,8 +1676,9 @@ pub struct IndexBatch<'a> {
     dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
     pending: FxHashMap<String, TermAcc>,
-    /// (documento, tamanho), na ordem em que foram adicionados.
-    lengths: Vec<(DocId, u32)>,
+    /// (documento, tamanho inteiro, tamanho do título, extensão do título),
+    /// na ordem em que foram adicionados.
+    lengths: Vec<(DocId, u32, u32, u32)>,
     labels: Vec<(DocId, String)>,
     analyzer: Analyzer,
 }
@@ -1293,8 +1686,8 @@ pub struct IndexBatch<'a> {
 /// O que o lote juntou de um termo.
 #[derive(Default)]
 struct TermAcc {
-    /// (documento, tf), na ordem em que os documentos foram adicionados.
-    docs: Vec<(DocId, u32)>,
+    /// (documento, tf, tf no título), na ordem em que os documentos foram adicionados.
+    docs: Vec<(DocId, u32, u32)>,
     /// `tf` posições por entrada de `docs`, em sequência (vazio sem posições).
     positions: Vec<u32>,
 }
@@ -1306,14 +1699,14 @@ impl TermAcc {
         if self.docs.windows(2).all(|w| w[0].0 < w[1].0) {
             return; // o caso comum: IDs crescentes
         }
-        let mut entries: Vec<(DocId, u32, usize)> = Vec::with_capacity(self.docs.len());
+        let mut entries: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(self.docs.len());
         let mut start = 0usize;
-        for &(doc, tf) in &self.docs {
-            entries.push((doc, tf, start));
+        for &(doc, tf, title_tf) in &self.docs {
+            entries.push((doc, tf, title_tf, start));
             start += tf as usize;
         }
         entries.sort_by_key(|e| e.0); // estável: a ordem de adição se mantém
-        let mut kept: Vec<(DocId, u32, usize)> = Vec::with_capacity(entries.len());
+        let mut kept: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(entries.len());
         for e in entries {
             match kept.last_mut() {
                 Some(last) if last.0 == e.0 => *last = e,
@@ -1322,13 +1715,51 @@ impl TermAcc {
         }
         if positions {
             let mut sorted = Vec::with_capacity(self.positions.len());
-            for &(_, tf, start) in &kept {
+            for &(_, tf, _, start) in &kept {
                 sorted.extend_from_slice(&self.positions[start..start + tf as usize]);
             }
             self.positions = sorted;
         }
-        self.docs = kept.into_iter().map(|(doc, tf, _)| (doc, tf)).collect();
+        self.docs = kept.into_iter().map(|(doc, tf, title_tf, _)| (doc, tf, title_tf)).collect();
     }
+}
+
+/// Onde um commit gastou o tempo ([`IndexBatch::commit_with_stats`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitStats {
+    pub docs: usize,
+    /// Termos distintos do lote.
+    pub terms: usize,
+    /// Leituras no RocksDB durante a travessia (nós fora do cache do escritor).
+    pub node_reads: u64,
+    /// Nós criados e nós regravados neste lote.
+    pub new_nodes: usize,
+    pub dirty_nodes: usize,
+    /// Nós no cache do escritor depois do descarte.
+    pub cache_nodes: usize,
+    /// Tamanho do `WriteBatch` gravado.
+    pub batch_bytes: usize,
+    /// Ordenar os termos do lote.
+    pub sort_secs: f64,
+    /// Percorrer e criar caminhos na Trie (inclui ler os nós fora do cache).
+    pub trie_secs: f64,
+    /// Ordenar e codificar as listas `post:`/`pos:` e colocá-las no lote.
+    pub encode_secs: f64,
+    /// Codificar os nós alterados, os blocos de `norm:` e os contadores.
+    pub nodes_secs: f64,
+    /// `db.write` do lote inteiro.
+    pub write_secs: f64,
+    /// Descarte do cache de nós.
+    pub evict_secs: f64,
+    pub total_secs: f64,
+}
+
+/// Caminho na Trie do último termo inserido no commit: `ids[d]` é o nó na
+/// profundidade `d` (`ids[0]` é a raiz) e `chars` são os caracteres até ele.
+#[derive(Default)]
+struct TriePath {
+    chars: Vec<char>,
+    ids: Vec<u64>,
 }
 
 struct CachedNode {
@@ -1341,25 +1772,34 @@ struct CachedNode {
 }
 
 impl IndexBatch<'_> {
-    /// Indexa `text` sob um ID escolhido por você. Reindexar um ID troca o
-    /// tf, as posições e o tamanho dele (termos que saíram do texto ficam).
+    /// Indexa `text` sob um ID escolhido por você, sem título. Reindexar um
+    /// ID troca o tf, as posições e o tamanho dele (termos que saíram do
+    /// texto ficam).
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
+        self.add_titled(doc_id, "", text)
+    }
+
+    /// Indexa um documento com título. As palavras do título são buscáveis
+    /// como as do texto, e o ranking as conta à parte (`Posting::title_tf`),
+    /// para pesar o título mais que o resto.
+    pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
-        let len = self.analyzer.run(text, &self.engine.stopwords);
+        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords);
+        let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
-            acc.docs.push((doc_id, found.len() as u32));
+            acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
             if positions {
                 acc.positions.extend_from_slice(found);
             }
         };
-        for (term, found) in self.analyzer.terms() {
+        for (term, found) in analyzer.terms() {
             // Só aloca a `String` do termo na primeira vez que ele aparece no lote.
             match self.pending.get_mut(term) {
                 Some(acc) => record(acc, found),
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
         }
-        self.lengths.push((doc_id, len));
+        self.lengths.push((doc_id, len, title_len, analyzer.title_span()));
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
@@ -1367,8 +1807,13 @@ impl IndexBatch<'_> {
 
     /// Indexa `text` com um ID novo e grava `label` (ex.: caminho do arquivo).
     pub fn add_labeled(&mut self, label: &str, text: &str) -> Result<DocId> {
+        self.add_labeled_titled(label, "", text)
+    }
+
+    /// Como [`IndexBatch::add_labeled`], com título (ex.: o nome do arquivo).
+    pub fn add_labeled_titled(&mut self, label: &str, title: &str, text: &str) -> Result<DocId> {
         let doc_id = self.next_doc_id;
-        self.add_document(doc_id, text)?;
+        self.add_titled(doc_id, title, text)?;
         self.labels.push((doc_id, label.to_string()));
         Ok(doc_id)
     }
@@ -1389,19 +1834,35 @@ impl IndexBatch<'_> {
     }
 
     /// Grava o lote num único `WriteBatch` atômico.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_with_stats().map(|_| ())
+    }
+
+    /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
+    /// Usado pelo harness de performance para achar o gargalo da carga.
+    pub fn commit_with_stats(mut self) -> Result<CommitStats> {
+        let started = Instant::now();
+        let reads_before = reads_on_this_thread();
+        let mut stats = CommitStats { docs: self.lengths.len(), ..CommitStats::default() };
         let positions = self.engine.positions;
         // Termos em ordem: a criação de nós fica determinística (o mesmo
         // corpus com o mesmo tamanho de lote gera sempre os mesmos IDs).
         let mut terms: Vec<(String, TermAcc)> = std::mem::take(&mut self.pending).into_iter().collect();
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        stats.terms = terms.len();
+        stats.sort_secs = started.elapsed().as_secs_f64();
 
         let mut wb = WriteBatch::default();
         let mut buf = Vec::new();
+        let mut trie = std::time::Duration::ZERO;
+        let mut path = TriePath::default();
+        let encode_started = Instant::now();
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         for (term, mut acc) in terms {
-            let id = self.insert_term(&term)?;
+            let t = Instant::now();
+            let id = self.insert_term(&term, &mut path)?;
+            trie += t.elapsed();
             acc.normalize(positions);
             buf.clear();
             codec::encode_postings_into(&mut buf, &acc.docs);
@@ -1412,17 +1873,27 @@ impl IndexBatch<'_> {
                 wb.merge(Key::new(POS, id), &buf);
             }
         }
+        stats.trie_secs = trie.as_secs_f64();
+        stats.encode_secs = encode_started.elapsed().as_secs_f64() - stats.trie_secs;
+        stats.node_reads = reads_on_this_thread() - reads_before;
+        stats.new_nodes = (self.next_node_id - self.state.next_node_id) as usize;
+        stats.dirty_nodes = self.dirty.len();
+        let t = Instant::now();
         for id in &self.dirty {
             wb.put(Key::new(NODE, *id), self.nodes[id].node.encode());
         }
-        let (stats, blocks) = self.write_lengths(&mut wb)?;
+        let (index, blocks) = self.write_lengths(&mut wb)?;
+        let stats_index = index;
         for (doc_id, label) in &self.labels {
             wb.put(Key::new(DOC, *doc_id), label.as_bytes());
         }
         wb.put(META_NEXT_NODE, varint(self.next_node_id));
         wb.put(META_NEXT_DOC, varint(self.next_doc_id));
-        wb.put(META_DOC_COUNT, varint(stats.doc_count));
-        wb.put(META_TOTAL_LEN, varint(stats.total_len));
+        wb.put(META_DOC_COUNT, varint(stats_index.doc_count));
+        wb.put(META_TOTAL_LEN, varint(stats_index.total_len));
+        wb.put(META_TOTAL_TITLE_LEN, varint(stats_index.total_title_len));
+        stats.nodes_secs = t.elapsed().as_secs_f64();
+        stats.batch_bytes = wb.size_in_bytes();
 
         // Ver `EpochCache`: marca, grava, publica.
         let engine = self.engine;
@@ -1432,7 +1903,9 @@ impl IndexBatch<'_> {
             let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
             engine.nodes.mark(shallow, next);
         }
+        let t = Instant::now();
         engine.db.write(wb)?;
+        stats.write_secs = t.elapsed().as_secs_f64();
         engine.epoch.store(next, AtomicOrdering::Release);
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
@@ -1441,13 +1914,17 @@ impl IndexBatch<'_> {
                 cached.dirty = false;
             }
         }
+        let t = Instant::now();
         let mut nodes = std::mem::take(&mut self.nodes);
         evict(&mut nodes, self.generation, self.cache_limit);
+        stats.evict_secs = t.elapsed().as_secs_f64();
+        stats.cache_nodes = nodes.len();
         self.state.cache = NodeCache { nodes, generation: self.generation };
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
-        self.state.stats = stats;
-        Ok(())
+        self.state.stats = stats_index;
+        stats.total_secs = started.elapsed().as_secs_f64();
+        Ok(stats)
     }
 
     /// Atualiza os blocos de `norm:` tocados pelo lote e as estatísticas.
@@ -1456,7 +1933,7 @@ impl IndexBatch<'_> {
     fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
         let mut stats = self.state.stats;
         let mut order: Vec<(u64, usize)> =
-            self.lengths.iter().enumerate().map(|(i, &(doc, _))| (doc / NORM_BLOCK_DOCS, i)).collect();
+            self.lengths.iter().enumerate().map(|(i, &(doc, ..))| (doc / NORM_BLOCK_DOCS, i)).collect();
         // Estável por bloco: dentro do bloco, a ordem de adição (a última vence).
         if !order.windows(2).all(|w| w[0].0 <= w[1].0) {
             order.sort_by_key(|e| e.0);
@@ -1470,12 +1947,20 @@ impl IndexBatch<'_> {
                 None => NormBlock::default(),
             };
             while i < order.len() && order[i].0 == block_id {
-                let (doc, len) = self.lengths[order[i].1];
-                match block.set((doc % NORM_BLOCK_DOCS) as u16, len) {
-                    Some(old) => stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old)),
+                let (doc, len, title_len, title_span) = self.lengths[order[i].1];
+                // Título com mais de 65.535 tokens: a contagem para no máximo.
+                let small = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+                let (title_len, title_span) = (small(title_len), small(title_span));
+                match block.set((doc % NORM_BLOCK_DOCS) as u16, DocLens { len, title_len, title_span }) {
+                    Some(old) => {
+                        stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old.len));
+                        stats.total_title_len =
+                            (stats.total_title_len + u64::from(title_len)).saturating_sub(u64::from(old.title_len));
+                    }
                     None => {
                         stats.doc_count += 1;
                         stats.total_len += u64::from(len);
+                        stats.total_title_len += u64::from(title_len);
                     }
                 }
                 i += 1;
@@ -1487,10 +1972,23 @@ impl IndexBatch<'_> {
     }
 
     /// Cria (se preciso) o caminho de `term` na Trie e devolve o nó terminal.
-    fn insert_term(&mut self, term: &str) -> Result<u64> {
-        let mut id = ROOT_ID;
-        let mut depth = 0u8;
-        for ch in term.chars() {
+    ///
+    /// Os termos do lote chegam em ordem alfabética, e vizinhos compartilham o
+    /// começo ("casa", "casaco", "casamento"): `path` guarda o caminho do
+    /// termo anterior, e a descida recomeça do fim do prefixo comum em vez da
+    /// raiz. Os nós desse caminho já estão no mapa do lote (o descarte só
+    /// acontece depois do commit).
+    fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<u64> {
+        if path.ids.is_empty() {
+            path.ids.push(ROOT_ID);
+        }
+        let common = path.chars.iter().zip(term.chars()).take_while(|(a, b)| *a == b).count();
+        path.chars.truncate(common);
+        path.ids.truncate(common + 1);
+        let mut id = path.ids[common];
+        // Termos têm no máximo MAX_TOKEN_CHARS (64) caracteres.
+        let mut depth = u8::try_from(common).unwrap_or(u8::MAX);
+        for ch in term.chars().skip(common) {
             let next_free = self.next_node_id;
             let generation = self.generation;
             let parent = self.node_mut(id, depth)?;
@@ -1509,8 +2007,9 @@ impl IndexBatch<'_> {
                     next_free
                 }
             };
-            // Termos têm no máximo MAX_TOKEN_CHARS (64) caracteres.
             depth = depth.saturating_add(1);
+            path.chars.push(ch);
+            path.ids.push(id);
         }
         let leaf = self.node_mut(id, depth)?;
         if !leaf.node.is_end_of_word {
@@ -1548,34 +2047,50 @@ impl IndexBatch<'_> {
     }
 }
 
-/// Mantém o cache de nós dentro de `limit`: primeiro saem os nós que o lote
-/// `generation` não usou; se ainda passar, saem os mais fundos.
+/// Mantém o cache de nós dentro de `limit`. Quando passa, descarta até 80%
+/// do limite (para não descartar a cada lote): ficam os nós usados mais
+/// recentemente e, no lote em que o corte cai, os mais rasos, que são os mais
+/// compartilhados.
+///
+/// Antes ficavam só os nós usados pelo último lote. Na Wikipédia isso jogava
+/// fora ~75% do cache a cada vez que ele enchia (1 milhão → 240 mil nós), e as
+/// leituras do escritor subiam de ~7 para ~18 por artigo logo depois.
 fn evict(nodes: &mut FxHashMap<u64, CachedNode>, generation: u64, limit: usize) {
     if nodes.len() <= limit {
         return;
     }
-    nodes.retain(|_, c| c.used == generation);
-    if nodes.len() <= limit {
-        return;
-    }
-    let mut per_depth = [0usize; 256];
+    let target = limit - limit / 5;
+    // Nós por (idade em lotes, profundidade). Idades acima de MAX_AGE contam juntas.
+    const MAX_AGE: usize = 255;
+    let age = |c: &CachedNode| (generation.saturating_sub(c.used) as usize).min(MAX_AGE);
+    let mut per_age = vec![[0usize; 256]; MAX_AGE + 1];
     for c in nodes.values() {
-        per_depth[c.depth as usize] += 1;
+        per_age[age(c)][c.depth as usize] += 1;
     }
-    // Maior profundidade que ainda cabe inteira no limite.
-    let mut total = 0;
-    let mut max_depth = None;
-    for (depth, &n) in per_depth.iter().enumerate() {
-        total += n;
-        if total > limit {
+    // Maior idade que cabe inteira no alvo; da seguinte, os mais rasos que couberem.
+    let mut kept = 0usize;
+    let mut cut_age = None;
+    for (a, depths) in per_age.iter().enumerate() {
+        let n: usize = depths.iter().sum();
+        if kept + n > target {
+            cut_age = Some(a);
             break;
         }
-        max_depth = Some(depth);
+        kept += n;
     }
-    match max_depth {
-        Some(d) => nodes.retain(|_, c| c.depth as usize <= d),
-        None => nodes.clear(),
+    let Some(cut_age) = cut_age else { return };
+    let mut max_depth = None;
+    for (d, &n) in per_age[cut_age].iter().enumerate() {
+        if kept + n > target {
+            break;
+        }
+        kept += n;
+        max_depth = Some(d);
     }
+    nodes.retain(|_, c| {
+        let a = age(c);
+        a < cut_age || (a == cut_age && max_depth.is_some_and(|d| c.depth as usize <= d))
+    });
 }
 
 thread_local! {
@@ -1657,27 +2172,34 @@ fn old_format() -> Error {
 }
 
 /// O RocksDB grava as opções da última abertura em `OPTIONS-<n>`, inclusive o
-/// nome do merge operator. O formato v1 usava outro nome.
-fn was_opened_as_v1(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else { return false };
-    let latest = entries
+/// nome do merge operator, que muda a cada formato.
+fn previous_merge_operator(path: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let (_, latest) = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             let n: u64 = name.strip_prefix("OPTIONS-")?.parse().ok()?;
             Some((n, e.path()))
         })
-        .max_by_key(|(n, _)| *n);
-    latest
-        .and_then(|(_, p)| std::fs::read_to_string(p).ok())
-        .is_some_and(|options| options.contains("merge_operator=fire_flower_postings_union"))
+        .max_by_key(|(n, _)| *n)?;
+    let options = std::fs::read_to_string(latest).ok()?;
+    let name = options.lines().find_map(|l| l.trim().strip_prefix("merge_operator="))?;
+    // Sem merge operator o RocksDB grava "nullptr" (ou nada).
+    (name != "nullptr" && !name.is_empty()).then(|| name.to_string())
 }
 
-/// Se o `open` falhou, confere (sem merge operator, só leitura) se é um banco v1.
-fn old_format_error(path: &Path) -> Option<Error> {
+/// Lê o formato gravado sem abrir para escrita (sem merge operator, sem
+/// recuperar o WAL) e monta o erro: v1 (sem `meta:format`) ou outra versão.
+fn stored_format_error(path: &Path) -> Option<Error> {
     let db = DB::open_for_read_only(&Options::default(), path, false).ok()?;
-    let is_v1 = read_counter(&db, META_FORMAT).ok()?.is_none() && read_counter(&db, META_NEXT_NODE).ok()?.is_some();
-    is_v1.then(old_format)
+    match read_counter(&db, META_FORMAT).ok()? {
+        None if read_counter(&db, META_NEXT_NODE).ok()?.is_some() => Some(old_format()),
+        Some(v) if v != FORMAT_VERSION => Some(Error::Config(format!(
+            "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
+        ))),
+        _ => None,
+    }
 }
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
@@ -1761,6 +2283,38 @@ pub fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 mod tests {
     use super::*;
 
+    fn cached(used: u64, depth: u8) -> CachedNode {
+        CachedNode { node: TrieNode::default(), dirty: false, used, depth }
+    }
+
+    #[test]
+    fn evict_keeps_the_most_recent_and_shallowest() {
+        let mut nodes: FxHashMap<u64, CachedNode> = FxHashMap::default();
+        // Lote 10 (o atual): 40 nós; lote 9: 40; lote 3: 40, metade rasa.
+        for i in 0..40 {
+            nodes.insert(i, cached(10, 5));
+            nodes.insert(100 + i, cached(9, 5));
+            nodes.insert(200 + i, cached(3, if i < 20 { 1 } else { 8 }));
+        }
+        evict(&mut nodes, 10, 200); // abaixo do limite: nada sai
+        assert_eq!(nodes.len(), 120);
+        // Limite 100 → alvo 80: ficam os lotes 10 e 9 inteiros.
+        evict(&mut nodes, 10, 100);
+        assert_eq!(nodes.len(), 80);
+        assert!(nodes.keys().all(|&k| k < 140));
+        // Alvo 60 (limite 75): o lote 10 inteiro e 20 do lote 9, os mais rasos.
+        for i in 0..20 {
+            nodes.get_mut(&(100 + i)).unwrap().depth = 2;
+        }
+        evict(&mut nodes, 10, 75);
+        assert_eq!(nodes.len(), 60);
+        assert!((0..40).all(|k| nodes.contains_key(&k)));
+        assert!((100..120).all(|k| nodes.contains_key(&k)));
+        // O lote atual sozinho passa do alvo: ficam os mais rasos dele.
+        evict(&mut nodes, 10, 10);
+        assert!(nodes.len() <= 8);
+    }
+
     #[test]
     fn keys_without_allocation() {
         assert_eq!(Key::new(POST, 0).as_ref(), b"post:0");
@@ -1770,7 +2324,7 @@ mod tests {
 
     #[test]
     fn seek_gallops_and_stops_at_first_not_less() {
-        let list: Vec<Posting> = [1u64, 3, 5, 7, 9, 11, 100, 101].iter().map(|&doc| Posting { doc, tf: 1 }).collect();
+        let list: Vec<Posting> = [1u64, 3, 5, 7, 9, 11, 100, 101].iter().map(|&doc| Posting::new(doc, 1)).collect();
         let mut at = 0;
         assert!(seek(&list, &mut at, 1));
         assert!(!seek(&list, &mut at, 4));
@@ -1787,17 +2341,19 @@ mod tests {
         let mut at = vec![0; 3];
         // casa@0 papel@2: "casa X papel" em 0 e 10; casa em 5 sem papel em 7.
         let pos = vec![vec![0, 5, 10], vec![2, 12]];
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false), 2);
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], true), 1);
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 0), (2, 0));
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], true, 0), (1, 0));
+        // Título com extensão 3: a ocorrência que começa em 0 está nele, a de 10 não.
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 3), (2, 1));
         // Termo repetido: novo@0 novo@2 em "novo de novo de novo" (0, 2, 4).
         let pos = vec![vec![0, 2, 4], vec![0, 2, 4]];
-        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false), 2);
+        assert_eq!(count_phrase(&[0, 2], &pos, &mut at[..2], false, 0), (2, 0));
         // Ordem trocada não casa.
         let pos = vec![vec![3], vec![2]];
-        assert_eq!(count_phrase(&[0, 1], &pos, &mut at[..2], false), 0);
+        assert_eq!(count_phrase(&[0, 1], &pos, &mut at[..2], false, 0), (0, 0));
         // Três termos.
         let pos = vec![vec![1, 8], vec![2, 9], vec![4, 20]];
-        assert_eq!(count_phrase(&[0, 1, 3], &pos, &mut at, false), 1);
+        assert_eq!(count_phrase(&[0, 1, 3], &pos, &mut at, false, 0), (1, 0));
     }
 
     #[test]
@@ -1818,7 +2374,7 @@ mod tests {
         let cache = EpochCache::<NormBlock>::default();
         let a = Arc::new(NormBlock::default());
         let mut b = NormBlock::default();
-        b.set(1, 10);
+        b.set(1, DocLens { len: 10, title_len: 0, title_span: 0 });
         let b = Arc::new(b);
         // Nunca mudou: qualquer busca usa.
         cache.offer(7, 0, &a);

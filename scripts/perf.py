@@ -10,9 +10,10 @@
     python3 scripts/perf.py concorrencia      # Fase 5: escala com threads e leitura durante escrita
     python3 scripts/perf.py pr                # Fase 8: checagem rápida; falha se o p50 piorar >10%
     python3 scripts/perf.py frases            # frases e ranking: carga com/sem posições, oráculo, latência
+    python3 scripts/perf.py relevancia        # ordenação: consultas de resposta conhecida (docs/plano-relevancia.md)
     python3 scripts/perf.py carga-longa       # carga inteira janela a janela; falha se a velocidade colapsar
                                               #   [--reproduzir: roda antes o cenário que colapsava]
-    python3 scripts/perf.py relatorio         # escreve bench/RESULTADOS.md
+    python3 scripts/perf.py relatorio         # escreve RESULTADOS.md no repositório de resultados
     python3 scripts/perf.py comparar A.json B.json
 
 `--escala` (1k, 10k, 100k ou full; padrão 10k) define a maior fatia do corpus
@@ -23,8 +24,10 @@ a mediana: uma carga de 10k varia ±10% entre rodadas, e uma rodada só não
 separa uma melhoria pequena de sorte. Fatias maiores rodam uma vez.
 
 Bancos ficam em ~/bench-db/perf/ (FF_PERF_DB para mudar); o corpus em
-~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados em bench/results/, com a escala
-no rótulo, então escalas diferentes não se misturam.
+~/datasets/ptwiki/ (FF_CORPUS_DIR). Resultados, linhas de base e relatório
+ficam no repositório separado fire-flower-bench, clonado ao lado deste
+(FF_BENCH_DIR para mudar), em results/, com a escala no rótulo, então escalas
+diferentes não se misturam.
 
 Regras do plano: build release, nada pesado em paralelo durante as medições,
 compare só resultados da mesma máquina. Só usa a biblioteca padrão.
@@ -41,8 +44,12 @@ import sys
 import time
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS = os.path.join(PROJECT, "bench", "results")
-REPORT = os.path.join(PROJECT, "bench", "RESULTADOS.md")
+# Resultados ficam no repositório fire-flower-bench, clonado ao lado deste.
+BENCH_DIR = os.path.expanduser(os.environ.get("FF_BENCH_DIR", os.path.join(os.path.dirname(PROJECT), "fire-flower-bench")))
+RESULTS = os.path.join(BENCH_DIR, "results")
+REPORT = os.path.join(BENCH_DIR, "RESULTADOS.md")
+# O relatório mora em outro repositório: os links para a documentação são absolutos.
+DOCS_URL = "https://github.com/evertondays/fire-flower/blob/main/docs"
 WIKI = os.path.join(PROJECT, "target", "release", "examples", "wiki")
 FF = os.path.join(PROJECT, "target", "release", "fire-flower")
 
@@ -61,6 +68,10 @@ REPETIR_ATE_DOCS = 10_000
 REPETICOES = 3  # --repeticoes
 # Quantas rodadas recentes (do mesmo commit e rótulo) entram na mediana.
 MEDIANA_DE = 5
+
+# Artigos por commit nas cargas. Era 1000 até 26/10/2026; com 10 mil a carga
+# inteira cai de 242 s para ~115 s (docs/plano-performance.md, P2).
+LOTE = 10000
 
 # Conjuntos do `pr` (comparados com a linha de base) e das frases/ranking.
 PR_SETS = ["t-medio", "t-freq", "p-2", "rank-freq", "frase-2"]
@@ -164,7 +175,7 @@ def ensure_loaded(slice_name):
     if not usable(path):
         step(f"carga {slice_name} (banco não existia ou era de outro formato)")
         fresh(path)
-        wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", 1000, "--label", f"ptwiki-{slice_name}")
+        wiki("load", "--db", path, "--corpus", corpus(slice_name), "--batch", LOTE, "--label", f"ptwiki-{slice_name}")
     return path
 
 
@@ -208,15 +219,17 @@ def latest(results, kind, label=None):
 
 
 def formato(r):
-    """Formato do banco de um resultado de carga: 1 antes de tf e posições."""
+    """Formato do banco de um resultado de carga: 1 antes de tf e posições.
+    Até 26/10/2026 o `wiki load` gravava 2 para qualquer formato com tf."""
     return r.get("formato", 1)
 
 
 def median_load(results, label, fmt=None):
     """Carga mediana (por docs/s) entre as últimas MEDIANA_DE rodadas com o
     rótulo, todas do mesmo commit da mais recente. `fmt` restringe ao formato
-    do banco (1 ou 2). Ganha `_rodadas`, `_min` e `_max`."""
-    results = [r for r in results if fmt is None or r.get("tipo") != "load" or formato(r) == fmt]
+    do banco: 1 (sem tf nem posições) ou 2 (qualquer formato com tf, 2 em
+    diante). Ganha `_rodadas`, `_min` e `_max`."""
+    results = [r for r in results if fmt is None or r.get("tipo") != "load" or min(formato(r), 2) == fmt]
     last = latest(results, "load", label)
     if not last:
         return None
@@ -246,7 +259,7 @@ def fase_escada(scale, experimentos=False):
     for s in ORDER[: ORDER.index(scale) + 1]:
         step(f"escada: carga {s}")
         path = db(f"ptwiki-{s}")
-        load_rounds(path, s, f"ptwiki-{s}", "--batch", 1000)
+        load_rounds(path, s, f"ptwiki-{s}", "--batch", LOTE)
         wiki("sizes", "--db", path)
     if experimentos:
         fase_experimentos(scale)
@@ -257,12 +270,12 @@ def fase_experimentos(scale):
     s = smaller(scale, "100k")
     n = docs_in(s)
     tmp = db("tmp-exp")
-    runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 5000, 10000, 50000) if b <= n]
-    runs += [("ids-remapeados", ["--batch", 1000, "--remap-ids"]),
-             ("cache-64mb", ["--batch", 1000, "--cache-mb", 64]),
-             ("cache-1024mb", ["--batch", 1000, "--cache-mb", 1024]),
-             ("sem-cache-de-nos", ["--batch", 1000, "--cache-nos", 0]),
-             ("sem-posicoes", ["--batch", 1000, "--sem-posicoes"])]
+    runs = [(f"lote-{b}", ["--batch", b]) for b in (100, 1000, 5000, 50000) if b <= n]
+    runs += [("ids-remapeados", ["--batch", LOTE, "--remap-ids"]),
+             ("cache-64mb", ["--batch", LOTE, "--cache-mb", 64]),
+             ("cache-1024mb", ["--batch", LOTE, "--cache-mb", 1024]),
+             ("sem-cache-de-nos", ["--batch", LOTE, "--cache-nos", 0]),
+             ("sem-posicoes", ["--batch", LOTE, "--sem-posicoes"])]
     for label, extra in runs:
         step(f"experimento {s}: {label}")
         load_rounds(tmp, s, f"exp-{s}-{label}", *extra)
@@ -390,7 +403,7 @@ def fase_latencia(scale):
     path = db(f"ptwiki-{scale}")
     step(f"carga {scale} limpa (para medir antes da compactação)")
     fresh(path)
-    wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", 1000, "--label", f"ptwiki-{scale}")
+    wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", LOTE, "--label", f"ptwiki-{scale}")
 
     step("merge pendente: termos, títulos, frases e ranking antes da compactação")
     pre_open = open_time(path)
@@ -447,7 +460,7 @@ def fase_concorrencia(scale):
 def fase_pr(scale, salvar_baseline=False):
     """Fase 8: oráculo + carga + bench rápido, comparado com a linha de base salva."""
     small = smaller(scale, "10k")
-    baseline_path = os.path.join(PROJECT, "bench", f"baseline-pr-{scale}.json")
+    baseline_path = os.path.join(BENCH_DIR, f"baseline-pr-{scale}.json")
     tmp_small, tmp_big = db("tmp-pr-oraculo"), db("tmp-pr-carga")
     step(f"pr: oráculo {small}")
     fresh(tmp_small)
@@ -503,11 +516,11 @@ def fase_frases(scale):
     small = smaller(scale, "10k")
     path = db(f"ptwiki-{scale}")
     step(f"carga {scale} com posições")
-    load_rounds(path, scale, f"ptwiki-{scale}", "--batch", 1000)
+    load_rounds(path, scale, f"ptwiki-{scale}", "--batch", LOTE)
     sizes_of(path, f"ptwiki-{scale}")
     tmp = db("tmp-sem-posicoes")
     step(f"carga {scale} sem posições")
-    load_rounds(tmp, scale, f"exp-{smaller(scale, '100k')}-sem-posicoes", "--batch", 1000, "--sem-posicoes")
+    load_rounds(tmp, scale, f"exp-{smaller(scale, '100k')}-sem-posicoes", "--batch", LOTE, "--sem-posicoes")
     sizes_of(tmp, f"exp-{smaller(scale, '100k')}-sem-posicoes")
     compact_and_save(tmp, f"{smaller(scale, '100k')}-sem-posicoes")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -526,6 +539,51 @@ def fase_frases(scale):
     step("latência de todos os conjuntos (cache quente)")
     bench(path, scale, None, f"{scale}-t1")
     return ok
+
+
+def fase_relevancia(scale):
+    """Plano de relevância: top-1/top-3/top-10/MRR em conjuntos com resposta
+    conhecida, gerados da fatia (até 100k) e versionados em bench/relevancia/."""
+    s = smaller(scale, "100k")
+    step(f"relevância {s}: título, digitando, hub, corpo e consultas à mão")
+    sets = os.path.join(PROJECT, "bench", "relevancia", s)
+    wiki("relevancia", "--db", ensure_loaded(s), "--corpus", corpus(s), "--sets", sets, "--label", s)
+
+
+def relevancia_section(R, scale):
+    s = smaller(scale, "100k")
+    rel = latest(R, "relevancia", s)
+    if not rel:
+        return []
+    base = latest(R, "relevancia", f"linha-de-base-{s}")
+    before = {c["conjunto"]: c for c in base["conjuntos"]} if base else {}
+    L = [f"## Relevância ({s})", "",
+         f"Consultas com resposta conhecida ([docs/plano-relevancia.md]({DOCS_URL}/plano-relevancia.md)). "
+         "Acerto: top-1 em título, digitando e hub; top-10 em corpo; top-3 nas consultas à mão. "
+         "Entre parênteses, a linha de base (ranking antes do plano).", "",
+         "| Conjunto | Consultas | top-1 | top-3 | top-10 | MRR | fora do top-1000 |", "|---|---|---|---|---|---|---|"]
+    for c in rel["conjuntos"]:
+        b = before.get(c["conjunto"])
+        def cell(key, pctg=True):
+            v = c[key]
+            txt = f"{fmt(v * 100, 1)}%" if pctg else fmt(v, 3)
+            if b:
+                txt += f" ({fmt(b[key] * 100, 1)}%)" if pctg else f" ({fmt(b[key], 3)})"
+            return txt
+        L.append(f"| `{c['conjunto']}` | {c['consultas']} | {cell('top1')} | {cell('top3')} | {cell('top10')} | "
+                 f"{cell('mrr', False)} | {c['fora_do_top1000']} |")
+    L.append("")
+    erros = [(c["conjunto"], e) for c in rel["conjuntos"] for e in c.get("erros", [])[:3]]
+    if erros:
+        L += ["Exemplos de erro (até 3 por conjunto):", "",
+              "| Conjunto | Consulta | Esperado | Posição | Os 3 primeiros |", "|---|---|---|---|---|"]
+        for nome, e in erros:
+            pos = f"{e['posicao']}º" if e.get("posicao") else "—"
+            L.append(f"| `{nome}` | `{e['consulta']}` | {e['esperado']} | {pos} | {' · '.join(e['top3'])} |")
+        L.append("")
+    L.append(f"<sub>{rel['_arquivo']}</sub>")
+    L.append("")
+    return L
 
 
 def fase_carga_longa(scale, reproduzir=False):
@@ -552,7 +610,7 @@ def fase_carga_longa(scale, reproduzir=False):
         label = f"carga-longa-{name}"
         step(f"carga longa: {name}" + (" (tem que colapsar)" if expect_collapse else ""))
         fresh(tmp)
-        wiki("load", "--db", tmp, "--corpus", corpus(slice_name), "--batch", 2000, *extra, "--label", label)
+        wiki("load", "--db", tmp, "--corpus", corpus(slice_name), "--batch", LOTE, *extra, "--label", label)
         r = latest(load_results(), "load", label)
         collapse = r.get("colapso")
         good = bool(collapse) == expect_collapse
@@ -674,15 +732,15 @@ def bench_table(r):
 def cmd_relatorio(scale):
     R = load_results()
     if not R:
-        sys.exit("nenhum resultado em bench/results/")
+        sys.exit(f"nenhum resultado em {RESULTS}")
     machine = next((r["maquina"] for r in reversed(R) if "maquina" in r), {})
     L = [
         f"# Resultados de performance (escala {scale})",
         "",
-        f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `bench/results/`. "
+        f"Gerado por `python3 scripts/perf.py relatorio --escala {scale}` a partir de `results/`. "
         "Cada seção mostra o resultado **mais recente** daquele tipo; as cargas mostram a **mediana** das "
         f"últimas rodadas do mesmo commit (até {MEDIANA_DE}), com a faixa mín–máx entre parênteses. O plano está em "
-        "[docs/plano-performance.md](../docs/plano-performance.md).",
+        f"[docs/plano-performance.md]({DOCS_URL}/plano-performance.md).",
         "",
         f"- Último resultado: `{R[-1]['_arquivo']}`",
         f"- Máquina: {machine.get('nucleos', '?')} núcleos, {mb(machine.get('ram_total'))} MB de RAM, "
@@ -744,7 +802,7 @@ def cmd_relatorio(scale):
         base = median_load(R, f"ptwiki-{exp_slice}")
         L += [f"### Experimentos ({exp_slice})", "", "| Experimento | docs/s | vs. padrão | Pico RSS | Banco |", "|---|---|---|---|---|"]
         if base:
-            L.append(f"| padrão (lote 1000) | {docs_s(base)} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
+            L.append(f"| padrão (lote {LOTE}) | {docs_s(base)} | — | {mb(base['pico_rss'])} MB | {mb(base['banco_bytes'])} MB |")
         for label, r in exps.items():
             vs = f"{pct(r['docs_por_s'], base['docs_por_s']):+.0f}%" if base and "streaming" not in label else "—"
             L.append(f"| {label} | {docs_s(r)} | {vs} | {mb(r['pico_rss'])} MB | {mb(r['banco_bytes'])} MB |")
@@ -827,6 +885,7 @@ def cmd_relatorio(scale):
     divs = sum(r["divergencias"] for r in oracles.values()) if oracles else None
     swap_growth = (load_scale or {}).get("swap_aumento")
     swap_txt = "—" if swap_growth is None else ("sim" if swap_growth < 64 << 20 else f"não (+{mb(swap_growth)} MB)")
+    L += relevancia_section(R, scale)
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
           f"| Carga sem swap (aumento < 64 MB) | {swap_txt} | **sim** |",
@@ -865,7 +924,7 @@ def frases_section(R, scale, post, oracles):
         return f" ({pct(r['docs_por_s'], v1['docs_por_s']):+.0f}%)" if r and v1 else ""
 
     L = ["## Frases e ranking (formato v2)", "",
-         "Plano em [docs/plano-frases-e-ranking.md](../docs/plano-frases-e-ranking.md). A linha de base é a última "
+         f"Plano em [docs/plano-frases-e-ranking.md]({DOCS_URL}/plano-frases-e-ranking.md). A linha de base é a última "
          "carga no formato v1 (sem tf nem posições) com o mesmo rótulo.", "",
          "| Métrica | Linha de base (v1) | Agora | Meta |", "|---|---|---|---|",
          f"| Carga {scale} com posições | {docs_s(v1) + ' docs/s' if v1 else '—'} | {docs_s(v2)} docs/s{delta(v2)} | queda ≤ 30% |"]
@@ -938,7 +997,8 @@ def main():
     e.add_argument("--experimentos", action="store_true")
     for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
                         ("concorrencia", "Fase 5"), ("frases", "frases e ranking (Fase E do plano)"),
-                        ("relatorio", "gera bench/RESULTADOS.md")):
+                        ("relevancia", "ordenação: consultas de resposta conhecida"),
+                        ("relatorio", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
     pr.add_argument("--salvar-baseline", action="store_true")
@@ -965,6 +1025,7 @@ def main():
     if args.cmd == "tudo":
         fase_escada(scale, experimentos=True)
         ok &= fase_corretude(scale)
+        fase_relevancia(scale)
         fase_consultas(scale)
         fase_latencia(scale)
         if not args.sem_concorrencia:
@@ -978,7 +1039,8 @@ def main():
         ok = fase_carga_longa(scale, args.reproduzir)
     else:
         result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
-                  "concorrencia": fase_concorrencia, "frases": fase_frases}[args.cmd](scale)
+                  "concorrencia": fase_concorrencia, "frases": fase_frases,
+                  "relevancia": fase_relevancia}[args.cmd](scale)
         ok = result is not False
     cmd_relatorio(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

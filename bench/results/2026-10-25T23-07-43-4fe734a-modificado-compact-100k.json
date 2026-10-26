@@ -1,0 +1,21 @@
+{
+  "segundos": 2.638537883758545,
+  "banco_antes": 262124571,
+  "banco_depois": 244873456,
+  "abertura_antes": {
+    "mediana_s": 0.03154921531677246,
+    "min_s": 0.03093433380126953,
+    "max_s": 0.9729042053222656,
+    "execucoes": 5
+  },
+  "abertura_depois": {
+    "mediana_s": 0.03483176231384277,
+    "min_s": 0.032407522201538086,
+    "max_s": 0.04417014122009277,
+    "execucoes": 5
+  },
+  "tipo": "compact",
+  "rotulo": "100k",
+  "commit": "4fe734a-modificado",
+  "quando": "2026-10-25T23-07-43"
+}

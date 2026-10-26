@@ -1,7 +1,8 @@
 //! fire-flower: motor de busca full-text embutido.
 //!
 //! Os termos ficam numa Trie persistida no RocksDB (um registro por nó), o que
-//! dá busca exata, por prefixo (`comp*`) e autocompletar sem servidor externo.
+//! dá busca exata, por prefixo (`comp*`), por frase (`"casa de papel"`),
+//! ranking BM25 e autocompletar sem servidor externo.
 //!
 //! ```
 //! use fire_flower::{Config, Engine};
@@ -16,25 +17,76 @@
 //!
 //! assert_eq!(engine.search("CORACAO")?, [1, 2]);
 //! assert_eq!(engine.search("coração bras*")?, [1]);
+//! assert_eq!(engine.search("\"coração do brasil\"")?, [1]);
 //! assert_eq!(engine.suggest("es", 5)?, ["estudante"]);
+//!
+//! // Ranqueado por BM25: os mais relevantes primeiro.
+//! let top = engine.search_top("coração", 10)?;
+//! assert_eq!(top.len(), 2);
+//! assert!(top[0].score >= top[1].score);
 //! # Ok::<(), fire_flower::Error>(())
 //! ```
 
 mod codec;
 mod engine;
+pub mod stopwords;
 pub mod text;
 
 pub use engine::{Config, Engine, IndexBatch};
+pub use stopwords::{Language, Stopwords};
 
 /// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).
 /// Não fazem parte da API estável.
 #[doc(hidden)]
 pub mod internals {
-    pub use crate::codec::{TrieNode, decode_postings, encode_postings};
-    pub use crate::engine::{intersect, reads_on_this_thread, union_encoded};
+    pub use crate::codec::{
+        NormBlock, PositionsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into,
+        encode_postings, merge_positions, merge_postings,
+    };
+    pub use crate::engine::{intersect, reads_on_this_thread};
 }
 
 pub type DocId = u64;
+
+/// Um documento numa lista de postagem e quantas vezes o termo aparece nele.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Posting {
+    pub doc: DocId,
+    /// Frequência do termo no documento (≥ 1).
+    pub tf: u32,
+}
+
+/// Um resultado ranqueado: o documento e a nota BM25.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    pub doc: DocId,
+    pub score: f64,
+}
+
+/// Os melhores resultados e quantos documentos casaram ao todo.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TopHits {
+    /// Nota decrescente; no empate, ID crescente.
+    pub hits: Vec<Hit>,
+    /// Documentos que satisfazem a consulta (não só os devolvidos).
+    pub total: usize,
+}
+
+/// Estatísticas do índice usadas pelo BM25.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Documentos distintos indexados (reindexar o mesmo ID não conta de novo).
+    pub doc_count: u64,
+    /// Soma dos tamanhos dos documentos (tokens indexados, sem stopwords).
+    pub total_len: u64,
+}
+
+impl IndexStats {
+    /// Tamanho médio de um documento.
+    pub fn avg_len(&self) -> f64 {
+        if self.doc_count == 0 { 0.0 } else { self.total_len as f64 / self.doc_count as f64 }
+    }
+}
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -42,6 +94,8 @@ pub enum Error {
     Db(rocksdb::Error),
     /// Um valor gravado não pôde ser decodificado, ou a Trie aponta para um nó inexistente.
     Corrupt(String),
+    /// A config não combina com o banco (ex.: idiomas das stopwords diferentes).
+    Config(String),
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +103,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Db(e) => write!(f, "erro do RocksDB: {e}"),
             Error::Corrupt(msg) => write!(f, "índice corrompido: {msg}"),
+            Error::Config(msg) => write!(f, "config incompatível: {msg}"),
         }
     }
 }
@@ -57,7 +112,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Db(e) => Some(e),
-            Error::Corrupt(_) => None,
+            Error::Corrupt(_) | Error::Config(_) => None,
         }
     }
 }

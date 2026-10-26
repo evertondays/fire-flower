@@ -648,6 +648,7 @@ dependencies = [
  "criterion",
  "ratatui",
  "rocksdb",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

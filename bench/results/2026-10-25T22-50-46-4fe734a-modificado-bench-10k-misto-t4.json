@@ -1,0 +1,50 @@
+{
+  "commit": "4fe734a-modificado",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "bm25_b": 0.75,
+    "bm25_k1": 1.2,
+    "languages": null,
+    "max_prefix_terms": 256,
+    "positions": null,
+    "statistics": false,
+    "writer_cache_nodes": 1000000
+  },
+  "conjuntos": [
+    {
+      "block_reads_por_consulta": 0.0,
+      "bloom_util_por_consulta": 0.0,
+      "cache_hits_por_consulta": 100.491,
+      "conjunto": "misto",
+      "consultas": 1000,
+      "gets_por_consulta": 33.497,
+      "max_us": 4175.255,
+      "media_us": 170.110924,
+      "merge_us_por_consulta": 0.0,
+      "merges_por_consulta": 0.0,
+      "modo": "search",
+      "p50_us": 113.659,
+      "p95_us": 397.725,
+      "p99_us": 1392.095,
+      "qps": 16016.419264241575,
+      "resultados_media": 339.448,
+      "threads": 4
+    }
+  ],
+  "db": "/home/evertondays/bench-db/perf/ptwiki-10k",
+  "frio": false,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3863584768,
+    "ram_total": 8266137600,
+    "swap_usado": 1074614272
+  },
+  "passes": 1,
+  "perf_time": false,
+  "quando": "2026-10-25T22-50-46",
+  "rotulo": "10k-misto-t4",
+  "threads": 4,
+  "tipo": "bench"
+}

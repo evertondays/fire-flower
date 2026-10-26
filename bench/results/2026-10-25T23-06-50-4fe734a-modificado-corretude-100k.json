@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "checagens": {
+    "oraculo_10k": true,
+    "idempotencia": true,
+    "lotes_vs_unico": true,
+    "oraculo_100k": true,
+    "reabrir": true
+  },
+  "idempotencia": {
+    "fatia": "10k",
+    "digest_1a": {
+      "db": "/home/evertondays/bench-db/perf-100k/tmp-corretude",
+      "digest": "de005dfd487e9a5e",
+      "documentos": 10000,
+      "posicoes": 9192819,
+      "postagens": 4922700,
+      "tamanho_total": 9192819,
+      "termos": 288203
+    },
+    "digest_2a": {
+      "db": "/home/evertondays/bench-db/perf-100k/tmp-corretude",
+      "digest": "de005dfd487e9a5e",
+      "documentos": 10000,
+      "posicoes": 9192819,
+      "postagens": 4922700,
+      "tamanho_total": 9192819,
+      "termos": 288203
+    },
+    "banco_1a": 57990679,
+    "banco_2a": 52410266,
+    "banco_2a_compactado": 52443176
+  },
+  "lotes": {
+    "batch_1": {
+      "db": "/home/evertondays/bench-db/perf-100k/tmp-lote-1",
+      "digest": "222285d1e944275c",
+      "documentos": 1000,
+      "posicoes": 1960957,
+      "postagens": 942452,
+      "tamanho_total": 1960957,
+      "termos": 114201
+    },
+    "batch_1000": {
+      "db": "/home/evertondays/bench-db/perf-100k/tmp-lote-1000",
+      "digest": "222285d1e944275c",
+      "documentos": 1000,
+      "posicoes": 1960957,
+      "postagens": 942452,
+      "tamanho_total": 1960957,
+      "termos": 114201
+    }
+  },
+  "tipo": "corretude",
+  "rotulo": "100k",
+  "commit": "4fe734a-modificado",
+  "quando": "2026-10-25T23-06-50"
+}

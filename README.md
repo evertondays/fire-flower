@@ -7,8 +7,16 @@ RocksDB**, um registro por nó. Sem servidor externo — é uma biblioteca Rust
 Suporta:
 
 - busca exata, normalizada (`Ação` = `acao` = `ACAO`);
+- stopwords por idioma (português e inglês por enquanto: `de`, `o`, `the`…)
+  ficam fora do índice e são ignoradas na consulta (`casa de papel` busca
+  `casa` E `papel`). Os idiomas são escolhidos na criação do banco
+  (`--idiomas pt,en`, o padrão) e ficam gravados nele;
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
+- busca por **frase** (`"casa de papel"`): os termos em sequência, com as
+  stopwords contando como buraco;
+- **ranking BM25**: os resultados saem por relevância (`search_top`), com
+  `k1 = 1,2` e `b = 0,75`; `search` continua devolvendo todos os IDs em ordem;
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
 - indexação em lotes atômicos, com buscas rodando em paralelo.
 
@@ -35,13 +43,18 @@ Busca interativa, com resultados enquanto você digita:
 
 | Tecla | Ação |
 |---|---|
-| digitar | busca na hora; a última palavra vale como prefixo até você dar espaço |
+| digitar | busca na hora; a última palavra vale como prefixo até você dar espaço (dentro de aspas, não: frase não tem prefixo) |
 | `Tab` ou `→` | completa a palavra com a sugestão (em cinza depois do cursor) |
 | `Ctrl+N` / `Ctrl+P` | troca a sugestão |
 | `↑` `↓` `PgUp` `PgDn` | escolhe o resultado |
 | `Enter` | abre o documento inteiro (`n`/`N` pulam entre ocorrências) |
 | `Ctrl+W` / `Ctrl+U` | apaga a última palavra / a consulta toda |
 | `Esc` | volta / sai |
+
+Os resultados vêm por relevância (BM25), com a nota ao lado do título, e a
+lista mostra os 1.000 melhores; o cabeçalho mostra o total. A linha
+"consulta:" mostra cada parte da consulta: uma frase aparece entre aspas, com
+`_` no lugar das stopwords (`"copa _ mundo"`).
 
 A prévia lê o arquivo apontado pelo rótulo do documento. Documentos cujo
 rótulo não é um arquivo (ex.: título de artigo) aparecem sem prévia.
@@ -70,12 +83,25 @@ Por baixo, o script chama:
 Cada linha do JSONL é `{"id", "title", "text"}`: indexa `title + texto` sob o
 `id` e guarda o título como rótulo.
 
+Por padrão o banco grava as **posições** de cada termo, que a busca por frase
+usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
+`scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
+frases dão erro. A escolha fica gravada no banco, como os idiomas.
+
 ### Busca sem interface
 
 Busca e autocompletar sem interface, para scripts:
 
 ```bash
 ./target/release/fire-flower search /tmp/indice "coração bras*"
+```
+
+A saída é `nota  id  rótulo`, da nota maior para a menor. `--por-id` lista
+todos os documentos em ordem de ID, sem ranking. Frases vão entre aspas
+simples no shell:
+
+```bash
+./target/release/fire-flower search /tmp/indice '"revolução francesa" 1789'
 ```
 
 ```bash
@@ -96,7 +122,13 @@ batch.commit()?; // um único WriteBatch atômico
 
 assert_eq!(engine.search("CORACAO")?, [1, 2]);
 assert_eq!(engine.search("coração bras*")?, [1]);
+assert_eq!(engine.search("\"coração do brasil\"")?, [1]);
 assert_eq!(engine.suggest("es", 5)?, ["estudante"]);
+
+// Os 10 mais relevantes (BM25): Vec<Hit { doc, score }>.
+let top = engine.search_top("coração", 10)?;
+// Com o total de documentos que casaram.
+let ranked = engine.search_ranked("coração", 10)?; // TopHits { hits, total }
 ```
 
 `Engine` é `Sync`: compartilhe com `Arc<Engine>`. Só um lote de indexação
@@ -117,21 +149,34 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 ### Chaves no RocksDB
 
+Formato v2 (`meta:format = 2`). Um banco do formato anterior não abre: o
+`open` diz "formato antigo; recarregue o banco".
+
 | Chave | Valor |
 |---|---|
 | `node:<id>` | nó da Trie: flag de fim de palavra + filhos (`caractere → id`). `node:0` é a raiz |
-| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: IDs de documentos ordenados |
+| `post:<id>` | lista de postagem do termo que termina no nó `<id>`: `(Δdoc, tf)` por documento |
+| `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições) |
+| `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco` |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
+| `meta:doc_count`, `meta:total_len` | total de documentos e soma dos tamanhos (BM25) |
+| `meta:format`, `meta:positions`, `meta:languages` | formato, se grava posições e idiomas das stopwords |
 
-Os valores usam varint; as listas de postagem gravam a diferença entre IDs
-consecutivos, então documentos com IDs próximos custam ~1 byte cada.
+Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
+então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
+em chaves separadas para que a busca comum não leia posições.
 
 ### Configuração do RocksDB
 
 - filtro de Bloom, 10 bits por chave (`Config::bloom_bits_per_key`);
 - block cache LRU de 256 MiB (`Config::block_cache_bytes`), com índices e
   filtros dentro do cache e os do nível 0 fixados nele;
+- filtros e índices **particionados** em blocos de 4 KB, com o nível de topo
+  fixado no cache. Sem isso, na Wikipédia inteira, um SST gerado pela
+  compactação tinha um filtro de ~6 MB num bloco só, maior que uma parte do
+  cache (o LRU se divide em 64 partes de 4 MB): cada leitura relia o filtro
+  inteiro, e a carga caía de ~5.000 para ~200 artigos/s;
 - compressão LZ4.
 
 ## Performance
@@ -153,25 +198,43 @@ python3 scripts/perf.py tudo --escala 10k
    nó terminal>`; não é preciso um segundo contador nem guardar o ID no nó.
 3. **Filhos guardam IDs numéricos** (`BTreeMap<char, u64>`), não strings
    `"node:124"`. O `BTreeMap` deixa o autocompletar em ordem alfabética.
-4. **Nós criados no meio de um lote.** Como nada vai para o banco antes do
-   commit, o lote mantém em memória os nós que leu ou criou; senão a segunda
-   palavra com o mesmo prefixo não enxergaria os nós criados pela primeira.
+4. **Lote invertido, com cache de nós.** O lote junta termo → documentos e só
+   percorre a Trie no commit, uma vez por termo distinto (e não uma vez por
+   documento). Os nós lidos ou criados ficam num cache do escritor que passa de
+   um lote para o outro (`Config::writer_cache_nodes`, 1 milhão de nós por
+   padrão), então a raiz e os termos comuns não são relidos a cada commit.
 5. **Serialização binária própria** em vez de Gob/JSON (menor e sem
    dependências).
 
 ## Limitações conhecidas
 
-- **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID só
-  adiciona termos; termos que saíram do texto continuam apontando para ele.
-- **Sem ranking.** Os resultados vêm em ordem de ID, não de relevância (não há
-  TF-IDF/BM25 nem frequência dos termos).
-- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 11 `Get`s.
-  Com o block cache quente isso fica em microssegundos, mas um índice de termos
+- **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID troca o
+  tf, as posições e o tamanho dele (e não conta o documento duas vezes), mas
+  termos que saíram do texto continuam apontando para ele.
+- **Título sem peso maior.** O BM25 olha o documento como um texto só; buscar
+  "Brasil" não garante o artigo "Brasil" em primeiro (campos/BM25F ficam para
+  depois).
+- **Frases:** uma stopword dentro da frase só conta a distância (`"casa de
+  papel"` também casa "casa da papel"); frase só de stopwords fica vazia; não
+  há prefixo dentro de frase (`"revolução franc*"`).
+- **Posições custam espaço.** Na fatia de 10k da Wikipédia, o banco
+  compactado tem ~51 MB com posições e ~21 MB sem; use `--sem-posicoes` se
+  não precisar de frases.
+- **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 9 `Get`s
+  (a raiz e os dois níveis seguintes vêm do cache de nós das buscas,
+  `Config::reader_cache_depth`). Com o block cache quente isso fica em
+  microssegundos, mas um índice de termos
   ordenado (`term:<palavra>` com iterador de prefixo do RocksDB) faria o mesmo
   com 1 leitura, e o autocompletar com um único scan.
 - **Prefixos muito curtos** (`a*`) expandem no máximo
-  `Config::max_prefix_terms` termos (256); os demais são ignorados.
-- **Sem stopwords nem stemming** ("casa" e "casas" são termos diferentes).
+  `Config::max_prefix_terms` termos (256); os demais são ignorados. No
+  ranking, um documento que casa com vários termos do prefixo fica com a nota
+  do melhor deles (não a soma).
+- **Sem stemming** ("casa" e "casas" são termos diferentes).
+- **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
+  stopword em inglês, então a consulta fica vazia. Como prefixo continuam
+  valendo (`de*` acha "dezembro"). As listas estão em `src/stopwords/*.txt`;
+  para usar outro idioma, crie o banco com `--idiomas en` (ou `nenhum`).
 
 ## Compilação
 

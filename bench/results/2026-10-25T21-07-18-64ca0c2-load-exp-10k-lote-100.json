@@ -1,0 +1,49 @@
+{
+  "arquivos_l0": 1,
+  "banco_bytes": 37477063,
+  "banco_por_texto": 0.385421066691143,
+  "batch": 100,
+  "bytes_corpus": 97236675,
+  "chaves_estimadas": 1989078,
+  "commit": "64ca0c2",
+  "config": {
+    "block_cache_bytes": 268435456,
+    "bloom_bits_per_key": 10.0,
+    "max_prefix_terms": 256,
+    "statistics": true,
+    "writer_cache_nodes": 1000000
+  },
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-10000.jsonl",
+  "db": "/home/evertondays/bench-db/perf/tmp-exp",
+  "docs": 10000,
+  "docs_por_s": 1180.6915876085438,
+  "escrita": {
+    "block_cache_hit": 0,
+    "block_cache_miss": 2,
+    "bloom_util": 0,
+    "bytes_compactacao": 0,
+    "bytes_escritos_usuario": 54657994,
+    "bytes_flush": 12932370,
+    "stall_micros": 0,
+    "write_amp": 0.23660528046455565
+  },
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3893620736,
+    "ram_total": 8266137600,
+    "swap_usado": 902926336
+  },
+  "mb_por_s": 10.948803346588708,
+  "nos_trie": 728495,
+  "pico_rss": 229101568,
+  "quando": "2026-10-25T21-07-18",
+  "remap_ids": false,
+  "rotulo": "exp-10k-lote-100",
+  "segundos": 8.469612306,
+  "skip": 0,
+  "streaming": false,
+  "swap_aumento": 0,
+  "take": null,
+  "tipo": "load"
+}

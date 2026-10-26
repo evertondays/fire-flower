@@ -30,8 +30,13 @@ a Wikipédia inteira leva mais de uma hora.
 ```bash
 python3 scripts/perf.py tudo --escala 10k     # todas as fases, ~7 min
 python3 scripts/perf.py pr --escala 10k       # checagem rápida contra a linha de base
+python3 scripts/perf.py frases --escala 10k   # só frases e ranking (carga com/sem posições, oráculo, latência)
 python3 scripts/perf.py relatorio --escala 10k
 ```
+
+Ao salvar uma linha de base nova (`tudo`, ou `pr --salvar-baseline`), a
+anterior, de outro commit, fica guardada como
+`bench/baseline-pr-<escala>-<commit>.json`.
 
 Os resultados ficam em `bench/results/` (um JSON por medição, com commit e
 data) e o resumo legível em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
@@ -58,8 +63,13 @@ Números em [`bench/RESULTADOS.md`](../bench/RESULTADOS.md).
    cabendo no cache. O cache LRU se divide em 64 partes, e o filtro de Bloom
    do SST (~1,3 MB num bloco só) não cabe numa parte de 1 MB. Com 256 MB as
    partes têm 4 MB e cabe. Na Wikipédia inteira os SSTs são maiores e o filtro
-   pode passar de 4 MB. Candidatos: filtros particionados
-   (`set_partition_filters`), menos partes no cache, ou filtros fora do cache.
+   pode passar de 4 MB. **Confirmado e corrigido (25/10):** na carga inteira a
+   velocidade caía de ~5.000 para ~200 artigos/s em 200k, 500k ou 600k
+   artigos (quando a compactação gerava um SST de chaves `node:` com filtro de
+   ~6 MB); o RocksDB chegou a contar 22 TB de filtro inserido no cache. Agora
+   filtros e índices são particionados (blocos de 4 KB). Cenário de teste:
+   `perf.py carga-longa` (com `--reproduzir`, roda antes a config antiga, que
+   tem que colapsar) e o teste `bloom_filters_larger_than_a_cache_shard_...`.
 6. **Lotes maiores indexam mais rápido:** lote de 10.000 dá +26% docs/s, mas
    o pico de RSS vai de 160 para 300 MB.
 7. **Leitura escala:** `misto` vai de 4,9 mil qps (1 thread) a 30,6 mil qps
@@ -85,9 +95,10 @@ cada operação:
 | Autocompletar | `suggest` | idem, até `limit` | busca em largura em prefixos curtos |
 | Abrir o banco | `Engine::open` | leitura de 2 contadores | tempo de recuperação do WAL após carga grande |
 
-**Fora do escopo por enquanto** (o motor não tem): busca por frase, OR,
-ranking, remoção e atualização. Quando existirem, ganham um conjunto de
-consultas próprio na Fase 4.
+**Fora do escopo por enquanto** (o motor não tem): OR, remoção e
+atualização. Busca por frase e ranking BM25 já existem (ver
+[plano-frases-e-ranking.md](plano-frases-e-ranking.md)) e têm conjuntos
+próprios (`frase-*`, `rank-*`).
 
 ---
 
@@ -298,6 +309,16 @@ pequeno).
 | `s-*` | os mesmos prefixos no `suggest`, limite 10 | | autocompletar |
 | `titulos` | 1.000 títulos reais | "Revolução Francesa" | mistura realista; também checa revocação |
 | `misto` | 70% `titulos`/`t-medio`, 20% `and-*`, 10% `p-*` | | carga das Fases 4 e 5 |
+| `frase-2` / `frase-3` | trechos reais de 2 e 3 palavras sem stopword | `"revolução francesa"` | conferência de posições |
+| `frase-stop` | 3 palavras com stopword no meio | `"copa do mundo"` | o buraco da stopword |
+| `frase-freq` | 2 palavras entre os 500 termos de maior df | `"sao paulo"` | muitos candidatos para conferir |
+| `frase-miss` | `frase-2`/`frase-3` com a ordem trocada | `"francesa revolução"` | conferir sem achar |
+| `rank-freq` | os termos de `t-freq`, top 10 | | custo do BM25 numa lista grande |
+| `rank-and` | 2–3 termos (df ≥ 100) do mesmo artigo, top 10 | | BM25 depois do E |
+| `rank-titulos` | os títulos de `titulos`, top 10 | | o caso real da CLI e do TUI |
+
+Conjuntos `rank-*` são medidos com `search_ranked(q, 10)`; os demais com
+`search` (todos os IDs), e os `s-*` com `suggest`.
 
 ---
 

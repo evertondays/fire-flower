@@ -1,0 +1,108 @@
+{
+  "commit": "4fe734a-modificado",
+  "corpus": "/home/evertondays/datasets/ptwiki/ptwiki-10000.jsonl",
+  "db": "/home/evertondays/bench-db/perf-100k/ptwiki-10k",
+  "divergencias": 0,
+  "docs": 10000,
+  "maquina": {
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "nucleos": 12,
+    "ram_livre": 3439763456,
+    "ram_total": 8266137600,
+    "swap_usado": 1075171328
+  },
+  "posicoes": true,
+  "quando": "2026-10-25T23-04-51",
+  "relevancia": {
+    "consultas": 1000,
+    "fora_do_top1000": 0,
+    "mrr": 0.8717807393478526,
+    "top1": 0.805,
+    "top10": 0.962
+  },
+  "remap_ids": false,
+  "rotulo": "10k-todos",
+  "take": null,
+  "termos_oraculo": 288203,
+  "tipo": "oracle",
+  "verificacoes": [
+    {
+      "casos": 288203,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "288203 termos no motor, 288203 no oráculo"
+      ],
+      "verificacao": "listas (doc, tf)"
+    },
+    {
+      "casos": 288203,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "posições"
+    },
+    {
+      "casos": 10003,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "tamanhos e estatísticas"
+    },
+    {
+      "casos": 5000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "AND"
+    },
+    {
+      "casos": 2000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "1033 de 2000 prefixos passaram de 256 termos; 5488778 termos ignorados no total (resultado incompleto por projeto)"
+      ],
+      "verificacao": "prefixo"
+    },
+    {
+      "casos": 2000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "autocompletar"
+    },
+    {
+      "casos": 1000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "título → artigo"
+    },
+    {
+      "casos": 8,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [],
+      "verificacao": "normalização"
+    },
+    {
+      "casos": 2000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "1554 frases com resultado, 446 sem (ordem trocada, em geral)"
+      ],
+      "verificacao": "frases"
+    },
+    {
+      "casos": 1000,
+      "divergencias": 0,
+      "exemplos": [],
+      "notas": [
+        "termo frequente, termo qualquer, E, termo + prefixo e frase; notas com diferença relativa < 1e-4"
+      ],
+      "verificacao": "ranking BM25 (top 10)"
+    }
+  ]
+}

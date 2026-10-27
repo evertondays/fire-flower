@@ -1,23 +1,17 @@
 //! Testes unitários das partes internas do motor.
 
-use crate::engine::ranking::topk::TopK;
-use crate::engine::writer::trie::evict;
-use crate::engine::writer::trie::CachedNode;
-use crate::codec::DocLens;
 use std::sync::Arc;
-use crate::codec::NormBlock;
-use crate::engine::EpochCache;
-use crate::DocId;
-use crate::Hit;
-use crate::engine::phrase::count_phrase;
-use crate::engine::conjunction::seek;
-use crate::Posting;
-use crate::engine::keys::NODE;
-use crate::engine::keys::NORM;
-use crate::engine::keys::POST;
-use crate::engine::Key;
+
 use rustc_hash::FxHashMap;
-use crate::codec::TrieNode;
+
+use crate::{DocId, Hit, Posting};
+use crate::codec::{DocLens, NormBlock, TrieNode};
+use crate::engine::{EpochCache, Key};
+use crate::engine::conjunction::seek;
+use crate::engine::keys::{NODE, NORM, POST};
+use crate::engine::phrase::count_phrase;
+use crate::engine::ranking::topk::TopK;
+use crate::engine::writer::trie::{CachedNode, evict};
 
 fn cached(used: u64, depth: u8) -> CachedNode {
     CachedNode { node: TrieNode::default(), dirty: false, used, depth }

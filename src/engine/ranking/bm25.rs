@@ -1,8 +1,7 @@
 //! BM25F e os limites superiores da nota usados no top-k.
 
+use crate::{Config, IndexStats};
 use crate::codec::DocLens;
-use crate::IndexStats;
-use crate::Config;
 
 /// Normalização de um campo pelo tamanho: `B(len) = 1 − b + b · len / média`.
 #[derive(Clone, Copy)]

@@ -1,10 +1,11 @@
 //! `wiki digest`: resumo do conteúdo lógico do banco (para comparar cargas).
 
-use crate::AnyResult;
-use fire_flower::Config;
-use fire_flower::Engine;
 use std::path::Path;
+
+use fire_flower::{Config, Engine};
 use serde_json::json;
+
+use crate::AnyResult;
 
 /// FNV-1a de 64 bits: estável entre versões do Rust (o SipHash da std não garante isso).
 pub(crate) struct Fnv(pub(crate) u64);

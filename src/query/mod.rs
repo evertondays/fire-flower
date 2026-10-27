@@ -1,8 +1,7 @@
 //! Consulta → partes: termos, prefixos (`termo*`) e frases (`"..."`), com a
 //! mesma normalização da indexação.
 
-use crate::analysis::for_each_term;
-use crate::analysis::tokenize;
+use crate::analysis::{for_each_term, tokenize};
 use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::Stopwords;
 

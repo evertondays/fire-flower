@@ -1,17 +1,12 @@
 //! Busca sem ranking: os documentos que casam com todas as partes, em ordem de ID.
 
-use crate::Result;
-use crate::engine::phrase::PhraseMatcher;
-use crate::engine::conjunction::seek_docs;
-use crate::engine::conjunction::use_cursor;
+use crate::{DocId, InflectionMode, Result, codec};
 use crate::codec::PostingsCursor;
+use crate::engine::conjunction::{Member, seek_docs, use_cursor};
 use crate::engine::groups::decode_group_docs;
-use crate::codec;
-use crate::engine::conjunction::Member;
-use crate::query::Clause;
-use crate::InflectionMode;
-use crate::DocId;
+use crate::engine::phrase::PhraseMatcher;
 use crate::engine::view::View;
+use crate::query::Clause;
 
 impl View<'_> {
     pub(crate) fn search(&self, query: &str) -> Result<Vec<DocId>> {

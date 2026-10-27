@@ -1,15 +1,14 @@
 //! Desenho da tela: cabeçalho, busca, sugestões, resultados, prévia e rodapé.
 
-
-use fire_flower::query::Clause;
 use fire_flower::Hit;
+use fire_flower::query::Clause;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
-use super::{App, Preview, PreviewContent, ACCENT, ACCENT_SOFT, MUTED};
+use super::{ACCENT, ACCENT_SOFT, App, MUTED, Preview, PreviewContent};
 
 
 impl<'a> App<'a> {

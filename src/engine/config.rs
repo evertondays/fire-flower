@@ -1,7 +1,6 @@
 //! Configuração do motor ([`Config`]).
 
-use crate::Result;
-use crate::Error;
+use crate::{Error, Result};
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::Language;
 

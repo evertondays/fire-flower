@@ -1,11 +1,10 @@
 //! O E entre listas: quem conduz, cursores que saltam blocos e interseção.
 
-use crate::Result;
 use std::cmp::Ordering;
-use crate::DocId;
-use crate::engine::groups::GroupParts;
+
+use crate::{DocId, Posting, Result};
 use crate::codec::PostingsCursor;
-use crate::Posting;
+use crate::engine::groups::GroupParts;
 
 /// Uma lista do E, antes de escolher quem conduz: os bytes de `post:` (ainda
 /// não decodificados; o tamanho vem do cabeçalho) ou uma lista já

@@ -1,11 +1,9 @@
 //! O formato comum das listas `post:` e `pos:`: o cabeçalho e a tabela de
 //! saltos (blocos para pular sem decodificar).
 
-use crate::codec::varint::corrupt;
-use crate::codec::varint::Reader;
-use crate::Error;
+use crate::{DocId, Error};
 use crate::codec::put_varint;
-use crate::DocId;
+use crate::codec::varint::{Reader, corrupt};
 
 /// Entradas por bloco da tabela de saltos.
 pub const SKIP_BLOCK: usize = 128;

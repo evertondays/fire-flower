@@ -1,18 +1,10 @@
 //! Merge operator das listas: une pedaços gravados em lotes diferentes.
 
+use crate::{DocId, Error};
+use crate::codec::{PositionsCursor, SKIP_BLOCK, decode_postings, encode_postings_into, put_varint};
+use crate::codec::list::{ListHeader, SkipEntry, put_skips};
 use crate::codec::positions::encode_positions_with;
-use crate::internals::PositionsCursor;
-use crate::codec::encode_postings_into;
-use crate::internals::decode_postings;
-use crate::codec::list::put_skips;
-use crate::codec::SKIP_BLOCK;
-use crate::codec::put_varint;
-use crate::codec::varint::corrupt;
-use crate::codec::varint::Reader;
-use crate::codec::list::ListHeader;
-use crate::Error;
-use crate::codec::list::SkipEntry;
-use crate::DocId;
+use crate::codec::varint::{Reader, corrupt};
 
 /// Uma lista codificada, pronta para o merge.
 pub(crate) struct Scan {

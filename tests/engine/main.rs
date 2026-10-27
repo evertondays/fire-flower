@@ -1,9 +1,7 @@
 //! Testes de integração do motor, por tema; aqui ficam as funções
 //! auxiliares que vários temas usam.
 
-use fire_flower::Posting;
-use fire_flower::Config;
-use fire_flower::Engine;
+use fire_flower::{Config, Engine, Posting};
 
 mod concurrency;
 mod indexing;

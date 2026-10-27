@@ -1,16 +1,12 @@
 //! Prefixos e autocompletar: as completações de um prefixo na Trie e a
 //! união das listas delas.
 
-use crate::Result;
-use crate::engine::view::missing_node;
-use crate::engine::keys::NODE;
-use crate::codec::TrieNode;
 use std::sync::Arc;
-use crate::DocId;
-use crate::codec;
-use crate::engine::keys::POST;
-use crate::Posting;
-use crate::engine::view::View;
+
+use crate::{DocId, Posting, Result, codec};
+use crate::codec::TrieNode;
+use crate::engine::keys::{NODE, POST};
+use crate::engine::view::{View, missing_node};
 
 impl View<'_> {
     /// Nós das completações de `prefix` e, com stemming, o do radical do

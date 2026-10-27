@@ -1,15 +1,13 @@
 //! Ambiente da medição: commit, máquina, memória, caches do sistema e onde gravar os resultados.
 
-use crate::AnyResult;
-use fire_flower::Engine;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use fire_flower::{Config, Engine};
 use rustc_hash::FxHashMap as HashMap;
-use fire_flower::Config;
-use serde_json::Value;
-use std::path::Path;
-use std::time::UNIX_EPOCH;
-use std::time::SystemTime;
-use std::path::PathBuf;
-use serde_json::json;
+use serde_json::{Value, json};
+
+use crate::AnyResult;
 
 pub(crate) fn project_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

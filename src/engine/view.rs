@@ -1,28 +1,14 @@
 //! Leituras de uma busca sobre um snapshot ([`View`]): nós da Trie, listas,
 //! tamanhos dos documentos.
 
-use crate::Result;
-use crate::engine::keys::NODE;
-use crate::codec::NORM_BLOCK_DOCS;
-use crate::codec::DocLens;
-use rustc_hash::FxHashMap;
-use crate::engine::keys::NORM;
-use crate::codec::NormBlock;
-use crate::Posting;
-use crate::DocId;
-use crate::engine::keys::ROOT_ID;
-use crate::codec::TrieNode;
 use std::sync::Arc;
-use crate::Error;
-use crate::engine::keys::META_TOTAL_TITLE_LEN;
-use crate::engine::keys::META_TOTAL_LEN;
-use crate::engine::keys::META_DOC_COUNT;
-use crate::codec;
-use crate::IndexStats;
-use crate::engine::keys::POST;
-use crate::engine::keys::Key;
-use crate::Engine;
+
 use rocksdb::DB;
+use rustc_hash::FxHashMap;
+
+use crate::{DocId, Engine, Error, IndexStats, Posting, Result, codec};
+use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
+use crate::engine::keys::{Key, META_DOC_COUNT, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POST, ROOT_ID};
 
 pub(crate) type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
 

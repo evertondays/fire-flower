@@ -1,26 +1,15 @@
 //! Formato do banco e metadados gravados na criação (posições, idiomas,
 //! stemming), e o merge operator das listas.
 
-use crate::Result;
-use crate::engine::keys::STEM;
-use crate::engine::keys::POS;
-use crate::engine::keys::POST;
-use rocksdb::MergeOperands;
-use crate::codec;
-use crate::engine::keys::META_STEMMING;
-use crate::analysis::stem::Stemming;
-use crate::analysis::stopwords;
-use crate::engine::keys::META_LANGUAGES;
-use crate::analysis::stopwords::Stopwords;
-use crate::analysis::stopwords::Language;
-use rocksdb::Options;
 use std::path::Path;
-use rocksdb::WriteBatch;
-use crate::engine::keys::META_NEXT_NODE;
-use crate::Error;
-use crate::engine::keys::META_POSITIONS;
-use crate::engine::keys::META_FORMAT;
-use rocksdb::DB;
+
+use rocksdb::{DB, MergeOperands, Options, WriteBatch};
+
+use crate::{Error, Result, codec};
+use crate::analysis::stopwords;
+use crate::analysis::stem::Stemming;
+use crate::analysis::stopwords::{Language, Stopwords};
+use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS, POST, STEM};
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
 pub const FORMAT_VERSION: u64 = 5;

@@ -1,12 +1,9 @@
 //! Stemming na indexação e flexões na consulta.
 
-use fire_flower::InflectionMode;
-use crate::open;
+use fire_flower::{Config, Engine, InflectionMode, Language, Stemming};
 use fire_flower::query::Clause;
-use fire_flower::Engine;
-use fire_flower::Language;
-use fire_flower::Stemming;
-use fire_flower::Config;
+
+use crate::open;
 
 pub(crate) fn stemmed() -> Config {
     Config { stemming: Some(Stemming::Snowball(Language::Portuguese)), ..Config::default() }

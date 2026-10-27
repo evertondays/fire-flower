@@ -1,16 +1,10 @@
 //! Grupos de flexões ([`Config::inflections`](crate::Config::inflections)):
 //! a palavra exata e as do mesmo radical como um termo só.
 
-use crate::engine::view::Source;
-use crate::Result;
-use crate::engine::keys::POST;
+use crate::{DocId, InflectionMode, Posting, Result, codec};
 use crate::engine::conjunction::Member;
-use crate::engine::keys::stem_key;
-use crate::InflectionMode;
-use crate::engine::view::View;
-use crate::codec;
-use crate::DocId;
-use crate::Posting;
+use crate::engine::keys::{POST, stem_key};
+use crate::engine::view::{Source, View};
 
 /// (exata, flexões) de cada documento da união de um [`Scorer::Group`].
 pub(crate) type GroupParts = Vec<(Posting, Posting)>;

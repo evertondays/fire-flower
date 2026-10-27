@@ -1,18 +1,8 @@
 //! Ranking: BM25 e BM25F conferidos à mão, empates e o top-k.
 
-use fire_flower::Error;
-use fire_flower::Engine;
-use crate::titled;
-use fire_flower::Config;
-use crate::K1;
-use crate::B;
-use crate::p;
-use fire_flower::Posting;
-use fire_flower::Hit;
-use crate::close;
-use crate::bm25;
-use crate::ranked;
-use crate::open;
+use fire_flower::{Config, Engine, Error, Hit, Posting};
+
+use crate::{B, K1, bm25, close, open, p, ranked, titled};
 
 #[test]
 pub(crate) fn bm25_matches_hand_computation() {

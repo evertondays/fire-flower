@@ -1,10 +1,9 @@
 //! O índice ingênuo do oráculo: listas por termo, posições e a busca.
 
+use fire_flower::DocId;
+use fire_flower::analysis::{TITLE_GAP, tokenize};
 use fire_flower::query::Clause;
 use rustc_hash::FxHashMap as HashMap;
-use fire_flower::analysis::TITLE_GAP;
-use fire_flower::analysis::tokenize;
-use fire_flower::DocId;
 
 /// Ordem do autocompletar e da expansão de prefixo: comprimento, depois alfabética.
 pub(crate) fn trie_order(a: &&str, b: &&str) -> std::cmp::Ordering {

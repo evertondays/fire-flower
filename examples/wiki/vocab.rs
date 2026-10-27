@@ -1,21 +1,16 @@
 //! `wiki vocab`: df e comprimento de cada termo do corpus.
 
-use crate::AnyResult;
-use std::io::BufRead;
-use std::io::Write;
-use std::io::BufReader;
 use std::fs::File;
-use std::io::BufWriter;
-use crate::corpus::stem;
-use crate::env::project_dir;
-use crate::corpus::unique_terms;
-use crate::corpus::Corpus;
-use rustc_hash::FxHashSet as HashSet;
-use rustc_hash::FxHashMap as HashMap;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::path::PathBuf;
+
 use fire_flower::Stopwords;
-use std::path::Path;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use crate::AnyResult;
+use crate::corpus::{Corpus, stem, unique_terms};
+use crate::env::project_dir;
 
 pub(crate) fn vocab(corpus_path: &Path, stopwords: &Stopwords, take: Option<u64>, out: Option<PathBuf>) -> AnyResult {
     let started = Instant::now();

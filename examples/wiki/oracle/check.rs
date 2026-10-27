@@ -1,7 +1,6 @@
 //! Contagem de divergências entre o motor e o oráculo, por tipo de consulta.
 
-use serde_json::Value;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Default)]
 pub(crate) struct Check {

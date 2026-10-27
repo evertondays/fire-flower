@@ -1,9 +1,8 @@
 //! Blocos de tamanhos dos documentos (`norm:<bloco>`), para o BM25.
 
-use crate::codec::varint::corrupt;
-use crate::codec::varint::Reader;
 use crate::Error;
 use crate::codec::put_varint;
+use crate::codec::varint::{Reader, corrupt};
 
 /// Tamanhos dos documentos de um bloco de IDs (`norm:<id ÷ NORM_BLOCK_DOCS>`).
 ///

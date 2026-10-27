@@ -1,9 +1,10 @@
 //! Buscas em paralelo com a indexação: cada uma vê um momento só do índice.
 
-use fire_flower::Config;
-use fire_flower::Engine;
-use crate::open;
 use std::sync::Arc;
+
+use fire_flower::{Config, Engine};
+
+use crate::open;
 
 #[test]
 pub(crate) fn readers_run_while_indexing() {

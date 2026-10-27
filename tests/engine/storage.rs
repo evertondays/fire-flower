@@ -1,10 +1,8 @@
 //! Armazenamento: opções gravadas na criação, formatos antigos e filtros de Bloom.
 
-use fire_flower::Error;
-use crate::p;
-use crate::open;
-use fire_flower::Engine;
-use fire_flower::Config;
+use fire_flower::{Config, Engine, Error};
+
+use crate::{open, p};
 
 #[test]
 pub(crate) fn languages_are_stored_on_creation_and_checked_on_open() {

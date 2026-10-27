@@ -1,8 +1,8 @@
 //! Busca: exata, E, prefixo, autocompletar, stopwords e listas com saltos.
 
 use fire_flower::Engine;
-use crate::sample;
-use crate::open;
+
+use crate::{open, sample};
 
 #[test]
 pub(crate) fn empty_index_finds_nothing() {

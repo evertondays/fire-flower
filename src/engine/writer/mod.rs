@@ -1,37 +1,23 @@
 //! Indexação: o lote ([`IndexBatch`]) e o commit.
 
-use crate::engine::view::Source;
-use crate::Result;
-use crate::codec::DocLens;
-use crate::codec::NormBlock;
-use crate::engine::keys::NORM;
-use crate::codec::NORM_BLOCK_DOCS;
-use crate::engine::writer::trie::evict;
-use std::sync::atomic::Ordering as AtomicOrdering;
-use crate::engine::keys::META_TOTAL_TITLE_LEN;
-use crate::engine::keys::META_TOTAL_LEN;
-use crate::engine::keys::META_DOC_COUNT;
-use crate::engine::keys::META_NEXT_DOC;
-use crate::engine::meta::varint;
-use crate::engine::keys::META_NEXT_NODE;
-use crate::engine::keys::DOC;
-use crate::engine::keys::NODE;
-use crate::engine::keys::stem_key;
-use crate::engine::keys::POS;
-use crate::engine::keys::POST;
-use crate::engine::keys::Key;
-use crate::codec;
-use crate::engine::writer::trie::TriePath;
-use rocksdb::WriteBatch;
-use crate::internals::reads_on_this_thread;
-use std::time::Instant;
 use std::sync::MutexGuard;
-use crate::Engine;
-use crate::engine::writer::trie::CachedNode;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::time::Instant;
+
+use rocksdb::WriteBatch;
 use rustc_hash::FxHashMap;
+
+use crate::{DocId, Engine, IndexStats, Result, codec};
 use crate::analysis::Analyzer;
-use crate::IndexStats;
-use crate::DocId;
+use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock};
+use crate::engine::reads_on_this_thread;
+use crate::engine::keys::{
+    DOC, Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_TOTAL_LEN, META_TOTAL_TITLE_LEN,
+    NODE, NORM, POS, POST, stem_key,
+};
+use crate::engine::meta::varint;
+use crate::engine::view::Source;
+use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
 pub(crate) mod trie;
 

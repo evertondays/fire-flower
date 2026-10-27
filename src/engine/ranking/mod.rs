@@ -1,28 +1,15 @@
 //! Busca ranqueada (BM25F) com top-k.
 
-use crate::Result;
-use crate::Hit;
-use crate::engine::ranking::score::doc_score;
-use crate::engine::ranking::score::doc_bound;
-use crate::engine::ranking::topk::TopK;
-use crate::engine::view::NormCursor;
-use crate::DocId;
+use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits, codec};
 use crate::codec::PostingsCursor;
-use crate::engine::conjunction::use_cursor;
-use crate::engine::conjunction::AndList;
-use crate::engine::groups::decode_group;
-use crate::codec;
+use crate::engine::conjunction::{AndList, Member, use_cursor};
+use crate::engine::groups::{GroupParts, decode_group};
 use crate::engine::phrase::PhraseMatcher;
-use crate::engine::ranking::bm25::Bound;
-use crate::engine::groups::GroupParts;
-use crate::engine::ranking::score::Scorer;
-use crate::Posting;
-use crate::engine::conjunction::Member;
-use crate::engine::ranking::bm25::Bm25;
+use crate::engine::ranking::bm25::{Bm25, Bound};
+use crate::engine::ranking::score::{Scorer, doc_bound, doc_score};
+use crate::engine::ranking::topk::TopK;
+use crate::engine::view::{NormCursor, View};
 use crate::query::Clause;
-use crate::InflectionMode;
-use crate::TopHits;
-use crate::engine::view::View;
 
 pub(crate) mod bm25;
 pub(crate) mod score;

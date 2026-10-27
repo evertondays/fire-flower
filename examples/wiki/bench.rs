@@ -1,20 +1,16 @@
 //! `wiki bench`: latência e vazão dos conjuntos de consulta.
 
-use crate::AnyResult;
-use crate::env::config_json;
-use crate::env::save_result;
-use fire_flower::Config;
-use std::path::Path;
-use serde_json::Value;
-use rocksdb::perf::set_perf_stats;
-use rocksdb::perf::PerfStatsLevel;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use fire_flower::Engine;
+
+use fire_flower::{Config, Engine};
+use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use rustc_hash::FxHashMap as HashMap;
-use rocksdb::perf::PerfContext;
+use serde_json::{Value, json};
+
+use crate::AnyResult;
 use crate::corpus::stem;
-use std::path::PathBuf;
-use serde_json::json;
+use crate::env::{config_json, save_result};
 
 /// Como um conjunto é medido, pelo prefixo do nome do arquivo.
 #[derive(Clone, Copy, PartialEq, Eq)]

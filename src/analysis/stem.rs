@@ -17,8 +17,8 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::analysis::stopwords::Language;
 use crate::analysis::for_each_token;
+use crate::analysis::stopwords::Language;
 
 /// Stemming de um banco.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

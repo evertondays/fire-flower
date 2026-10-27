@@ -2,14 +2,14 @@
 
 use std::path::Path;
 
+use fire_flower::Stemmer;
 use fire_flower::analysis::normalize_term;
 use fire_flower::query::QueryTerm;
-use fire_flower::Stemmer;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_normalization::char::is_combining_mark;
 
-use super::{PreviewContent, ACCENT, MAX_LINE_CHARS, MAX_PREVIEW_BYTES, MUTED};
+use super::{ACCENT, MAX_LINE_CHARS, MAX_PREVIEW_BYTES, MUTED, PreviewContent};
 
 
 

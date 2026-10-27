@@ -16,18 +16,17 @@
 //! cargo run --release --example wiki -- concurrent --db D --corpus F --skip K --queries Q [--threads T]
 //! ```
 
-use crate::concurrent::concurrent;
-use crate::digest::digest;
-use crate::sizes::sizes;
 use crate::bench::bench;
-use crate::relevance::run_relevance;
-use crate::env::project_dir;
-use crate::oracle::OracleArgs;
-use crate::oracle::oracle;
-use crate::queries::queries;
-use crate::vocab::vocab;
-use crate::load::load;
+use crate::concurrent::concurrent;
 use crate::corpus::parse_languages;
+use crate::digest::digest;
+use crate::env::project_dir;
+use crate::load::load;
+use crate::oracle::{OracleArgs, oracle};
+use crate::queries::queries;
+use crate::relevance::run_relevance;
+use crate::sizes::sizes;
+use crate::vocab::vocab;
 
 // FxHash: os mapas do vocabulário e do oráculo têm centenas de milhares de termos.
 use std::path::PathBuf;

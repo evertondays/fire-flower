@@ -2,9 +2,9 @@
 
 use fire_flower::Stemmer;
 
+use super::*;
 use super::draw::{describe_phrase, format_count, truncate_left};
 use super::preview::highlight;
-use super::*;
 
 #[test]
 fn highlight_marks_normalized_matches() {

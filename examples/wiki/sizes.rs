@@ -1,16 +1,15 @@
 //! `wiki sizes`: tamanho de cada espaço de chave e das maiores listas.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use fire_flower::{Config, Engine};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde_json::json;
+
 use crate::AnyResult;
 use crate::corpus::stem;
-use crate::env::save_result;
-use crate::env::mb;
-use rustc_hash::FxHashSet as HashSet;
-use rustc_hash::FxHashMap as HashMap;
-use std::collections::BTreeMap;
-use fire_flower::Config;
-use fire_flower::Engine;
-use std::path::Path;
-use serde_json::json;
+use crate::env::{mb, save_result};
 
 pub(crate) fn sizes(db: &Path) -> AnyResult {
     let engine = Engine::open(db, Config::default())?;

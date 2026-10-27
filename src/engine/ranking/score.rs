@@ -1,10 +1,8 @@
 //! A nota de um documento: soma das partes da consulta.
 
-use crate::engine::ranking::bm25::DocNorm;
-use crate::engine::groups::GroupParts;
 use crate::engine::conjunction::AndList;
-use crate::engine::ranking::bm25::Bm25;
-use crate::engine::ranking::bm25::Bound;
+use crate::engine::groups::GroupParts;
+use crate::engine::ranking::bm25::{Bm25, Bound, DocNorm};
 
 /// Uma parte da consulta já carregada, para o ranking. `weight` é
 /// idf · (k1 + 1), a parte da nota que não depende do documento.

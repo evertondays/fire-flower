@@ -1,14 +1,10 @@
 //! Busca por frase: confere as posições dos termos em cada documento.
 
-use crate::Result;
-use crate::engine::view::Source;
-use crate::DocId;
+use crate::{DocId, Error, Result};
 use crate::codec::PositionsCursor;
-use crate::engine::keys::POS;
-use crate::engine::keys::Key;
-use crate::Error;
+use crate::engine::keys::{Key, POS};
+use crate::engine::view::{Source, View};
 use crate::query::Clause;
-use crate::engine::view::View;
 
 impl View<'_> {
     pub(crate) fn check_phrases(&self, clauses: &[Clause]) -> Result<()> {

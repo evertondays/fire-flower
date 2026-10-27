@@ -1,14 +1,14 @@
 //! Busca interativa no terminal: resultados por relevância enquanto você
 //! digita, autocompletar da palavra atual e prévia com os termos destacados.
 
-use std::collections::HashMap;
 use std::io;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use fire_flower::{DocId, Engine, Hit};
 use fire_flower::analysis::normalize_term;
 use fire_flower::query::{Clause, QueryTerm};
-use fire_flower::{DocId, Engine, Hit};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Color;

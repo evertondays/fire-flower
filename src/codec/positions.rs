@@ -1,14 +1,9 @@
 //! Listas de posições (`pos:<id>`) e o cursor que salta blocos.
 
-use crate::codec::varint::corrupt;
-use crate::codec::list::ListHeader;
-use crate::codec::list::Block;
-use crate::codec::varint::Reader;
-use crate::Error;
-use crate::codec::list::write_list;
-use crate::codec::SKIP_BLOCK;
-use crate::codec::put_varint;
-use crate::DocId;
+use crate::{DocId, Error};
+use crate::codec::{SKIP_BLOCK, put_varint};
+use crate::codec::list::{Block, ListHeader, write_list};
+use crate::codec::varint::{Reader, corrupt};
 
 /// Grava em `buf` as posições de cada documento. `entries` traz
 /// `(doc, tf, tf no título)` ordenado por doc (só o tf é usado); `positions`

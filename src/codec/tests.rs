@@ -1,29 +1,14 @@
 //! Testes dos formatos.
 
-
-use crate::codec::DocLens;
-use crate::internals::PostingsCursor;
-use crate::internals::list_len;
-use crate::codec::SKIP_BLOCK;
+use crate::{DocId, Posting};
+use crate::codec::{
+    DocLens, NormBlock, PositionsCursor, PostingsCursor, SKIP_BLOCK, TrieNode, decode_docs,
+    decode_node_set, decode_positions, decode_postings, encode_node_set, encode_positions_into,
+    encode_postings, get_varint, list_len, merge_node_sets, merge_positions, merge_postings,
+};
 use crate::codec::list::ListHeader;
 use crate::codec::merge::merge_lists;
-use crate::internals::merge_positions;
-use crate::internals::NormBlock;
-use crate::codec::get_varint;
-use crate::internals::PositionsCursor;
-use crate::internals::encode_positions_into;
-use crate::internals::decode_positions;
-use crate::internals::merge_postings;
-use crate::internals::decode_docs;
-use crate::internals::decode_postings;
-use crate::internals::encode_postings;
-use crate::internals::TrieNode;
 use crate::codec::positions::encode_positions_with;
-use crate::Posting;
-use crate::DocId;
-use crate::codec::merge_node_sets;
-use crate::codec::decode_node_set;
-use crate::codec::encode_node_set;
 
 #[test]
 fn node_sets_round_trip_and_merge() {

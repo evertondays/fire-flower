@@ -1,13 +1,8 @@
 //! Busca por frase.
 
-use fire_flower::Config;
-use crate::titled;
-use crate::close;
-use crate::ranked;
-use crate::B;
-use crate::K1;
-use crate::open;
-use fire_flower::Engine;
+use fire_flower::{Config, Engine};
+
+use crate::{B, K1, close, open, ranked, titled};
 
 pub(crate) fn phrase_sample(engine: &Engine) {
     let mut batch = engine.batch();

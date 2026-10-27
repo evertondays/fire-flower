@@ -2,9 +2,9 @@
 //! com os snapshots ([`EpochCache`]).
 
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
 use rustc_hash::FxHashMap;
-use std::sync::RwLock;
 
 /// Valores já decodificados, compartilhados pelas buscas: blocos de `norm:`
 /// (o ranking precisa do tamanho de cada documento) e os nós rasos da Trie

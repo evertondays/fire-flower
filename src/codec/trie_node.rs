@@ -1,9 +1,8 @@
 //! Nó da Trie (`node:<id>`): os filhos e se o caminho até ele é uma palavra.
 
-use crate::codec::varint::corrupt;
-use crate::codec::varint::Reader;
 use crate::Error;
 use crate::codec::put_varint;
+use crate::codec::varint::{Reader, corrupt};
 
 /// Nó da Trie, gravado em `node:<id>`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

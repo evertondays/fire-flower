@@ -1,7 +1,6 @@
 //! Tokenização: texto → tokens normalizados (sem acentos, minúsculos).
 
-use unicode_normalization::char::is_combining_mark;
-use unicode_normalization::char::decompose_compatible;
+use unicode_normalization::char::{decompose_compatible, is_combining_mark};
 
 /// Tokens maiores que isso são descartados (hashes, base64, lixo binário),
 /// para não criar caminhos enormes e inúteis na Trie.

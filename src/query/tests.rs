@@ -1,12 +1,8 @@
 //! Testes do parser de consultas.
 
-use crate::query::parse_query_stemmed;
 use crate::analysis::stem::Stemmer;
-use crate::query::parse_query;
 use crate::analysis::stopwords::Stopwords;
-use crate::query::PhraseTerm;
-use crate::query::QueryTerm;
-use crate::query::Clause;
+use crate::query::{Clause, PhraseTerm, QueryTerm, parse_query, parse_query_stemmed};
 
 fn term(text: &str, prefix: bool) -> Clause {
     Clause::Term(QueryTerm { text: text.into(), prefix, stem: None })

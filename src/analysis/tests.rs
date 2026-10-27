@@ -1,21 +1,15 @@
 //! Testes da análise de texto.
 
 use unicode_normalization::UnicodeNormalization;
-use crate::analysis::strip_html;
-use crate::analysis::for_each_term;
-use crate::analysis::stem::Stemmer;
+use unicode_normalization::char::{canonical_combining_class, is_combining_mark};
+
 use crate::Language;
-use crate::analysis::index_terms;
-use crate::analysis::normalize_term;
-use crate::analysis::Analyzer;
-use crate::analysis::Analysis;
-use crate::analysis::analyze;
+use crate::analysis::{
+    Analysis, Analyzer, MAX_TOKEN_CHARS, analyze, for_each_term, for_each_token, index_terms,
+    normalize_term, strip_html, tokenize,
+};
+use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::Stopwords;
-use crate::analysis::for_each_token;
-use unicode_normalization::char::canonical_combining_class;
-use crate::analysis::tokenize;
-use unicode_normalization::char::is_combining_mark;
-use crate::analysis::MAX_TOKEN_CHARS;
 
 /// A tokenização original: NFKD da string inteira.
 fn reference_tokenize(text: &str) -> Vec<String> {

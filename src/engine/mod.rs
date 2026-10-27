@@ -10,59 +10,30 @@
 //! - `stem:<radical>` -> nós das palavras com esse radical (só com flexões na consulta)
 //! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas e stemming
 
-
-
-
-use crate::Result;
-use crate::analysis::stopwords::Language;
-use std::sync::atomic::Ordering as AtomicOrdering;
-use crate::engine::view::View;
-use crate::codec::NORM_BLOCK_DOCS;
-use crate::engine::keys::DOC;
-use crate::engine::keys::Key;
-use crate::query::parse_query_stemmed;
-use crate::query::Clause;
-use crate::analysis::normalize_term;
-use crate::Posting;
-use crate::TopHits;
-use crate::Hit;
-use crate::DocId;
-use rustc_hash::FxHashMap;
-use crate::analysis::Analyzer;
-use crate::engine::writer::NodeCache;
-use crate::engine::keys::META_INFLECTIONS;
-use crate::engine::keys::META_STEMMING;
-use crate::engine::meta::resolve_stemming;
-use crate::engine::meta::resolve_languages;
-use crate::engine::keys::META_TOTAL_TITLE_LEN;
-use crate::engine::keys::META_TOTAL_LEN;
-use crate::engine::keys::META_DOC_COUNT;
-use crate::IndexStats;
-use crate::engine::keys::META_NEXT_DOC;
-use crate::engine::keys::ROOT_ID;
-use crate::engine::keys::META_NEXT_NODE;
-use crate::engine::meta::read_counter;
-use crate::engine::meta::resolve_format;
-use crate::Error;
-use crate::engine::meta::stored_format_error;
-use crate::engine::meta::previous_merge_operator;
-use crate::engine::meta::merge_operator;
-use crate::engine::keys::MERGE_OPERATOR;
-use rocksdb::DBCompressionType;
-use rocksdb::Options;
-use rocksdb::BlockBasedIndexType;
-use rocksdb::Cache;
-use rocksdb::BlockBasedOptions;
 use std::path::Path;
-use crate::codec::TrieNode;
-use crate::codec::NormBlock;
-use crate::engine::cache::EpochCache;
-use std::sync::atomic::AtomicU64;
-use crate::analysis::stem::Stemmer;
-use crate::analysis::stopwords::Stopwords;
-use crate::engine::writer::WriterState;
 use std::sync::Mutex;
-use rocksdb::DB;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options};
+use rustc_hash::FxHashMap;
+
+use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
+use crate::analysis::{Analyzer, normalize_term};
+use crate::analysis::stem::Stemmer;
+use crate::analysis::stopwords::{Language, Stopwords};
+use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
+use crate::engine::cache::EpochCache;
+use crate::engine::keys::{
+    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
+    META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
+};
+use crate::engine::meta::{
+    merge_operator, previous_merge_operator, read_counter, resolve_format, resolve_languages,
+    resolve_stemming, stored_format_error,
+};
+use crate::engine::view::View;
+use crate::engine::writer::{NodeCache, WriterState};
+use crate::query::{Clause, parse_query_stemmed};
 
 mod cache;
 mod config;

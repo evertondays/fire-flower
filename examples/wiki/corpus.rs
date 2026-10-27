@@ -1,15 +1,14 @@
 //! Leitura do corpus JSONL da Wikipédia.
 
-use crate::AnyResult;
-use std::io::BufRead;
-use fire_flower::Language;
-use fire_flower::analysis::index_terms;
-use fire_flower::Stopwords;
-use std::path::Path;
 use std::fs::File;
-use std::io::BufReader;
-use fire_flower::DocId;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+use fire_flower::{DocId, Language, Stopwords};
+use fire_flower::analysis::index_terms;
 use serde::Deserialize;
+
+use crate::AnyResult;
 
 #[derive(Deserialize)]
 pub(crate) struct Article {

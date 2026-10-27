@@ -1,23 +1,20 @@
 //! `wiki queries`: os conjuntos de consulta da Fase 3.
 
-use crate::AnyResult;
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use fire_flower::Stopwords;
+use fire_flower::analysis::{index_terms, tokenize};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use crate::AnyResult;
+use crate::corpus::Corpus;
 use crate::env::project_dir;
 use crate::relevance::regular_inflections;
-use rustc_hash::FxHashMap as HashMap;
-use fire_flower::analysis::index_terms;
-use fire_flower::analysis::tokenize;
-use crate::corpus::Corpus;
-use std::collections::BTreeMap;
-use crate::vocab::VocabEntry;
-use rustc_hash::FxHashSet as HashSet;
 use crate::rng::Rng;
-use crate::vocab::read_vocab;
-use std::path::PathBuf;
-use fire_flower::Stopwords;
-use std::path::Path;
+use crate::vocab::{VocabEntry, read_vocab};
 
 /// Artigos cujos tokens o `queries` guarda para sortear frases.
 pub(crate) const SNIPPET_DOCS: usize = 2000;

@@ -1,12 +1,8 @@
 //! Indexação: lotes, reindexação, rótulos, cache de nós e o que fica gravado.
 
-use fire_flower::IndexStats;
-use crate::positions;
-use crate::p;
-use fire_flower::Config;
-use fire_flower::Engine;
-use crate::sample;
-use crate::open;
+use fire_flower::{Config, Engine, IndexStats};
+
+use crate::{open, p, positions, sample};
 
 #[test]
 pub(crate) fn persists_across_reopen_and_appends() {

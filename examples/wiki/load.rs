@@ -1,25 +1,15 @@
 //! `wiki load`: carga com o monitor por janela e a divisão do tempo do commit.
 
-use crate::AnyResult;
-use crate::env::machine;
-use crate::env::write_metrics;
-use crate::env::config_json;
-use crate::env::tickers;
-use fire_flower::CommitStats;
-use serde_json::Value;
-use rustc_hash::FxHashMap as HashMap;
-use crate::env::save_result;
-use crate::env::mb;
-use crate::env::dir_size;
-use crate::env::rss;
-use std::time::Instant;
-use crate::env::swap_used;
-use crate::corpus::stem;
-use crate::corpus::Corpus;
-use fire_flower::Engine;
-use fire_flower::Config;
 use std::path::Path;
-use serde_json::json;
+use std::time::Instant;
+
+use fire_flower::{CommitStats, Config, Engine};
+use rustc_hash::FxHashMap as HashMap;
+use serde_json::{Value, json};
+
+use crate::AnyResult;
+use crate::corpus::{Corpus, stem};
+use crate::env::{config_json, dir_size, machine, mb, rss, save_result, swap_used, tickers, write_metrics};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load(

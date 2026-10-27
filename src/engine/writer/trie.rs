@@ -1,13 +1,13 @@
 //! A Trie do escritor: inserção dos termos e o cache de nós entre lotes.
 
-use crate::Result;
-use rustc_hash::FxHashMap;
-use crate::engine::view::missing_node;
-use crate::engine::view::load_node;
 use std::collections::hash_map::Entry;
-use crate::engine::keys::ROOT_ID;
-use crate::IndexBatch;
+
+use rustc_hash::FxHashMap;
+
+use crate::{IndexBatch, Result};
 use crate::codec::TrieNode;
+use crate::engine::keys::ROOT_ID;
+use crate::engine::view::{load_node, missing_node};
 
 /// Caminho na Trie do último termo inserido no commit: `ids[d]` é o nó na
 /// profundidade `d` (`ids[0]` é a raiz) e `chars` são os caracteres até ele.

@@ -12,9 +12,11 @@ use std::io::BufRead;
 use std::path::PathBuf;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use fire_flower::internals::{decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_postings};
-use fire_flower::analysis::{Analyzer, tokenize};
 use fire_flower::{Config, Engine, Posting, Stopwords};
+use fire_flower::analysis::{Analyzer, tokenize};
+use fire_flower::internals::{
+    decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_postings,
+};
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());

@@ -1,9 +1,8 @@
 //! Conjuntos de nós (`stem:<radical>`), para as flexões na consulta.
 
-use crate::codec::varint::corrupt;
-use crate::codec::varint::Reader;
 use crate::Error;
 use crate::codec::put_varint;
+use crate::codec::varint::{Reader, corrupt};
 
 /// Conjunto de nós de `stem:<radical>` (as palavras com esse radical): IDs
 /// crescentes, o primeiro inteiro e os outros como diferença.

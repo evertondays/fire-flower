@@ -1,25 +1,11 @@
 //! Diagnóstico e medição: usados pelo harness de performance (`examples/wiki.rs`).
 
-use crate::engine::view::Source;
-use crate::Result;
-use crate::engine::view::missing_node;
-use crate::codec::TrieNode;
-use crate::engine::keys::ROOT_ID;
-use crate::engine::view::load_node;
-use crate::codec::NORM_BLOCK_DOCS;
-use crate::codec::NormBlock;
-use crate::Error;
-use crate::engine::keys::NORM;
-use crate::codec;
-use crate::engine::keys::POS;
-use crate::engine::keys::Key;
-use crate::Posting;
-use crate::DocId;
+use crate::{Config, DocId, Engine, Error, Posting, Result, codec};
 use crate::analysis::normalize_term;
-use crate::engine::keys::META_NEXT_NODE;
+use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
+use crate::engine::keys::{Key, META_NEXT_NODE, NORM, POS, ROOT_ID};
 use crate::engine::meta::read_counter;
-use crate::Config;
-use crate::Engine;
+use crate::engine::view::{Source, load_node, missing_node};
 
 /// Diagnóstico e medição: usados pelo harness de performance (`examples/wiki.rs`).
 impl Engine {

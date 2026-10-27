@@ -1,28 +1,19 @@
 //! `wiki relevancia`: consultas com resposta conhecida (top-1, top-3, top-10, MRR).
 
-use std::io::Write;
-use crate::AnyResult;
-use crate::env::config_json;
-use crate::env::save_result;
-use crate::corpus::stem;
-use serde_json::Value;
-use std::time::Instant;
-use fire_flower::Config;
-use fire_flower::Engine;
-use rustc_hash::FxHashSet as HashSet;
-use fire_flower::Language;
-use fire_flower::Stemming;
-use fire_flower::analysis::tokenize;
-use fire_flower::analysis::index_terms;
-use crate::corpus::Corpus;
-use rustc_hash::FxHashMap as HashMap;
-use fire_flower::Stopwords;
-use crate::rng::Rng;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use fire_flower::DocId;
-use serde_json::json;
+use std::time::Instant;
+
+use fire_flower::{Config, DocId, Engine, Language, Stemming, Stopwords};
+use fire_flower::analysis::{index_terms, tokenize};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde_json::{Value, json};
+
+use crate::AnyResult;
+use crate::corpus::{Corpus, stem};
+use crate::env::{config_json, save_result};
+use crate::rng::Rng;
 
 /// Uma consulta com resposta conhecida: algum dos `expected` tem que vir no topo.
 pub(crate) struct RelCase {

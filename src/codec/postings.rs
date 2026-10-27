@@ -1,16 +1,10 @@
 //! Listas de documentos (`post:<id>`): (documento, tf, tf no título), e o
 //! cursor que salta blocos.
 
-use crate::codec::list::Block;
-use crate::codec::list::ListHeader;
-use crate::codec::varint::corrupt;
-use crate::Error;
-use crate::codec::varint::Reader;
-use crate::Posting;
-use crate::codec::list::write_list;
-use crate::codec::SKIP_BLOCK;
-use crate::codec::put_varint;
-use crate::DocId;
+use crate::{DocId, Error, Posting};
+use crate::codec::{SKIP_BLOCK, put_varint};
+use crate::codec::list::{Block, ListHeader, write_list};
+use crate::codec::varint::{Reader, corrupt};
 
 /// Grava em `buf` a lista `(doc, tf, tf no título)`, **ordenada por doc e
 /// sem repetições**.

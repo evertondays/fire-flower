@@ -1,27 +1,18 @@
 //! `wiki concurrent`: buscas enquanto o índice é escrito.
 
-use crate::AnyResult;
-use crate::corpus::stem;
-use crate::env::save_result;
-use serde_json::Value;
-use crate::bench::summarize;
-use crate::corpus::Corpus;
-use std::time::Instant;
-use crate::env::write_metrics;
-use std::time::Duration;
-use crate::bench::run_query;
-use std::sync::atomic::Ordering;
-use rocksdb::perf::PerfContext;
-use rocksdb::perf::PerfStatsLevel;
-use rocksdb::perf::set_perf_stats;
-use crate::bench::Sample;
-use std::sync::atomic::AtomicBool;
-use fire_flower::Config;
-use fire_flower::Engine;
-use std::sync::Arc;
-use crate::bench::read_query_sets;
 use std::path::Path;
-use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use fire_flower::{Config, Engine};
+use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
+use serde_json::{Value, json};
+
+use crate::AnyResult;
+use crate::bench::{Sample, read_query_sets, run_query, summarize};
+use crate::corpus::{Corpus, stem};
+use crate::env::{save_result, write_metrics};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queries_path: &Path, threads: usize, batch_size: usize, baseline_secs: u64, label: Option<String>) -> AnyResult {

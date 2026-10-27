@@ -1,16 +1,11 @@
 //! Top-k: os k melhores documentos sem ordenar todos.
 
-use crate::Result;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use crate::engine::view::NormCursor;
-use crate::engine::ranking::bm25::DocNorm;
-use crate::DocId;
-use crate::Hit;
-use crate::engine::ranking::bm25::Bm25;
-use crate::engine::ranking::bm25::Bound;
-use crate::Posting;
-use crate::engine::view::View;
+
+use crate::{DocId, Hit, Posting, Result};
+use crate::engine::ranking::bm25::{Bm25, Bound, DocNorm};
+use crate::engine::view::{NormCursor, View};
 
 impl View<'_> {
     /// Um termo só: a nota depende só dos tf e dos tamanhos, e o limite só

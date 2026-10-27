@@ -2,10 +2,9 @@
 //! e as posições de cada um.
 
 use rustc_hash::FxHashMap;
-use crate::analysis::stem::StemCache;
-use crate::analysis::tokenize;
-use crate::analysis::for_each_token;
-use crate::analysis::stem::Stemmer;
+
+use crate::analysis::{for_each_token, tokenize};
+use crate::analysis::stem::{StemCache, Stemmer};
 use crate::analysis::stopwords::Stopwords;
 
 /// Chama `f(termo, posição)` para cada token de `text` que não é stopword,

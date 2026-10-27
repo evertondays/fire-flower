@@ -1,25 +1,21 @@
 //! `wiki oracle`: índice ingênuo em memória comparado com o motor.
 
-use crate::AnyResult;
-use crate::env::save_result;
-use crate::corpus::stem;
-use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeMap;
-use fire_flower::query::parse_query_stemmed;
-use fire_flower::analysis::index_terms;
-use crate::corpus::Corpus;
-use fire_flower::Engine;
-use crate::rng::Rng;
-use std::time::Instant;
-use fire_flower::query::Clause;
-use rustc_hash::FxHashMap as HashMap;
-use fire_flower::DocId;
-use fire_flower::Config;
 use std::path::PathBuf;
+use std::time::Instant;
+
+use fire_flower::{Config, DocId, Engine};
+use fire_flower::analysis::index_terms;
+use fire_flower::query::{Clause, parse_query_stemmed};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::json;
 
+use crate::AnyResult;
+use crate::corpus::{Corpus, stem};
+use crate::env::save_result;
+use crate::rng::Rng;
 use self::check::Check;
-use self::index::{doc_tokens, trie_order, OPos, OTerm, Oracle};
+use self::index::{OPos, OTerm, Oracle, doc_tokens, trie_order};
 
 mod check;
 mod index;

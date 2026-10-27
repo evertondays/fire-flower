@@ -170,12 +170,15 @@ pela metade.
 Explicação completa, com o que é o RocksDB, um banco real byte a byte e os
 fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
-| Camada | Arquivo | Responsabilidade |
+| Camada | Onde | Responsabilidade |
 |---|---|---|
-| Interface | `src/main.rs` + `src/tui.rs` | subcomandos (clap) e busca interativa (ratatui) |
-| Texto | `src/text.rs` | remove HTML, acentos (NFKD), pontuação; minúsculas; tokens > 64 caracteres são descartados |
-| Índice (Trie) | `src/engine.rs` | travessia e criação de nós, busca, prefixo, autocompletar |
-| Armazenamento | `src/engine.rs` + `src/codec.rs` | chaves no RocksDB e serialização binária |
+| Interface | `src/bin/fire-flower/` | subcomandos (clap), `index-jsonl` e busca interativa (`tui/`, ratatui) |
+| Texto | `src/analysis/` | remove HTML, acentos (NFKD), pontuação; minúsculas; tokens > 64 caracteres são descartados; stopwords e stemming |
+| Consulta | `src/query/` | separa a consulta em termos, prefixos (`termo*`) e frases (`"..."`) |
+| Índice (Trie) | `src/engine/` | indexação (`writer/`), busca, prefixo, frases, ranking (`ranking/`), autocompletar |
+| Armazenamento | `src/engine/` + `src/codec/` | chaves no RocksDB e serialização binária (um arquivo por formato) |
+
+O mapa arquivo por arquivo está em [docs/como-funciona.md](docs/como-funciona.md#9-mapa-do-código).
 
 ### Chaves no RocksDB
 
@@ -275,7 +278,7 @@ python3 scripts/perf.py tudo --escala 10k
   palavras sem relação (`coreia` e `cor` viram `cor`).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam
-  valendo (`de*` acha "dezembro"). As listas estão em `src/stopwords/*.txt`;
+  valendo (`de*` acha "dezembro"). As listas estão em `src/analysis/stopwords/*.txt`;
   para usar outro idioma, crie o banco com `--idiomas en` (ou `nenhum`).
 
 ## Compilação

@@ -22,7 +22,7 @@ falta tem uma causa comum: ler listas inteiras de termos muito frequentes
 
 ## Como rodar
 
-Tudo está em `examples/wiki.rs` (o harness) e é orquestrado por
+Tudo está em `examples/wiki/` (o harness) e é orquestrado por
 `scripts/perf.py`. A escala define a maior fatia do corpus usada.
 
 ```bash
@@ -119,7 +119,7 @@ VHD. Números de outra máquina não são comparáveis com os daqui.
 
 ## 4. Ferramentas e harness
 
-### Harness: `examples/wiki.rs`
+### Harness: `examples/wiki/`
 
 | Subcomando | O que faz |
 |---|---|

@@ -725,7 +725,7 @@ def phase_long_load(scale, reproduce=False):
     """Cenário do colapso da carga: a velocidade caía de ~5.000 para ~200
     artigos/s em pontos diferentes (200k, 500k, 600k) da Wikipédia inteira.
     Causa: filtros de Bloom de um bloco só, maiores que uma parte do block
-    cache (ver `bloom_filters_larger_than_...` em tests/engine.rs). O `wiki
+    cache (ver `bloom_filters_larger_than_...` em tests/engine/storage.rs). O `wiki
     load` acompanha a carga em janelas de 10k artigos e acusa a primeira cuja
     velocidade (MB/s) cai abaixo de 20% da mediana das anteriores.
 

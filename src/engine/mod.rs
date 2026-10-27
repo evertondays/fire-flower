@@ -307,6 +307,26 @@ impl Engine {
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     }
 
+    /// Percorre os rótulos de todos os documentos (`f(documento, rótulo)`),
+    /// em ordem de chave. Lê só as chaves `doc:`: serve para achar um
+    /// documento pelo rótulo (o `index --sync` da CLI acha assim os arquivos
+    /// já indexados).
+    pub fn for_each_label(&self, mut f: impl FnMut(DocId, &str)) -> Result<()> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_upper_bound(b"doc;".to_vec()); // ';' vem logo depois de ':'
+        let mode = rocksdb::IteratorMode::From(DOC, rocksdb::Direction::Forward);
+        for item in self.db.iterator_opt(mode, opts) {
+            let (key, value) = item?;
+            let doc = key
+                .strip_prefix(DOC)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .and_then(|d| d.parse().ok())
+                .ok_or_else(|| Error::Corrupt(format!("chave de rótulo inválida: {}", String::from_utf8_lossy(&key))))?;
+            f(doc, &String::from_utf8_lossy(&value));
+        }
+        Ok(())
+    }
+
     /// Tamanho do documento (tokens indexados, sem stopwords), se ele existe.
     pub fn doc_len(&self, doc_id: DocId) -> Result<Option<u32>> {
         let view = self.view();

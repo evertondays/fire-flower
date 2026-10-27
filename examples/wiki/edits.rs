@@ -82,7 +82,10 @@ struct Sources {
 }
 
 fn sources(corpus: &Path, take: u64, ops: &[Edit]) -> AnyResult<Sources> {
-    let donors_needed = ops.iter().filter(|e| matches!(e, Edit::Update { .. })).count() as u64;
+    // Os doadores são numerados no plano inteiro: com `--max-ops`, o corte
+    // pode usar o 339º sem usar todos os anteriores.
+    let donors_needed =
+        ops.iter().filter_map(|e| if let Edit::Update { donor, .. } = e { Some(*donor as u64 + 1) } else { None }).max().unwrap_or(0);
     let readd: HashSet<DocId> = ops.iter().filter_map(|e| if let Edit::Readd(id) = e { Some(*id) } else { None }).collect();
     let mut originals = HashMap::default();
     for doc in Corpus::open(corpus, 0, Some(take), false)? {

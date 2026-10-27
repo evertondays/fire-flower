@@ -1,0 +1,6 @@
+# Só Cargo.toml, Cargo.lock, src/ e benches/ entram na imagem.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!benches/

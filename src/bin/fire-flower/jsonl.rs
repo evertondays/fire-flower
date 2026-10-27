@@ -120,9 +120,11 @@ fn report(progress: &mut Progress, started: Instant, json: bool) {
     } else {
         let pct = progress.bytes as f64 * 100.0 / progress.bytes_total.max(1) as f64;
         let rate = progress.documents as f64 / progress.seconds.max(0.001);
-        eprint!(
-            "\r\x1b[2K{pct:5.1}%  {} documentos  {rate:.0}/s  {}",
-            progress.documents, progress.phase
-        );
+        let phase = match progress.phase {
+            "writing" => "gravando",
+            "done" => "fim",
+            _ => "indexando",
+        };
+        eprint!("\r\x1b[2K{pct:5.1}%  {} documentos  {rate:.0}/s  {phase}", progress.documents);
     }
 }

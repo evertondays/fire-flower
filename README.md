@@ -28,6 +28,48 @@ Suporta:
 
 ## Uso
 
+### Docker (sem instalar nada)
+
+A imagem tem só a linha de comando, para amd64 e arm64 (Mac M1/M2 inclusive).
+A pasta atual vira `/data` dentro do container: bancos e documentos são
+caminhos relativos a ela.
+
+```bash
+docker pull ghcr.io/evertondays/fire-flower
+```
+
+```bash
+# indexa a pasta documentos/ num banco chamado meu-banco (criado na pasta atual)
+docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower index meu-banco documentos/
+
+# busca
+docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower search meu-banco "casa de papel"
+
+# busca interativa (precisa do -it)
+docker run --rm -it -v "$PWD:/data" ghcr.io/evertondays/fire-flower tui meu-banco
+```
+
+Com um alias, fica igual ao binário:
+
+```bash
+alias fire-flower='docker run --rm -it -v "$PWD:/data" ghcr.io/evertondays/fire-flower'
+
+fire-flower index meu-banco documentos/
+fire-flower tui meu-banco
+```
+
+- **Tags:** `latest` (última versão), `0.1.0` etc. (versões fixas) e `main`
+  (o que está na branch principal).
+- **Linux com UID diferente de 1000:** o container roda como o usuário 1000;
+  para os bancos ficarem com o seu dono, acrescente
+  `--user "$(id -u):$(id -g)"`.
+- **Windows (PowerShell):** troque `"$PWD:/data"` por `"${PWD}:/data"`.
+- **Em scripts, sem terminal:** tire o `-it` (o Docker recusa `-t` sem
+  terminal).
+- **Compilar a imagem localmente:** `docker build -t fire-flower .` (a primeira
+  vez leva uns minutos, por causa do RocksDB; depois só o fire-flower
+  recompila).
+
 ### Linha de comando
 
 ```bash

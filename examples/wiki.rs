@@ -68,27 +68,27 @@ enum Cmd {
         #[arg(long)]
         streaming: bool,
         /// Nós da Trie que o escritor guarda entre lotes (0 desliga o cache)
-        #[arg(long)]
-        cache_nos: Option<usize>,
+        #[arg(long = "cache-nos", value_name = "CACHE_NOS")]
+        node_cache: Option<usize>,
         /// Idiomas das stopwords de um banco novo ("pt,en", "en" ou "nenhum").
         /// Sem a opção, usa o que está gravado no banco (ou pt,en)
-        #[arg(long)]
-        idiomas: Option<String>,
+        #[arg(long = "idiomas", value_name = "IDIOMAS")]
+        languages: Option<String>,
         /// Cria o banco sem posições (sem busca por frase)
-        #[arg(long)]
-        sem_posicoes: bool,
+        #[arg(long = "sem-posicoes")]
+        no_positions: bool,
         /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "nenhum"). Sem a opção,
         /// usa o que está gravado no banco (ou nenhum)
         #[arg(long)]
         stemming: Option<String>,
         /// Flexões na consulta num banco novo: o stemmer do mapa `stem:` ("pt",
         /// "pt-plural" ou "nenhum"). Sem a opção, usa o que está gravado
-        #[arg(long)]
-        flexoes: Option<String>,
+        #[arg(long = "flexoes", value_name = "FLEXOES")]
+        inflections: Option<String>,
         /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
         /// colapso da carga quando o filtro passa de uma parte do block cache
-        #[arg(long)]
-        filtro_inteiro: bool,
+        #[arg(long = "filtro-inteiro")]
+        whole_filter: bool,
         #[arg(long)]
         label: Option<String>,
     },
@@ -97,8 +97,8 @@ enum Cmd {
         #[arg(long)]
         corpus: PathBuf,
         /// Idiomas das stopwords, como no banco que será medido
-        #[arg(long, default_value = "pt,en")]
-        idiomas: String,
+        #[arg(long = "idiomas", value_name = "IDIOMAS", default_value = "pt,en")]
+        languages: String,
         #[arg(long)]
         take: Option<u64>,
         #[arg(long)]
@@ -111,8 +111,8 @@ enum Cmd {
         #[arg(long)]
         corpus: PathBuf,
         /// Idiomas das stopwords, como no banco que será medido
-        #[arg(long, default_value = "pt,en")]
-        idiomas: String,
+        #[arg(long = "idiomas", value_name = "IDIOMAS", default_value = "pt,en")]
+        languages: String,
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[arg(long, default_value_t = 1000)]
@@ -149,12 +149,13 @@ enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[command(flatten)]
-        flexoes: FlexoesArgs,
+        inflections: InflectionArgs,
         #[arg(long)]
         label: Option<String>,
     },
     /// Avalia a ordenação com consultas de resposta conhecida (docs/plano-relevancia.md)
-    Relevancia {
+    #[command(name = "relevancia")]
+    Relevance {
         #[arg(long)]
         db: PathBuf,
         #[arg(long)]
@@ -173,19 +174,19 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         per_set: usize,
         /// Gera os conjuntos de novo mesmo que já existam
-        #[arg(long)]
-        gerar: bool,
+        #[arg(long = "gerar")]
+        generate: bool,
         /// Peso do título no BM25F (padrão: o do Config)
-        #[arg(long)]
-        peso_titulo: Option<f64>,
+        #[arg(long = "peso-titulo", value_name = "PESO_TITULO")]
+        title_weight: Option<f64>,
         /// `b` do título no BM25F (padrão: o do Config)
-        #[arg(long)]
-        b_titulo: Option<f64>,
+        #[arg(long = "b-titulo", value_name = "B_TITULO")]
+        title_b: Option<f64>,
         /// Não imprime as consultas à mão (para a grade)
-        #[arg(long)]
-        resumo: bool,
+        #[arg(long = "resumo")]
+        brief: bool,
         #[command(flatten)]
-        flexoes: FlexoesArgs,
+        inflections: InflectionArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -208,12 +209,12 @@ enum Cmd {
         #[arg(long)]
         perf_time: bool,
         /// Profundidade do cache de nós das buscas ("nenhum" desliga)
-        #[arg(long)]
-        cache_leitura: Option<String>,
+        #[arg(long = "cache-leitura", value_name = "CACHE_LEITURA")]
+        reader_cache: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
         #[command(flatten)]
-        flexoes: FlexoesArgs,
+        inflections: InflectionArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -253,45 +254,45 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, flexoes, filtro_inteiro, label } => {
-            let languages = idiomas.as_deref().map(parse_languages).transpose()?;
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, label } => {
+            let languages = languages.as_deref().map(parse_languages).transpose()?;
             let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)"));
             let stemming = stemming.map(code).transpose()?;
-            let inflections = flexoes.map(code).transpose()?;
+            let inflections = inflections.map(code).transpose()?;
             let config = Config {
                 block_cache_bytes: cache_mb << 20,
-                writer_cache_nodes: cache_nos.unwrap_or(Config::default().writer_cache_nodes),
+                writer_cache_nodes: node_cache.unwrap_or(Config::default().writer_cache_nodes),
                 languages,
-                positions: sem_posicoes.then_some(false),
+                positions: no_positions.then_some(false),
                 stemming,
                 inflections,
-                partition_filters: !filtro_inteiro,
+                partition_filters: !whole_filter,
                 statistics: true,
                 ..Config::default()
             };
             load(&db, &corpus, batch, skip, take, remap_ids, streaming, config, label)
         }
-        Cmd::Vocab { corpus, idiomas, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&idiomas)?), take, out),
-        Cmd::Queries { vocab, corpus, idiomas, seed, per_set, out } => {
-            queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&idiomas)?), seed, per_set, out)
+        Cmd::Vocab { corpus, languages, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&languages)?), take, out),
+        Cmd::Queries { vocab, corpus, languages, seed, per_set, out } => {
+            queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&languages)?), seed, per_set, out)
         }
-        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, flexoes, label } => {
-            let config = flexoes.apply(Config::default())?;
+        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, label } => {
+            let config = inflections.apply(Config::default())?;
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, label })
         }
-        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, flexoes, label } => {
+        Cmd::Relevance { db, corpus, sets, manual, take, seed, per_set, generate, title_weight, title_b, brief, inflections, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
             let defaults = Config::default();
-            let config = flexoes.apply(Config {
-                title_weight: peso_titulo.unwrap_or(defaults.title_weight),
-                title_b: b_titulo.unwrap_or(defaults.title_b),
+            let config = inflections.apply(Config {
+                title_weight: title_weight.unwrap_or(defaults.title_weight),
+                title_b: title_b.unwrap_or(defaults.title_b),
                 ..defaults
             })?;
-            relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
+            run_relevance(&db, &corpus, &sets, &manual, take, seed, per_set, generate, config, brief, label)
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, flexoes, label } => {
-            let mut config = flexoes.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
-            if let Some(depth) = cache_leitura {
+        Cmd::Bench { db, queries, threads, passes, cold, perf_time, reader_cache, cache_mb, inflections, label } => {
+            let mut config = inflections.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
+            if let Some(depth) = reader_cache {
                 config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
             }
             bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, config, label)
@@ -307,21 +308,21 @@ fn main() -> AnyResult {
 /// Peso e modo das flexões na consulta (valem por busca; o banco precisa ter
 /// sido criado com `--flexoes`).
 #[derive(clap::Args)]
-struct FlexoesArgs {
+struct InflectionArgs {
     /// α: quanto as flexões valem perto da palavra exata (0 a 1)
-    #[arg(long)]
-    peso_flexoes: Option<f64>,
+    #[arg(long = "peso-flexoes", value_name = "PESO_FLEXOES")]
+    inflection_weight: Option<f64>,
     /// "sempre" ou N: só quando a busca exata acha menos de N documentos
-    #[arg(long)]
-    modo_flexoes: Option<String>,
+    #[arg(long = "modo-flexoes", value_name = "MODO_FLEXOES")]
+    inflection_mode: Option<String>,
 }
 
-impl FlexoesArgs {
+impl InflectionArgs {
     fn apply(&self, mut config: Config) -> AnyResult<Config> {
-        if let Some(w) = self.peso_flexoes {
+        if let Some(w) = self.inflection_weight {
             config.inflection_weight = w;
         }
-        if let Some(m) = &self.modo_flexoes {
+        if let Some(m) = &self.inflection_mode {
             config.inflection_mode = match m.as_str() {
                 "sempre" => fire_flower::InflectionMode::Always,
                 n => fire_flower::InflectionMode::IfFewer(n.parse().map_err(|_| format!("modo das flexões: {m:?} (use sempre ou um número)"))?),
@@ -951,8 +952,8 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     let band = |lo: u32, hi: u32| -> Vec<&str> {
         vocab.iter().filter(|v| v.df >= lo && v.df <= hi).map(|v| v.term.as_str()).collect()
     };
-    let raro = band(1, 10);
-    let medio = band(100, 10_000);
+    let rare = band(1, 10);
+    let medium = band(100, 10_000);
     let freq = band(100_000, u32::MAX);
     let freq = if freq.is_empty() {
         // Corpus pequeno: os 50 termos mais frequentes fazem o papel.
@@ -971,8 +972,8 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     let sample = |rng: &mut Rng, pool: &[&str]| -> Vec<String> {
         if pool.is_empty() { Vec::new() } else { (0..per_set).map(|_| rng.pick(pool).to_string()).collect() }
     };
-    sets.insert("t-raro".into(), sample(&mut rng, &raro));
-    sets.insert("t-medio".into(), sample(&mut rng, &medio));
+    sets.insert("t-raro".into(), sample(&mut rng, &rare));
+    sets.insert("t-medio".into(), sample(&mut rng, &medium));
     sets.insert("t-freq".into(), sample(&mut rng, &freq));
     for len in [3, 8, 15] {
         sets.insert(format!("t-len-{len}"), sample(&mut rng, &by_len(len)));
@@ -983,7 +984,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     while miss.len() < per_set {
         let candidate = match miss.len() % 4 {
             0 | 1 => {
-                let base = rng.pick(&medio);
+                let base = rng.pick(&medium);
                 let extra = (b'a' + rng.below(26) as u8) as char;
                 format!("{base}{extra}")
             }
@@ -999,13 +1000,13 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     let and_of = |rng: &mut Rng, pools: &[&[&str]]| -> String {
         pools.iter().map(|p| *rng.pick(p)).collect::<Vec<_>>().join(" ")
     };
-    sets.insert("and-raro-freq".into(), (0..per_set).map(|_| and_of(&mut rng, &[&raro, &freq])).collect());
+    sets.insert("and-raro-freq".into(), (0..per_set).map(|_| and_of(&mut rng, &[&rare, &freq])).collect());
     sets.insert(
         "and-freq".into(),
         (0..per_set).map(|i| if i % 2 == 0 { and_of(&mut rng, &[&freq, &freq]) } else { and_of(&mut rng, &[&freq, &freq, &freq]) }).collect(),
     );
     for n in [2usize, 3, 5] {
-        let pools = vec![&medio[..]; n];
+        let pools = vec![&medium[..]; n];
         sets.insert(format!("and-{n}"), (0..per_set).map(|_| and_of(&mut rng, &pools)).collect());
     }
 
@@ -1019,7 +1020,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     let prefix_set = |rng: &mut Rng, lo: usize, hi: usize| -> Vec<String> {
         let mut out = Vec::new();
         while out.len() < per_set {
-            let term = rng.pick(&medio);
+            let term = rng.pick(&medium);
             let n = rng.range(lo, hi);
             if term.chars().count() >= n {
                 out.push(cut(term, n));
@@ -1030,17 +1031,17 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     let p1 = prefix_set(&mut rng, 1, 1);
     let p2 = prefix_set(&mut rng, 2, 3);
     let p4 = prefix_set(&mut rng, 4, 6);
-    let mut praro = Vec::new();
+    let mut p_rare = Vec::new();
     let mut attempts = 0;
-    while praro.len() < per_set && attempts < per_set * 50 {
+    while p_rare.len() < per_set && attempts < per_set * 50 {
         attempts += 1;
-        let term = rng.pick(&raro);
+        let term = rng.pick(&rare);
         let chars = term.chars().count();
         if let Some(n) = (3..=chars).find(|&n| completions(&cut(term, n)) <= 5) {
-            praro.push(cut(term, n));
+            p_rare.push(cut(term, n));
         }
     }
-    for (name, list) in [("1", &p1), ("2", &p2), ("4", &p4), ("raro", &praro)] {
+    for (name, list) in [("1", &p1), ("2", &p2), ("4", &p4), ("raro", &p_rare)] {
         sets.insert(format!("p-{name}"), list.iter().map(|p| format!("{p}*")).collect());
         sets.insert(format!("s-{name}"), list.clone());
     }
@@ -1081,7 +1082,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     sets.insert("titulos".into(), titles);
 
     // Misto: 70% títulos/termos médios, 20% AND, 10% prefixo.
-    let mut misto = Vec::new();
+    let mut mixed = Vec::new();
     for i in 0..per_set {
         let source = match i % 10 {
             0..=3 => "titulos",
@@ -1090,9 +1091,9 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
             8 => "and-raro-freq",
             _ => "p-4",
         };
-        misto.push(rng.pick(&sets[source]).clone());
+        mixed.push(rng.pick(&sets[source]).clone());
     }
-    sets.insert("misto".into(), misto);
+    sets.insert("misto".into(), mixed);
 
     // Frases (Fase E do plano de frases e ranking), tiradas de trechos reais.
     let df: HashMap<&str, u32> = vocab.iter().map(|v| (v.term.as_str(), v.df)).collect();
@@ -1164,7 +1165,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     // também está no índice (para medir o custo de somar as flexões). Gerador
     // próprio: os conjuntos acima não mudam.
     let mut frng = Rng(seed ^ 0xf1e0_5eed);
-    let with_other: Vec<&str> = medio
+    let with_other: Vec<&str> = medium
         .iter()
         .copied()
         .filter(|t| regular_inflections(t).iter().any(|v| df.get(v.as_str()).is_some_and(|&n| n >= 10)))
@@ -2440,7 +2441,7 @@ fn rank_of(engine: &Engine, case: &RelCase) -> AnyResult<(Option<usize>, Vec<Doc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn relevancia(
+fn run_relevance(
     db: &Path,
     corpus: &Path,
     sets_dir: &Path,
@@ -2448,9 +2449,9 @@ fn relevancia(
     take: Option<u64>,
     seed: u64,
     per_set: usize,
-    gerar: bool,
+    generate: bool,
     config: Config,
-    resumo: bool,
+    brief: bool,
     label: Option<String>,
 ) -> AnyResult {
     let started = Instant::now();
@@ -2459,11 +2460,11 @@ fn relevancia(
     std::fs::create_dir_all(sets_dir)?;
 
     let missing = REL_SETS.iter().any(|(name, _)| !sets_dir.join(format!("{name}.tsv")).exists());
-    if gerar || missing {
+    if generate || missing {
         eprintln!("gerando conjuntos em {}", sets_dir.display());
         for (name, cases) in generate_rel_sets(corpus, take, &stopwords, seed, per_set)? {
             let path = sets_dir.join(format!("{name}.tsv"));
-            if gerar || !path.exists() {
+            if generate || !path.exists() {
                 write_rel_set(&path, &cases)?;
             }
         }
@@ -2474,9 +2475,9 @@ fn relevancia(
     }
     sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
     // Flexões escritas à mão, ao lado do `manual.tsv`.
-    let flexao_manual = manual.with_file_name("flexao-manual.tsv");
-    if flexao_manual.exists() {
-        sets.push(("rel-flexao-manual".into(), 3, read_manual(&flexao_manual, corpus, take)?));
+    let inflection_manual = manual.with_file_name("flexao-manual.tsv");
+    if inflection_manual.exists() {
+        sets.push(("rel-flexao-manual".into(), 3, read_manual(&inflection_manual, corpus, take)?));
     }
 
     let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
@@ -2519,7 +2520,7 @@ fn relevancia(
         results.push(json!({ "conjunto": name, "consultas": cases.len(), "acerto_ate": hit_at, "top1": top1, "top3": top3,
                              "top10": top10, "mrr": mrr, "fora_do_top1000": out, "erros": misses }));
     }
-    if !resumo {
+    if !brief {
         println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
         for line in &manual_lines {
             println!("{line}");

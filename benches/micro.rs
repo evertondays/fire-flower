@@ -74,7 +74,7 @@ fn bench_postings(c: &mut Criterion) {
     let Some(engine) = open_db() else { return };
     // Os termos mais frequentes que não são stopwords ("de" e "em" não são mais indexados).
     let area = engine.term_postings("area").unwrap();
-    let em = engine.postings("populacao").unwrap();
+    let population = engine.postings("populacao").unwrap();
     let rare = engine.postings("astrofisica").unwrap();
     let area_docs: Vec<u64> = area.iter().map(|p| p.doc).collect();
     let area_bytes = encode_postings(&area);
@@ -111,8 +111,8 @@ fn bench_postings(c: &mut Criterion) {
     g.bench_function(format!("intersect_raro{}_x_area{}", rare.len(), area.len()), |b| {
         b.iter(|| intersect(black_box(&rare), black_box(&area_docs)))
     });
-    g.bench_function(format!("intersect_populacao{}_x_area{}", em.len(), area.len()), |b| {
-        b.iter(|| intersect(black_box(&em), black_box(&area_docs)))
+    g.bench_function(format!("intersect_populacao{}_x_area{}", population.len(), area.len()), |b| {
+        b.iter(|| intersect(black_box(&population), black_box(&area_docs)))
     });
     g.finish();
 }

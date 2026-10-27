@@ -17,101 +17,111 @@ struct Cli {
     command: Command,
 }
 
+// Os nomes das opções e dos valores ficam em português (são a interface da
+// CLI); os campos, em inglês.
 #[derive(Subcommand)]
 enum Command {
     /// Busca interativa com autocompletar
     #[command(visible_alias = "ui")]
     Tui {
         /// Pasta do banco
-        banco: PathBuf,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
     },
     /// Indexa arquivos de texto/HTML (pastas recursivamente)
     Index {
         /// Pasta do banco (criada se não existir)
-        banco: PathBuf,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
         /// Arquivos ou pastas
-        #[arg(required = true)]
-        caminhos: Vec<PathBuf>,
+        #[arg(required = true, value_name = "CAMINHOS")]
+        paths: Vec<PathBuf>,
         #[command(flatten)]
-        idiomas: Idiomas,
+        languages: LanguageArgs,
         #[command(flatten)]
-        posicoes: Posicoes,
+        positions: PositionArgs,
         #[command(flatten)]
-        radicais: Radicais,
+        stemming: StemmingArgs,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
     IndexJsonl {
         /// Pasta do banco (criada se não existir)
-        banco: PathBuf,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
         /// Arquivo .jsonl
-        arquivo: PathBuf,
+        #[arg(value_name = "ARQUIVO")]
+        file: PathBuf,
         /// Documentos por commit
-        #[arg(long, default_value_t = 10000)]
-        lote: usize,
+        #[arg(long = "lote", value_name = "LOTE", default_value_t = 10000)]
+        batch: usize,
         /// Pula as N primeiras linhas (para retomar uma carga interrompida)
-        #[arg(long, default_value_t = 0)]
-        pular: u64,
+        #[arg(long = "pular", value_name = "PULAR", default_value_t = 0)]
+        skip: u64,
         /// Emite o progresso como JSON na saída padrão
-        #[arg(long)]
-        progresso_json: bool,
+        #[arg(long = "progresso-json")]
+        progress_json: bool,
         #[command(flatten)]
-        idiomas: Idiomas,
+        languages: LanguageArgs,
         #[command(flatten)]
-        posicoes: Posicoes,
+        positions: PositionArgs,
         #[command(flatten)]
-        radicais: Radicais,
+        stemming: StemmingArgs,
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos
     Compact {
-        banco: PathBuf,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
     },
     /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
     /// Os resultados saem por relevância (BM25), com a nota.
     Search {
-        banco: PathBuf,
-        #[arg(required = true)]
-        consulta: Vec<String>,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
+        #[arg(required = true, value_name = "CONSULTA")]
+        query: Vec<String>,
         /// Quantos resultados imprimir
-        #[arg(short = 'n', long, default_value_t = 50)]
-        limite: usize,
+        #[arg(short = 'n', long = "limite", value_name = "LIMITE", default_value_t = 50)]
+        limit: usize,
         /// Ordena por ID do documento, sem ranking
-        #[arg(long)]
-        por_id: bool,
+        #[arg(long = "por-id")]
+        by_id: bool,
     },
     /// Autocompletar: palavras indexadas que começam com o prefixo
     Suggest {
-        banco: PathBuf,
-        prefixo: String,
-        #[arg(default_value_t = 10)]
-        limite: usize,
+        #[arg(value_name = "BANCO")]
+        db: PathBuf,
+        #[arg(value_name = "PREFIXO")]
+        prefix: String,
+        #[arg(default_value_t = 10, value_name = "LIMITE")]
+        limit: usize,
     },
 }
 
 #[derive(clap::Args)]
-struct Idiomas {
+struct LanguageArgs {
     /// Idiomas das stopwords de um banco novo: códigos separados por vírgula
     /// (pt, en) ou "nenhum". Padrão: pt,en. Num banco existente, precisa
     /// combinar com o que foi gravado na criação.
-    #[arg(long, value_parser = parse_idiomas)]
-    idiomas: Option<ListaIdiomas>,
+    #[arg(long = "idiomas", value_name = "IDIOMAS", value_parser = parse_languages)]
+    languages: Option<LanguageList>,
 }
 
 #[derive(clap::Args)]
-struct Posicoes {
+struct PositionArgs {
     /// Cria o banco sem posições: menor e mais rápido de carregar, mas sem
     /// busca por frase. Num banco existente, precisa combinar com a criação.
-    #[arg(long)]
-    sem_posicoes: bool,
+    #[arg(long = "sem-posicoes")]
+    no_positions: bool,
 }
 
 #[derive(clap::Args)]
-struct Radicais {
+struct StemmingArgs {
     /// Flexões na consulta num banco novo (o recomendado para achar plurais):
     /// "pt-plural" ("planetas" acha "Planeta", com a palavra exata valendo
     /// mais), "pt" (Snowball) ou "nenhum" (o padrão). Não combina com
     /// --stemming. Num banco existente, precisa combinar com a criação.
-    #[arg(long, value_parser = parse_stemming)]
-    flexoes: Option<Stemming>,
+    #[arg(long = "flexoes", value_name = "FLEXOES", value_parser = parse_stemming)]
+    inflections: Option<Stemming>,
     /// Stemming de um banco novo: "pt" (Snowball do português, "correndo"
     /// acha "corrida"), "pt-plural" (só o plural: "casas" acha "casa"), "en",
     /// "en-plural" ou "nenhum" (o padrão). Num banco existente, precisa
@@ -124,26 +134,26 @@ fn parse_stemming(s: &str) -> Result<Stemming, String> {
     Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, pt-plural, en, en-plural ou \"nenhum\""))
 }
 
-impl Posicoes {
+impl PositionArgs {
     /// `None` (usa o que o banco tiver) quando a opção não foi dada.
     fn config(&self) -> Option<bool> {
-        self.sem_posicoes.then_some(false)
+        self.no_positions.then_some(false)
     }
 }
 
 /// Lista de idiomas já validada (o clap precisa de um tipo só para o valor).
 #[derive(Clone)]
-struct ListaIdiomas(Vec<Language>);
+struct LanguageList(Vec<Language>);
 
-fn parse_idiomas(s: &str) -> Result<ListaIdiomas, String> {
+fn parse_languages(s: &str) -> Result<LanguageList, String> {
     if s.trim().eq_ignore_ascii_case("nenhum") {
-        return Ok(ListaIdiomas(Vec::new()));
+        return Ok(LanguageList(Vec::new()));
     }
     let valid = || Language::ALL.iter().map(|l| l.code()).collect::<Vec<_>>().join(", ");
     s.split(',')
         .map(|c| Language::from_code(c).ok_or_else(|| format!("idioma desconhecido {c:?}; use {} ou \"nenhum\"", valid())))
         .collect::<Result<_, _>>()
-        .map(ListaIdiomas)
+        .map(LanguageList)
 }
 
 /// Documentos por commit. Limita a memória usada pelo lote.
@@ -153,30 +163,30 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { banco } => open(&banco, None, None, None).and_then(|engine| {
-            tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
+        Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
+            tui::run(&engine, &db.display().to_string()).map_err(Into::into)
         }),
-        Command::Index { banco, caminhos, idiomas, posicoes, radicais } => {
-            index(&banco, &caminhos, idiomas.idiomas, posicoes.config(), radicais)
+        Command::Index { db, paths, languages, positions, stemming } => {
+            index(&db, &paths, languages.languages, positions.config(), stemming)
         }
-        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas, posicoes, radicais } => {
-            let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
-            open(&banco, idiomas.idiomas, posicoes.config(), Some(radicais)).and_then(|engine| {
-                if !progresso_json {
+        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming } => {
+            let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
+            open(&db, languages.languages, positions.config(), Some(stemming)).and_then(|engine| {
+                if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
                     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
                 }
-                jsonl::index(&engine, &arquivo, &opts)
+                jsonl::index(&engine, &file, &opts)
             })
         }
-        Command::Compact { banco } => open(&banco, None, None, None).map(|engine| {
+        Command::Compact { db } => open(&db, None, None, None).map(|engine| {
             let started = Instant::now();
             engine.compact();
             println!("compactado em {:.2?}", started.elapsed());
         }),
-        Command::Search { banco, consulta, limite, por_id } => search(&banco, &consulta.join(" "), limite, por_id),
-        Command::Suggest { banco, prefixo, limite } => suggest(&banco, &prefixo, limite),
+        Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
+        Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -187,27 +197,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `idiomas`, `posicoes` e `radicais` só importam na criação;
-/// `None` usa o que está gravado.
+/// Abre o banco. `languages`, `positions` e `stemming` só importam na
+/// criação; `None` usa o que está gravado.
 fn open(
     db: &Path,
-    idiomas: Option<ListaIdiomas>,
-    posicoes: Option<bool>,
-    radicais: Option<Radicais>,
+    languages: Option<LanguageList>,
+    positions: Option<bool>,
+    stemming: Option<StemmingArgs>,
 ) -> Result<Engine, Box<dyn std::error::Error>> {
-    let (stemming, inflections) = radicais.map_or((None, None), |r| (r.stemming, r.flexoes));
-    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, stemming, inflections, ..Config::default() };
+    let (stemming, inflections) = stemming.map_or((None, None), |s| (s.stemming, s.inflections));
+    let config = Config { languages: languages.map(|l| l.0), positions, stemming, inflections, ..Config::default() };
     Ok(Engine::open(db, config)?)
 }
 
 fn index(
     db: &Path,
     paths: &[PathBuf],
-    idiomas: Option<ListaIdiomas>,
-    posicoes: Option<bool>,
-    radicais: Radicais,
+    languages: Option<LanguageList>,
+    positions: Option<bool>,
+    stemming: StemmingArgs,
 ) -> AnyResult {
-    let engine = open(db, idiomas, posicoes, Some(radicais))?;
+    let engine = open(db, languages, positions, Some(stemming))?;
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
     let started = Instant::now();

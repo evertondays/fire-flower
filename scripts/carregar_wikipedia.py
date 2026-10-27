@@ -56,9 +56,9 @@ def num(n):
     return f"{int(n):,}".replace(",", ".")
 
 
-def dec(x, casas=1):
+def dec(x, decimals=1):
     """1234.5 -> '1.234,5'"""
-    s = f"{x:,.{casas}f}"
+    s = f"{x:,.{decimals}f}"
     return s.replace(",", "_").replace(".", ",").replace("_", ".")
 
 
@@ -146,9 +146,9 @@ def git_commit():
 # -------------------------------------------------------------------- painel
 
 class Dashboard:
-    def __init__(self, corpus, banco, total_lines, skip):
+    def __init__(self, corpus, db, total_lines, skip):
         self.corpus = corpus
-        self.banco = banco
+        self.db = db
         self.total_lines = total_lines
         self.skip = skip
         self.drawn_lines = 0
@@ -180,29 +180,29 @@ class Dashboard:
         if self.swap_start is None:
             self.swap_start = swap_used
         if final or now - self.db_size_at > DB_SIZE_EVERY_SECONDS:
-            self.db_size = dir_size(self.banco)
+            self.db_size = dir_size(self.db)
             self.db_size_at = now
 
         total_bytes = max(p["bytes_total"], 1)
         fraction = p["bytes"] / total_bytes
         remaining = (total_bytes - p["bytes"]) / bytes_rate if bytes_rate > 0 else None
 
-        fase = {
+        phase = {
             "indexando": f"{GREEN}● indexando{RESET}",
             "gravando": f"{ORANGE}● gravando lote no RocksDB…{RESET}",
             "fim": f"{GREEN}✔ concluído{RESET}",
         }.get(p["fase"], p["fase"])
         bar_width = max(10, width - 32)
-        restante = "—" if remaining is None else f"~{duration(remaining)}"
+        remaining_txt = "—" if remaining is None else f"~{duration(remaining)}"
         available = mem.get("MemAvailable", 0)
         mem_warn = f"  {RED}pouca RAM livre!{RESET}" if available and available < 600 << 20 else ""
         swap_grew = swap_used - (self.swap_start or 0)
         swap_warn = f"  {RED}usando swap (+{size(swap_grew)}){RESET}" if swap_grew > 64 << 20 else ""
 
         lines = [
-            f"{ORANGE}{BOLD} ✿ fire-flower{RESET}{BOLD} · carga da Wikipédia{RESET}   {fase}",
+            f"{ORANGE}{BOLD} ✿ fire-flower{RESET}{BOLD} · carga da Wikipédia{RESET}   {phase}",
             f"{DIM}   corpus{RESET}  {short(self.corpus, width - 12)}",
-            f"{DIM}   banco {RESET}  {short(self.banco, width - 12)}",
+            f"{DIM}   banco {RESET}  {short(self.db, width - 12)}",
             "",
             f"   {bar(fraction, bar_width)} {BOLD}{dec(fraction * 100)}%{RESET}",
             f"   {BOLD}{num(p['linhas'])}{RESET} de {num(self.total_lines)} artigos"
@@ -210,7 +210,7 @@ class Dashboard:
             "",
             f"{DIM}   velocidade{RESET}  {BOLD}{num(docs_rate)}{RESET} artigos/s  ·  {size(bytes_rate)}/s"
             f"{DIM}  (últimos {RATE_WINDOW_SECONDS}s){RESET}",
-            f"{DIM}   tempo     {RESET}  {duration(elapsed)} decorrido  ·  {restante} restante",
+            f"{DIM}   tempo     {RESET}  {duration(elapsed)} decorrido  ·  {remaining_txt} restante",
             f"{DIM}   memória   {RESET}  {size(rss) if rss else '—'} (pico {size(self.peak_rss)})"
             f"  ·  RAM livre {size(available)}{mem_warn}{swap_warn}",
             f"{DIM}   banco     {RESET}  {size(self.db_size)} em disco  ·  lotes gravados: {num(p['commits'])}"
@@ -240,15 +240,15 @@ def build():
         sys.exit("falha ao compilar")
 
 
-def confirm_delete(banco, assume_yes):
-    if not os.path.exists(banco):
+def confirm_delete(db, assume_yes):
+    if not os.path.exists(db):
         return
-    print(f"o banco {BOLD}{banco}{RESET} já existe ({size(dir_size(banco))}) e será apagado.")
+    print(f"o banco {BOLD}{db}{RESET} já existe ({size(dir_size(db))}) e será apagado.")
     if not assume_yes:
         answer = input("apagar e começar do zero? [s/N] ").strip().lower()
         if answer not in ("s", "sim", "y", "yes"):
             sys.exit("cancelado; use --pular N para retomar uma carga em vez de apagar")
-    shutil.rmtree(banco)
+    shutil.rmtree(db)
     print(f"{DIM}banco apagado{RESET}")
 
 
@@ -264,51 +264,51 @@ def reader_thread(stream, events):
 def main():
     parser = argparse.ArgumentParser(description="Carrega a Wikipédia no fire-flower com painel de progresso.")
     parser.add_argument("--corpus", default="~/datasets/ptwiki/ptwiki.jsonl", help="arquivo .jsonl")
-    parser.add_argument("--banco", default="~/bench-db/ptwiki-full", help="pasta do banco")
-    parser.add_argument("--lote", type=int, default=10000,
+    parser.add_argument("--banco", dest="db", metavar="BANCO", default="~/bench-db/ptwiki-full", help="pasta do banco")
+    parser.add_argument("--lote", dest="batch", metavar="LOTE", type=int, default=10000,
                         help="artigos por commit (padrão: 10000; ~1,4 GB de pico na Wikipédia inteira)")
-    parser.add_argument("--pular", type=int, default=0,
+    parser.add_argument("--pular", dest="skip", metavar="PULAR", type=int, default=0,
                         help="retoma a partir desta linha, sem apagar o banco")
-    parser.add_argument("--sem-compactar", action="store_true",
+    parser.add_argument("--sem-compactar", dest="no_compact", action="store_true",
                         help="não compacta no fim (compactar leva ~10 s e deixa as buscas 30–50%% mais rápidas)")
-    parser.add_argument("--sim", action="store_true", help="não pede confirmação para apagar o banco")
-    parser.add_argument("--sem-build", action="store_true", help="não roda o cargo build")
-    parser.add_argument("--idiomas", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
-    parser.add_argument("--sem-posicoes", action="store_true",
+    parser.add_argument("--sim", dest="yes", action="store_true", help="não pede confirmação para apagar o banco")
+    parser.add_argument("--sem-build", dest="no_build", action="store_true", help="não roda o cargo build")
+    parser.add_argument("--idiomas", dest="languages", metavar="IDIOMAS", help="idiomas das stopwords de um banco novo: pt,en (padrão), en, nenhum…")
+    parser.add_argument("--sem-posicoes", dest="no_positions", action="store_true",
                         help="cria o banco sem posições: menor e mais rápido, mas sem busca por frase")
-    parser.add_argument("--flexoes", choices=["pt-plural", "pt", "nenhum"],
+    parser.add_argument("--flexoes", dest="inflections", choices=["pt-plural", "pt", "nenhum"],
                         help="flexões na consulta num banco novo (recomendado: pt-plural; \"planetas\" acha \"Planeta\")")
     parser.add_argument("--stemming", choices=["pt", "pt-plural", "en", "en-plural", "nenhum"],
                         help="stemming de um banco novo (padrão: nenhum): pt (Snowball, \"correndo\" acha \"corrida\") ou pt-plural (só o plural)")
     args = parser.parse_args()
 
     corpus = os.path.expanduser(args.corpus)
-    banco = os.path.expanduser(args.banco)
+    db = os.path.expanduser(args.db)
     if not os.path.isfile(corpus):
         sys.exit(f"corpus não encontrado: {corpus}")
 
-    if not args.sem_build:
+    if not args.no_build:
         build()
-    if args.pular:
-        print(f"retomando a partir da linha {num(args.pular)}; o banco existente será mantido")
+    if args.skip:
+        print(f"retomando a partir da linha {num(args.skip)}; o banco existente será mantido")
     else:
-        confirm_delete(banco, args.sim)
-    os.makedirs(os.path.dirname(banco) or ".", exist_ok=True)
+        confirm_delete(db, args.yes)
+    os.makedirs(os.path.dirname(db) or ".", exist_ok=True)
 
     print(f"{DIM}contando artigos…{RESET}", flush=True)
     total_lines = count_lines(corpus)
-    log_path = banco.rstrip("/") + ".carga.log"
+    log_path = db.rstrip("/") + ".carga.log"
 
-    cmd = [BINARY, "index-jsonl", banco, corpus, "--lote", str(args.lote),
-           "--pular", str(args.pular), "--progresso-json"]
-    if args.idiomas:
-        cmd += ["--idiomas", args.idiomas]
-    if args.sem_posicoes:
+    cmd = [BINARY, "index-jsonl", db, corpus, "--lote", str(args.batch),
+           "--pular", str(args.skip), "--progresso-json"]
+    if args.languages:
+        cmd += ["--idiomas", args.languages]
+    if args.no_positions:
         cmd += ["--sem-posicoes"]
     if args.stemming:
         cmd += ["--stemming", args.stemming]
-    if args.flexoes:
-        cmd += ["--flexoes", args.flexoes]
+    if args.inflections:
+        cmd += ["--flexoes", args.inflections]
     log = open(log_path, "w")
     # Processo próprio: o Ctrl+C chega só ao script, que encerra o motor com
     # SIGINT e ainda consegue mostrar o resumo.
@@ -317,10 +317,10 @@ def main():
     events = queue.Queue()
     threading.Thread(target=reader_thread, args=(proc.stdout, events), daemon=True).start()
 
-    dashboard = Dashboard(corpus, banco, total_lines, args.pular)
+    dashboard = Dashboard(corpus, db, total_lines, args.skip)
     started = time.time()
-    last = {"fase": "indexando", "linhas": args.pular, "documentos": 0, "invalidas": 0, "bytes": 0,
-            "bytes_total": os.path.getsize(corpus), "linhas_gravadas": args.pular, "commits": 0,
+    last = {"fase": "indexando", "linhas": args.skip, "documentos": 0, "invalidas": 0, "bytes": 0,
+            "bytes_total": os.path.getsize(corpus), "linhas_gravadas": args.skip, "commits": 0,
             "segundos": 0.0, "ultimo_titulo": ""}
     interrupted = False
     sys.stdout.write(HIDE_CURSOR)
@@ -355,17 +355,17 @@ def main():
         else:
             print(f"{RED}o fire-flower terminou com erro (código {code}).{RESET} Veja {log_path}")
         print("para continuar de onde parou:")
-        print(f"  python3 {os.path.relpath(__file__)} --banco {banco} --corpus {corpus} "
-              f"--lote {args.lote} --pular {last['linhas_gravadas']}")
+        print(f"  python3 {os.path.relpath(__file__)} --banco {db} --corpus {corpus} "
+              f"--lote {args.batch} --pular {last['linhas_gravadas']}")
         sys.exit(1)
 
     dashboard.draw(last, proc.pid, elapsed, final=True)
     summary = {
         "commit": git_commit(),
         "corpus": corpus,
-        "banco": banco,
-        "lote": args.lote,
-        "pular": args.pular,
+        "banco": db,
+        "lote": args.batch,
+        "pular": args.skip,
         "artigos": last["documentos"],
         "linhas_invalidas": last["invalidas"],
         "segundos": round(elapsed, 1),
@@ -376,23 +376,23 @@ def main():
         "corpus_bytes": last["bytes_total"],
     }
 
-    if not args.sem_compactar:
+    if not args.no_compact:
         print(f"{DIM}compactando…{RESET}", flush=True)
         t = time.time()
-        subprocess.run([BINARY, "compact", banco], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([BINARY, "compact", db], check=True, stdout=subprocess.DEVNULL)
         summary["compactacao_segundos"] = round(time.time() - t, 1)
-        summary["banco_bytes_compactado"] = dir_size(banco)
+        summary["banco_bytes_compactado"] = dir_size(db)
         print(f"compactado em {duration(summary['compactacao_segundos'])}: "
               f"{size(summary['banco_bytes'])} → {size(summary['banco_bytes_compactado'])}")
 
-    summary_path = banco.rstrip("/") + ".carga.json"
+    summary_path = db.rstrip("/") + ".carga.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print(f"{GREEN}pronto:{RESET} {num(last['documentos'])} artigos em {duration(elapsed)} "
           f"({num(summary['artigos_por_segundo'])} artigos/s). Resumo em {summary_path}")
     print("para buscar:")
-    print(f"  {BINARY} tui {banco}")
+    print(f"  {BINARY} tui {db}")
 
 
 if __name__ == "__main__":

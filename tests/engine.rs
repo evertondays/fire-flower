@@ -599,12 +599,12 @@ fn ties_break_by_id_and_prefix_is_one_term() {
 
     // "carr*" casa 3 documentos: df = 3, e o 40 tem as duas completações (tf 2).
     let (n, avg) = (6.0, 9.0 / 6.0);
-    let carr = |tf: f64, len: f64| bm25(n, 3.0, tf, len, avg);
+    let prefix_score = |tf: f64, len: f64| bm25(n, 3.0, tf, len, avg);
     let got: std::collections::HashMap<u64, f64> = ranked(&engine, "carr*").into_iter().collect();
     assert_eq!(got.len(), 3);
-    assert!(close(got[&40], carr(2.0, 2.0)), "tf somado");
-    assert!(close(got[&41], carr(1.0, 2.0)));
-    assert!(close(got[&42], carr(1.0, 2.0)));
+    assert!(close(got[&40], prefix_score(2.0, 2.0)), "tf somado");
+    assert!(close(got[&41], prefix_score(1.0, 2.0)));
+    assert!(close(got[&42], prefix_score(1.0, 2.0)));
     assert!(got[&40] > got[&41]);
     let got = ranked(&engine, "carr* xis");
     assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [41, 42]);

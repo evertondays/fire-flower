@@ -9,7 +9,7 @@ use crate::engine::view::View;
 use crate::query::Clause;
 
 impl View<'_> {
-    pub(crate) fn search(&self, query: &str) -> Result<Vec<DocId>> {
+    pub(super) fn search(&self, query: &str) -> Result<Vec<DocId>> {
         let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
         match self.inflection_mode() {
@@ -23,7 +23,7 @@ impl View<'_> {
     }
 
     /// `expand`: palavras exatas casam também as flexões (frases e prefixos não).
-    pub(crate) fn search_with(&self, clauses: &[Clause], expand: bool) -> Result<Vec<DocId>> {
+    fn search_with(&self, clauses: &[Clause], expand: bool) -> Result<Vec<DocId>> {
         // Listas exatas ficam como bytes até se saber quem conduz o E.
         let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
         let mut members: Vec<Member<DocId>> = Vec::new();
@@ -142,7 +142,7 @@ impl View<'_> {
 
     /// Guarda os bytes da lista `post:` do termo e devolve o df (0 se o termo
     /// não existe).
-    pub(crate) fn add_exact<'s, T>(
+    pub(super) fn add_exact<'s, T>(
         &'s self,
         node: Option<u64>,
         bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,

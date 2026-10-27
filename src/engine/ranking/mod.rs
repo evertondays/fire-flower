@@ -11,13 +11,13 @@ use crate::engine::ranking::topk::TopK;
 use crate::engine::view::{NormCursor, View};
 use crate::query::Clause;
 
-pub(crate) mod bm25;
-pub(crate) mod score;
-pub(crate) mod topk;
+mod bm25;
+mod score;
+pub(super) mod topk;
 
 
 impl View<'_> {
-    pub(crate) fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
+    pub(super) fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
         let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
         if clauses.is_empty() {
@@ -34,7 +34,7 @@ impl View<'_> {
     }
 
     /// `expand`: como em [`View::search_with`].
-    pub(crate) fn search_ranked_with(&self, clauses: &[Clause], k: usize, expand: bool) -> Result<TopHits> {
+    fn search_ranked_with(&self, clauses: &[Clause], k: usize, expand: bool) -> Result<TopHits> {
         let stats = self.stats()?;
         let config = &self.engine.config;
         let bm25 = Bm25::new(config, stats);

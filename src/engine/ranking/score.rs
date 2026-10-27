@@ -6,7 +6,7 @@ use crate::engine::ranking::bm25::{Bm25, Bound, DocNorm};
 
 /// Uma parte da consulta já carregada, para o ranking. `weight` é
 /// idf · (k1 + 1), a parte da nota que não depende do documento.
-pub(crate) enum Scorer {
+pub(super) enum Scorer {
     /// Termo exato, ou prefixo tratado como um termo só (R1 do plano de
     /// relevância): a lista `list` em `lists`.
     Term { weight: f64, list: usize, bound: Bound },
@@ -27,7 +27,7 @@ pub(crate) enum Scorer {
 /// Nota de um documento (já posicionado em todas as listas): soma das
 /// partes, na ordem da consulta.
 #[inline]
-pub(crate) fn doc_score(
+pub(super) fn doc_score(
     bm25: &Bm25,
     scorers: &[Scorer],
     sources: &[AndList<'_>],
@@ -59,7 +59,7 @@ pub(crate) fn doc_score(
 /// Limite superior de [`doc_score`]: a mesma soma, com o maior valor
 /// possível de cada parte.
 #[inline]
-pub(crate) fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], groups: &[GroupParts], counts: &[(u32, u32)]) -> f64 {
+pub(super) fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], groups: &[GroupParts], counts: &[(u32, u32)]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {

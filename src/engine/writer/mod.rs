@@ -19,27 +19,27 @@ use crate::engine::meta::varint;
 use crate::engine::view::Source;
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
-pub(crate) mod trie;
+pub(super) mod trie;
 
 
 pub(crate) struct WriterState {
-    pub(crate) next_node_id: u64,
-    pub(crate) next_doc_id: DocId,
-    pub(crate) stats: IndexStats,
+    pub(super) next_node_id: u64,
+    pub(super) next_doc_id: DocId,
+    pub(super) stats: IndexStats,
     /// Nós da Trie dos lotes anteriores. Só o escritor altera a Trie, então
     /// depois de um commit o cache é igual ao banco. O lote o pega emprestado
     /// e só o devolve no commit: um lote descartado leva o cache junto, e
     /// nada que não foi gravado sobrevive.
-    pub(crate) cache: NodeCache,
+    pub(super) cache: NodeCache,
     /// Buffers da análise e radicais já calculados, entre um lote e outro.
-    pub(crate) analyzer: Analyzer,
+    pub(super) analyzer: Analyzer,
 }
 
 #[derive(Default)]
-pub(crate) struct NodeCache {
-    pub(crate) nodes: FxHashMap<u64, CachedNode>,
+pub(super) struct NodeCache {
+    pub(super) nodes: FxHashMap<u64, CachedNode>,
     /// Número do último lote gravado. Cada nó guarda o lote que o usou por último.
-    pub(crate) generation: u64,
+    pub(super) generation: u64,
 }
 
 /// Lote de indexação. Acumula as mudanças em memória e grava tudo de uma vez,
@@ -50,40 +50,40 @@ pub(crate) struct NodeCache {
 /// posições), e a Trie é percorrida no commit, uma vez por termo distinto do
 /// lote (e não uma vez por documento que contém o termo).
 pub struct IndexBatch<'a> {
-    pub(crate) engine: &'a Engine,
-    pub(crate) state: MutexGuard<'a, WriterState>,
-    pub(crate) next_node_id: u64,
-    pub(crate) next_doc_id: DocId,
+    pub(super) engine: &'a Engine,
+    pub(super) state: MutexGuard<'a, WriterState>,
+    pub(super) next_node_id: u64,
+    pub(super) next_doc_id: DocId,
     /// Cache de nós emprestado do `WriterState`, mais os nós lidos ou criados
     /// neste lote. Nós criados aqui ainda não existem no banco, então as
     /// travessias seguintes precisam enxergá-los por este mapa.
-    pub(crate) nodes: FxHashMap<u64, CachedNode>,
-    pub(crate) generation: u64,
-    pub(crate) cache_limit: usize,
+    pub(super) nodes: FxHashMap<u64, CachedNode>,
+    pub(super) generation: u64,
+    pub(super) cache_limit: usize,
     /// Nós alterados neste lote, na ordem em que mudaram.
-    pub(crate) dirty: Vec<u64>,
+    pub(super) dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
-    pub(crate) pending: FxHashMap<String, TermAcc>,
+    pub(super) pending: FxHashMap<String, TermAcc>,
     /// (documento, tamanho inteiro, tamanho do título, extensão do título),
     /// na ordem em que foram adicionados.
-    pub(crate) lengths: Vec<(DocId, u32, u32, u32)>,
-    pub(crate) labels: Vec<(DocId, String)>,
-    pub(crate) analyzer: Analyzer,
+    pub(super) lengths: Vec<(DocId, u32, u32, u32)>,
+    pub(super) labels: Vec<(DocId, String)>,
+    pub(super) analyzer: Analyzer,
 }
 
 /// O que o lote juntou de um termo.
 #[derive(Default)]
-pub(crate) struct TermAcc {
+pub(super) struct TermAcc {
     /// (documento, tf, tf no título), na ordem em que os documentos foram adicionados.
-    pub(crate) docs: Vec<(DocId, u32, u32)>,
+    docs: Vec<(DocId, u32, u32)>,
     /// `tf` posições por entrada de `docs`, em sequência (vazio sem posições).
-    pub(crate) positions: Vec<u32>,
+    positions: Vec<u32>,
 }
 
 impl TermAcc {
     /// Ordena por documento. Para o mesmo documento adicionado duas vezes no
     /// lote, a última vence (como entre lotes, no merge operator).
-    pub(crate) fn normalize(&mut self, positions: bool) {
+    fn normalize(&mut self, positions: bool) {
         if self.docs.windows(2).all(|w| w[0].0 < w[1].0) {
             return; // o caso comum: IDs crescentes
         }
@@ -312,7 +312,7 @@ impl IndexBatch<'_> {
     /// Atualiza os blocos de `norm:` tocados pelo lote e as estatísticas.
     /// Um documento que já existia troca de tamanho e não conta de novo.
     /// Devolve as estatísticas novas e os blocos gravados.
-    pub(crate) fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
+    fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
         let mut stats = self.state.stats;
         let mut order: Vec<(u64, usize)> =
             self.lengths.iter().enumerate().map(|(i, &(doc, ..))| (doc / NORM_BLOCK_DOCS, i)).collect();

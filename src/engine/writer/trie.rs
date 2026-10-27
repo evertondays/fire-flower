@@ -13,8 +13,8 @@ use crate::engine::view::{load_node, missing_node};
 /// profundidade `d` (`ids[0]` é a raiz) e `chars` são os caracteres até ele.
 #[derive(Default)]
 pub(crate) struct TriePath {
-    pub(crate) chars: Vec<char>,
-    pub(crate) ids: Vec<u64>,
+    chars: Vec<char>,
+    ids: Vec<u64>,
 }
 
 pub(crate) struct CachedNode {
@@ -35,7 +35,7 @@ impl IndexBatch<'_> {
     /// raiz. Os nós desse caminho já estão no mapa do lote (o descarte só
     /// acontece depois do commit).
     /// Devolve o nó do termo e se ele virou palavra agora (não estava no índice).
-    pub(crate) fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<(u64, bool)> {
+    pub(super) fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<(u64, bool)> {
         if path.ids.is_empty() {
             path.ids.push(ROOT_ID);
         }
@@ -81,7 +81,7 @@ impl IndexBatch<'_> {
     }
 
     /// Nó do cache, lendo do banco na primeira vez.
-    pub(crate) fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
+    fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
         let generation = self.generation;
         match self.nodes.entry(id) {
             Entry::Occupied(e) => {

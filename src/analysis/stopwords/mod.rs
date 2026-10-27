@@ -1,8 +1,8 @@
 //! Stopwords por idioma: palavras tão comuns que não entram no índice.
 //!
-//! As listas ficam em `src/stopwords/<código>.txt`, uma palavra por linha, e
+//! As listas ficam em `src/analysis/stopwords/<código>.txt`, uma palavra por linha, e
 //! vão embutidas no binário. Para adicionar um idioma:
-//! 1. crie `src/stopwords/<código>.txt`;
+//! 1. crie `src/analysis/stopwords/<código>.txt`;
 //! 2. adicione a variante em [`Language`] e o código em `code` e `list`.
 //!
 //! Os idiomas de um banco são gravados na criação (ver
@@ -40,7 +40,7 @@ impl Language {
         Self::ALL.iter().copied().find(|l| l.code().eq_ignore_ascii_case(code.trim()))
     }
 
-    /// Conteúdo de `src/stopwords/<código>.txt`.
+    /// Conteúdo de `src/analysis/stopwords/<código>.txt`.
     fn list(self) -> &'static str {
         match self {
             Language::Portuguese => include_str!("pt.txt"),

@@ -1,4 +1,4 @@
-//! Diagnóstico e medição: usados pelo harness de performance (`examples/wiki.rs`).
+//! Diagnóstico e medição: usados pelo harness de performance (`examples/wiki/`).
 
 use crate::{Config, DocId, Engine, Error, Posting, Result, codec};
 use crate::analysis::normalize_term;
@@ -7,7 +7,7 @@ use crate::engine::keys::{Key, META_NEXT_NODE, NORM, POS, ROOT_ID};
 use crate::engine::meta::read_counter;
 use crate::engine::view::{Source, load_node, missing_node};
 
-/// Diagnóstico e medição: usados pelo harness de performance (`examples/wiki.rs`).
+/// Diagnóstico e medição: usados pelo harness de performance (`examples/wiki/`).
 impl Engine {
     pub fn config(&self) -> &Config {
         &self.config

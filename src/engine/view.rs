@@ -10,23 +10,23 @@ use crate::{DocId, Engine, Error, IndexStats, Posting, Result, codec};
 use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::keys::{Key, META_DOC_COUNT, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POST, ROOT_ID};
 
-pub(crate) type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
+type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
 
 /// Leituras de uma única busca, todas sobre o mesmo snapshot.
-pub(crate) struct View<'a> {
-    pub(crate) snap: Snapshot<'a>,
+pub(super) struct View<'a> {
+    pub(super) snap: Snapshot<'a>,
     /// Número do último commit visível quando o snapshot foi criado.
-    pub(crate) epoch: u64,
-    pub(crate) engine: &'a Engine,
+    pub(super) epoch: u64,
+    pub(super) engine: &'a Engine,
 }
 
 impl View<'_> {
     /// Bytes da lista `post:` de um nó, presos ao snapshot (sem cópia).
-    pub(crate) fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+    pub(super) fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
         self.snap.get_bytes(Key::new(POST, node).as_ref())
     }
 
-    pub(crate) fn stats(&self) -> Result<IndexStats> {
+    pub(super) fn stats(&self) -> Result<IndexStats> {
         let get = |key: &[u8]| -> Result<u64> {
             self.snap.get_bytes(key)?.map(|v| codec::get_varint(&v)).transpose().map(|v| v.unwrap_or(0))
         };
@@ -38,7 +38,7 @@ impl View<'_> {
     }
 
     /// `term` já deve estar normalizado.
-    pub(crate) fn term_node(&self, term: &str) -> Result<Option<u64>> {
+    pub(super) fn term_node(&self, term: &str) -> Result<Option<u64>> {
         Ok(match self.find_node(term)? {
             Some((id, node)) if node.is_end_of_word => Some(id),
             _ => None,
@@ -47,7 +47,7 @@ impl View<'_> {
 
     /// `<prefixo><id>` para cada id, num `MultiGet` em lote sobre o snapshot,
     /// na ordem de `ids`.
-    pub(crate) fn get_many(&self, prefix: &[u8], ids: impl Iterator<Item = u64>) -> Result<Vec<Option<rocksdb::DBPinnableSlice<'_>>>> {
+    pub(super) fn get_many(&self, prefix: &[u8], ids: impl Iterator<Item = u64>) -> Result<Vec<Option<rocksdb::DBPinnableSlice<'_>>>> {
         let keys: Vec<Key> = ids.map(|id| Key::new(prefix, id)).collect();
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -65,7 +65,7 @@ impl View<'_> {
 
     /// Percorre a Trie caractere a caractere: um `Get` no RocksDB por nível,
     /// menos nos níveis guardados no cache de nós.
-    pub(crate) fn find_node(&self, term: &str) -> Result<Option<(u64, Arc<TrieNode>)>> {
+    pub(super) fn find_node(&self, term: &str) -> Result<Option<(u64, Arc<TrieNode>)>> {
         let Some(mut node) = self.node(ROOT_ID, 0)? else { return Ok(None) };
         let mut id = ROOT_ID;
         for (depth, ch) in term.chars().enumerate() {
@@ -76,12 +76,12 @@ impl View<'_> {
         Ok(Some((id, node)))
     }
 
-    pub(crate) fn require_node(&self, id: u64, depth: usize) -> Result<Arc<TrieNode>> {
+    fn require_node(&self, id: u64, depth: usize) -> Result<Arc<TrieNode>> {
         self.node(id, depth)?.ok_or_else(|| missing_node(id))
     }
 
     /// Nó `id`, a `depth` passos da raiz. Os rasos vêm do cache compartilhado.
-    pub(crate) fn node(&self, id: u64, depth: usize) -> Result<Option<Arc<TrieNode>>> {
+    fn node(&self, id: u64, depth: usize) -> Result<Option<Arc<TrieNode>>> {
         let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
         if cached && let Some(node) = self.engine.nodes.get(id, self.epoch) {
             return Ok(Some(node));
@@ -94,21 +94,21 @@ impl View<'_> {
         Ok(Some(node))
     }
 
-    pub(crate) fn load_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
+    pub(super) fn load_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
         match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
             Some(v) => codec::decode_docs(&v),
             None => Ok(Vec::new()),
         }
     }
 
-    pub(crate) fn load_postings(&self, node_id: u64) -> Result<Vec<Posting>> {
+    pub(super) fn load_postings(&self, node_id: u64) -> Result<Vec<Posting>> {
         match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
             Some(v) => codec::decode_postings(&v),
             None => Ok(Vec::new()),
         }
     }
 
-    pub(crate) fn norm_block(&self, block: u64) -> Result<Option<Arc<NormBlock>>> {
+    pub(super) fn norm_block(&self, block: u64) -> Result<Option<Arc<NormBlock>>> {
         if let Some(cached) = self.engine.norms.get(block, self.epoch) {
             return Ok(Some(cached));
         }
@@ -123,20 +123,20 @@ impl View<'_> {
 /// com IDs crescentes, mas aceita qualquer ordem. Os blocos já usados ficam
 /// num mapa local: voltar a um bloco não passa de novo pela trava do cache
 /// compartilhado.
-pub(crate) struct NormCursor<'v, 'a> {
-    pub(crate) view: &'v View<'a>,
-    pub(crate) block_id: u64,
-    pub(crate) block: Option<Arc<NormBlock>>,
-    pub(crate) seen: FxHashMap<u64, Option<Arc<NormBlock>>>,
+pub(super) struct NormCursor<'v, 'a> {
+    view: &'v View<'a>,
+    block_id: u64,
+    block: Option<Arc<NormBlock>>,
+    seen: FxHashMap<u64, Option<Arc<NormBlock>>>,
 }
 
 impl<'v, 'a> NormCursor<'v, 'a> {
-    pub(crate) fn new(view: &'v View<'a>) -> Self {
+    pub(super) fn new(view: &'v View<'a>) -> Self {
         Self { view, block_id: u64::MAX, block: None, seen: FxHashMap::default() }
     }
 
     #[inline]
-    pub(crate) fn lens(&mut self, doc: DocId) -> Result<DocLens> {
+    pub(super) fn lens(&mut self, doc: DocId) -> Result<DocLens> {
         let block_id = doc / NORM_BLOCK_DOCS;
         if block_id != self.block_id {
             self.block = match self.seen.get(&block_id) {
@@ -160,7 +160,7 @@ impl<'v, 'a> NormCursor<'v, 'a> {
 thread_local! {
     /// Leituras (`get`) feitas pelo motor nesta thread. Usado pelo harness
     /// para medir "Gets por consulta" sem depender do PerfContext do RocksDB.
-    pub(crate) static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Total de `get`s que o motor fez na thread atual (só cresce).
@@ -168,12 +168,12 @@ pub fn reads_on_this_thread() -> u64 {
     READS.with(|r| r.get())
 }
 
-pub(crate) fn count_read() {
+fn count_read() {
     READS.with(|r| r.set(r.get() + 1));
 }
 
 /// O banco direto (usado pelo lote, único escritor) ou um snapshot (buscas).
-pub(crate) trait Source {
+pub(super) trait Source {
     fn get_bytes(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>>;
 }
 
@@ -191,10 +191,10 @@ impl Source for Snapshot<'_> {
     }
 }
 
-pub(crate) fn load_node(src: &impl Source, id: u64) -> Result<Option<TrieNode>> {
+pub(super) fn load_node(src: &impl Source, id: u64) -> Result<Option<TrieNode>> {
     src.get_bytes(Key::new(NODE, id).as_ref())?.map(|v| TrieNode::decode(&v)).transpose()
 }
 
-pub(crate) fn missing_node(id: u64) -> Error {
+pub(super) fn missing_node(id: u64) -> Error {
     Error::Corrupt(format!("nó {id} referenciado mas ausente"))
 }

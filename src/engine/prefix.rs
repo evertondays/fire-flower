@@ -11,7 +11,7 @@ use crate::engine::view::{View, missing_node};
 impl View<'_> {
     /// Nós das completações de `prefix` e, com stemming, o do radical do
     /// prefixo (ver [`crate::query::QueryTerm::stem`]), sem repetir.
-    pub(crate) fn prefix_nodes(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<u64>> {
+    fn prefix_nodes(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<u64>> {
         let mut nodes: Vec<u64> =
             self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?.into_iter().map(|(_, n)| n).collect();
         if let Some(node) = stem.map(|s| self.term_node(s)).transpose()?.flatten()
@@ -24,12 +24,12 @@ impl View<'_> {
 
     /// Listas das completações de `prefix` unidas por documento, com o tf
     /// somado: o prefixo como se fosse um termo só.
-    pub(crate) fn prefix_postings(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<Posting>> {
+    pub(super) fn prefix_postings(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<Posting>> {
         self.union_postings(self.prefix_nodes(prefix, stem)?.into_iter())
     }
 
     /// Listas de vários nós unidas por documento, com o tf somado.
-    pub(crate) fn union_postings(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<Posting>> {
+    fn union_postings(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<Posting>> {
         let mut all: Vec<Posting> = Vec::new();
         for value in self.get_many(POST, nodes)?.into_iter().flatten() {
             all.extend(codec::decode_postings(&value)?);
@@ -51,12 +51,12 @@ impl View<'_> {
         Ok(merged)
     }
 
-    pub(crate) fn prefix_docs(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<DocId>> {
+    pub(super) fn prefix_docs(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<DocId>> {
         self.union_docs(self.prefix_nodes(prefix, stem)?.into_iter())
     }
 
     /// Documentos de vários nós, unidos.
-    pub(crate) fn union_docs(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<DocId>> {
+    fn union_docs(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<DocId>> {
         let mut all = Vec::new();
         for value in self.get_many(POST, nodes)?.into_iter().flatten() {
             all.extend(codec::decode_docs(&value)?);
@@ -74,7 +74,7 @@ impl View<'_> {
     /// estão no cache em lotes de até `WORDS_CHUNK` com um `MultiGet`: um
     /// prefixo curto visita centenas de nós, e um `Get` por nó custava metade
     /// do tempo de `p-2*` na Wikipédia inteira.
-    pub(crate) fn words_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+    pub(super) fn words_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
         const WORDS_CHUNK: usize = 64;
         let mut out = Vec::new();
         let Some((start, start_node)) = self.find_node(prefix)? else { return Ok(out) };
@@ -117,7 +117,7 @@ impl View<'_> {
 
     /// Vários nós à mesma `depth`, na ordem de `ids`: os rasos do cache, o
     /// resto num `MultiGet` só.
-    pub(crate) fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
+    fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
         let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
         let mut out: Vec<Option<Arc<TrieNode>>> = Vec::new();
         let mut missing: Vec<(usize, u64)> = Vec::new();

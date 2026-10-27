@@ -25,14 +25,14 @@
 //! lista com pedaços pendentes (termo frequente antes de compactar: +43%).
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
 
-pub(crate) mod list;
-pub(crate) mod merge;
-pub(crate) mod node_set;
-pub(crate) mod norms;
-pub(crate) mod positions;
-pub(crate) mod postings;
-pub(crate) mod trie_node;
-pub(crate) mod varint;
+mod list;
+mod merge;
+mod node_set;
+mod norms;
+mod positions;
+mod postings;
+mod trie_node;
+mod varint;
 #[cfg(test)]
 mod tests;
 

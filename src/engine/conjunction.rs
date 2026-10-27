@@ -18,7 +18,7 @@ pub(crate) enum Member<T> {
 }
 
 impl<T> Member<T> {
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         match self {
             Member::Bytes { len, .. } | Member::Group { len, .. } => *len,
             Member::Decoded(list) => list.len(),
@@ -28,7 +28,7 @@ impl<T> Member<T> {
 
 /// Uma lista do E no ranking, já posicionada: decodificada (a que conduz e as
 /// uniões de prefixo) ou um cursor que salta blocos pela tabela de saltos.
-pub(crate) enum AndList<'s> {
+pub(super) enum AndList<'s> {
     Decoded { list: Vec<Posting>, at: usize },
     Cursor { cursor: PostingsCursor<'s>, current: Posting },
     /// Grupo de flexões que não conduz: um cursor por lista, sem decodificar;
@@ -39,7 +39,7 @@ pub(crate) enum AndList<'s> {
 impl AndList<'_> {
     /// A entrada do documento da última busca bem-sucedida.
     #[inline]
-    pub(crate) fn current(&self) -> Posting {
+    pub(super) fn current(&self) -> Posting {
         match self {
             AndList::Decoded { list, at } => list[*at],
             AndList::Cursor { current, .. } => *current,
@@ -52,7 +52,7 @@ impl AndList<'_> {
     /// (exata, flexões) do documento atual de um grupo de flexões: dos
     /// cursores, ou de `groups[group]` se a lista foi decodificada.
     #[inline]
-    pub(crate) fn group_parts(&self, groups: &[GroupParts], group: usize) -> (Posting, Posting) {
+    pub(super) fn group_parts(&self, groups: &[GroupParts], group: usize) -> (Posting, Posting) {
         match self {
             AndList::Decoded { at, .. } => groups[group][*at],
             AndList::Group { current, .. } => *current,
@@ -62,7 +62,7 @@ impl AndList<'_> {
 
     /// Avança até `doc` (os alvos só crescem) e diz se ele está na lista.
     #[inline]
-    pub(crate) fn seek(&mut self, doc: DocId) -> Result<bool> {
+    pub(super) fn seek(&mut self, doc: DocId) -> Result<bool> {
         match self {
             AndList::Decoded { list, at } => Ok(seek(list, at, doc)),
             AndList::Cursor { cursor, current } => match cursor.seek(doc)? {
@@ -98,13 +98,13 @@ impl AndList<'_> {
 /// entradas não tem nenhum candidato e é pulada sem decodificar. Com tamanhos
 /// parecidos, decodificar a lista inteira e andar nela em sequência é mais
 /// barato (E de dois termos frequentes: +16% com cursor).
-pub(crate) fn use_cursor(len: usize, driver_len: usize) -> bool {
+pub(super) fn use_cursor(len: usize, driver_len: usize) -> bool {
     len >= 32 * driver_len
 }
 
 /// Como [`seek`], numa lista só de IDs.
 #[inline]
-pub(crate) fn seek_docs(list: &[DocId], at: &mut usize, target: DocId) -> bool {
+pub(super) fn seek_docs(list: &[DocId], at: &mut usize, target: DocId) -> bool {
     let mut lo = *at;
     if lo >= list.len() {
         return false;
@@ -128,7 +128,7 @@ pub(crate) fn seek_docs(list: &[DocId], at: &mut usize, target: DocId) -> bool {
 /// Avança `at` até a primeira entrada com documento ≥ `target` (busca
 /// exponencial a partir da posição atual) e diz se ela é `target`.
 #[inline]
-pub(crate) fn seek(list: &[Posting], at: &mut usize, target: DocId) -> bool {
+pub(super) fn seek(list: &[Posting], at: &mut usize, target: DocId) -> bool {
     let mut lo = *at;
     if lo >= list.len() {
         return false;

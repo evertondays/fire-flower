@@ -30,13 +30,13 @@ use rustc_hash::FxHashMap;
 /// tamanho de todos os documentos (~6 bytes cada; 1 milhão ≈ 6 MB); os nós,
 /// só os rasos.
 pub(crate) struct EpochCache<T> {
-    pub(crate) slots: RwLock<FxHashMap<u64, Slot<T>>>,
+    slots: RwLock<FxHashMap<u64, Slot<T>>>,
 }
 
-pub(crate) struct Slot<T> {
+struct Slot<T> {
     /// Commit a partir do qual `value` vale.
-    pub(crate) version: u64,
-    pub(crate) value: Option<Arc<T>>,
+    version: u64,
+    value: Option<Arc<T>>,
 }
 
 impl<T> Default for EpochCache<T> {
@@ -46,7 +46,7 @@ impl<T> Default for EpochCache<T> {
 }
 
 impl<T> EpochCache<T> {
-    pub(crate) fn get(&self, key: u64, epoch: u64) -> Option<Arc<T>> {
+    pub(super) fn get(&self, key: u64, epoch: u64) -> Option<Arc<T>> {
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         match slots.get(&key) {
             Some(slot) if slot.version <= epoch => slot.value.clone(),
@@ -55,7 +55,7 @@ impl<T> EpochCache<T> {
     }
 
     /// Uma busca leu `key` do snapshot `epoch`; guarda se ainda for o atual.
-    pub(crate) fn offer(&self, key: u64, epoch: u64, data: &Arc<T>) {
+    pub(super) fn offer(&self, key: u64, epoch: u64, data: &Arc<T>) {
         let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
         match slots.entry(key) {
             Entry::Vacant(e) => {
@@ -71,7 +71,7 @@ impl<T> EpochCache<T> {
     }
 
     /// Passo 1 do commit: `keys` vão mudar no commit `version`.
-    pub(crate) fn mark(&self, keys: impl IntoIterator<Item = u64>, version: u64) {
+    pub(super) fn mark(&self, keys: impl IntoIterator<Item = u64>, version: u64) {
         let mut keys = keys.into_iter().peekable();
         if keys.peek().is_none() {
             return;

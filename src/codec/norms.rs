@@ -19,10 +19,10 @@ use crate::codec::varint::{Reader, corrupt};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NormBlock {
     /// Tamanho por deslocamento; [`ABSENT`] onde não há documento.
-    pub(crate) lens: Vec<u32>,
+    lens: Vec<u32>,
     /// (tamanho do título, extensão do título) por deslocamento.
-    pub(crate) titles: Vec<(u16, u16)>,
-    pub(crate) count: usize,
+    titles: Vec<(u16, u16)>,
+    count: usize,
 }
 
 /// Os tamanhos de um documento.
@@ -40,7 +40,7 @@ pub struct DocLens {
 pub const NORM_BLOCK_DOCS: u64 = 1024;
 
 /// Marca de "sem documento" no bloco denso. Nenhum documento tem 4 bilhões de tokens.
-pub(crate) const ABSENT: u32 = u32::MAX;
+const ABSENT: u32 = u32::MAX;
 
 impl NormBlock {
     pub fn encode(&self) -> Vec<u8> {

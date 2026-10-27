@@ -12,7 +12,7 @@ pub const SKIP_BLOCK: usize = 128;
 /// `write` grava as entradas num buffer e anota, para cada bloco de
 /// `SKIP_BLOCK` entradas (o último pode ser menor), o último documento e onde
 /// o bloco termina (bytes desde o começo das entradas).
-pub(crate) fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Vec<u8>, &mut Vec<(DocId, usize)>)) {
+pub(super) fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Vec<u8>, &mut Vec<(DocId, usize)>)) {
     put_varint(buf, n as u64);
     if n <= 2 * SKIP_BLOCK {
         // Lista pequena: sem tabela, e as entradas vão direto para `buf`.
@@ -38,15 +38,15 @@ pub(crate) fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Ve
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SkipEntry {
     /// Último documento do bloco (absoluto).
-    pub(crate) last: DocId,
+    pub(super) last: DocId,
     /// Tamanho do bloco em bytes.
-    pub(crate) bytes: usize,
+    pub(super) bytes: usize,
     /// Entradas no bloco.
-    pub(crate) count: u64,
+    pub(super) count: u64,
 }
 
 /// `s`, depois `(Δúltimo doc, bytes, entradas − 1)` de cada bloco.
-pub(crate) fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry]) {
+pub(super) fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry]) {
     put_varint(buf, blocks.len() as u64);
     let mut last = 0;
     for b in blocks {
@@ -61,23 +61,23 @@ pub(crate) fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry]) {
 /// entradas) e o índice da sua primeira entrada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Block {
-    pub(crate) last: DocId,
-    pub(crate) start: usize,
-    pub(crate) first: u64,
+    pub(super) last: DocId,
+    pub(super) start: usize,
+    pub(super) first: u64,
 }
 
 /// Cabeçalho de uma lista: quantas entradas, a tabela de saltos e onde as
 /// entradas começam.
-pub(crate) struct ListHeader {
-    pub(crate) n: u64,
-    pub(crate) blocks: Vec<Block>,
-    pub(crate) entries: Vec<SkipEntry>,
-    pub(crate) body: usize,
+pub(super) struct ListHeader {
+    pub(super) n: u64,
+    pub(super) blocks: Vec<Block>,
+    pub(super) entries: Vec<SkipEntry>,
+    pub(super) body: usize,
 }
 
 impl ListHeader {
     /// `parse_skips = false` só pula a tabela (decodificação completa).
-    pub(crate) fn parse(bytes: &[u8], parse_skips: bool) -> Result<Self, Error> {
+    pub(super) fn parse(bytes: &[u8], parse_skips: bool) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
         let n = r.varint()?;
         let s = r.varint()?;

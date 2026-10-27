@@ -7,7 +7,7 @@ use crate::engine::view::{Source, View};
 use crate::query::Clause;
 
 impl View<'_> {
-    pub(crate) fn check_phrases(&self, clauses: &[Clause]) -> Result<()> {
+    pub(super) fn check_phrases(&self, clauses: &[Clause]) -> Result<()> {
         if !self.engine.positions && clauses.iter().any(|c| matches!(c, Clause::Phrase(_))) {
             return Err(Error::Config("banco sem posições: busca por frase indisponível".into()));
         }
@@ -15,7 +15,7 @@ impl View<'_> {
     }
 
     /// As listas `pos:` dos termos de uma frase, na ordem dos termos.
-    pub(crate) fn load_positions(&self, phrase: &[(u32, u64)]) -> Result<Vec<rocksdb::DBPinnableSlice<'_>>> {
+    pub(super) fn load_positions(&self, phrase: &[(u32, u64)]) -> Result<Vec<rocksdb::DBPinnableSlice<'_>>> {
         phrase
             .iter()
             .map(|&(_, node)| {
@@ -28,15 +28,15 @@ impl View<'_> {
 }
 
 /// Confere uma frase documento a documento (em ordem crescente).
-pub(crate) struct PhraseMatcher<'s> {
-    pub(crate) offsets: Vec<u32>,
-    pub(crate) cursors: Vec<PositionsCursor<'s>>,
-    pub(crate) positions: Vec<Vec<u32>>,
-    pub(crate) at: Vec<usize>,
+pub(super) struct PhraseMatcher<'s> {
+    offsets: Vec<u32>,
+    cursors: Vec<PositionsCursor<'s>>,
+    positions: Vec<Vec<u32>>,
+    at: Vec<usize>,
 }
 
 impl<'s> PhraseMatcher<'s> {
-    pub(crate) fn new(phrase: &[(u32, u64)], slices: &'s [rocksdb::DBPinnableSlice<'_>]) -> Result<Self> {
+    pub(super) fn new(phrase: &[(u32, u64)], slices: &'s [rocksdb::DBPinnableSlice<'_>]) -> Result<Self> {
         let cursors = slices.iter().map(|s| PositionsCursor::new(s)).collect::<Result<_>>()?;
         Ok(Self {
             offsets: phrase.iter().map(|&(o, _)| o).collect(),
@@ -48,7 +48,7 @@ impl<'s> PhraseMatcher<'s> {
 
     /// Quantas vezes a frase aparece em `doc`, e quantas dessas no título
     /// (as que começam antes de `title_span`). `first_only` para na primeira.
-    pub(crate) fn count(&mut self, doc: DocId, first_only: bool, title_span: u32) -> Result<(u32, u32)> {
+    pub(super) fn count(&mut self, doc: DocId, first_only: bool, title_span: u32) -> Result<(u32, u32)> {
         for (cursor, positions) in self.cursors.iter_mut().zip(&mut self.positions) {
             if !cursor.seek(doc, positions)? {
                 return Ok((0, 0));
@@ -61,7 +61,7 @@ impl<'s> PhraseMatcher<'s> {
 /// Quantos `p` existem com o termo `i` na posição `p + offsets[i]`, para todo
 /// `i`, e quantos desses `p` ficam antes de `title_span` (no título). As listas
 /// estão em ordem crescente, então basta um ponteiro por termo.
-pub(crate) fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool, title_span: u32) -> (u32, u32) {
+pub(super) fn count_phrase(offsets: &[u32], positions: &[Vec<u32>], at: &mut [usize], first_only: bool, title_span: u32) -> (u32, u32) {
     at.fill(0);
     let (mut count, mut in_title) = (0, 0);
     'anchors: for &p0 in &positions[0] {

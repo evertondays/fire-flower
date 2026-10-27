@@ -19,7 +19,7 @@ pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)], p
     }));
 }
 
-pub(crate) fn encode_positions_with<'p>(buf: &mut Vec<u8>, n: usize, entries: impl Iterator<Item = (DocId, &'p [u32])>) {
+pub(super) fn encode_positions_with<'p>(buf: &mut Vec<u8>, n: usize, entries: impl Iterator<Item = (DocId, &'p [u32])>) {
     let write = |out: &mut Vec<u8>, blocks: &mut Vec<(DocId, usize)>| {
         let start = out.len();
         let mut prev = 0;
@@ -59,16 +59,16 @@ pub fn decode_positions(bytes: &[u8]) -> Result<Vec<(DocId, Vec<u32>)>, Error> {
 /// saltos até o bloco do documento e, dentro do bloco, pula as posições dos
 /// documentos que não interessam byte a byte.
 pub struct PositionsCursor<'a> {
-    pub(crate) r: Reader<'a>,
-    pub(crate) body: usize,
-    pub(crate) n: u64,
-    pub(crate) blocks: Vec<Block>,
+    r: Reader<'a>,
+    body: usize,
+    n: u64,
+    blocks: Vec<Block>,
     /// Bloco da próxima entrada a ler (a de `head` já foi lida).
-    pub(crate) block: usize,
-    pub(crate) remaining: u64,
-    pub(crate) prev: DocId,
+    block: usize,
+    remaining: u64,
+    prev: DocId,
     /// Cabeçalho (doc, k) já lido, com as posições ainda por ler.
-    pub(crate) head: Option<(DocId, u64)>,
+    head: Option<(DocId, u64)>,
 }
 
 impl<'a> PositionsCursor<'a> {
@@ -79,7 +79,7 @@ impl<'a> PositionsCursor<'a> {
 
     /// Se o bloco da próxima entrada termina antes de `target`, vai direto
     /// ao primeiro bloco que pode conter `target`.
-    pub(crate) fn jump(&mut self, target: DocId) {
+    fn jump(&mut self, target: DocId) {
         if self.blocks.is_empty() || self.remaining == 0 {
             return;
         }
@@ -104,7 +104,7 @@ impl<'a> PositionsCursor<'a> {
     }
 
     /// Próximo documento da lista (sem consumir as posições dele).
-    pub(crate) fn next_doc(&mut self) -> Result<Option<DocId>, Error> {
+    pub(super) fn next_doc(&mut self) -> Result<Option<DocId>, Error> {
         if let Some((_, k)) = self.head.take() {
             self.r.skip_varints(k)?;
         }
@@ -125,7 +125,7 @@ impl<'a> PositionsCursor<'a> {
         Ok(Some(doc))
     }
 
-    pub(crate) fn read_positions(&mut self, out: &mut Vec<u32>) -> Result<(), Error> {
+    pub(super) fn read_positions(&mut self, out: &mut Vec<u32>) -> Result<(), Error> {
         let (_, k) = self.head.take().ok_or_else(|| corrupt("posições sem documento"))?;
         out.clear();
         let mut p: u64 = 0;

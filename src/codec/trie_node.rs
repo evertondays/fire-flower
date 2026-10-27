@@ -15,7 +15,7 @@ pub struct TrieNode {
     pub is_end_of_word: bool,
 }
 
-pub(crate) const FLAG_END_OF_WORD: u8 = 1;
+const FLAG_END_OF_WORD: u8 = 1;
 
 impl TrieNode {
     pub fn encode(&self) -> Vec<u8> {

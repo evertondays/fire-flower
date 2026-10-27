@@ -1,6 +1,6 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v3; a codificação está em `codec.rs`):
+//! Espaços de chave (formato v5; a codificação está em `src/codec/`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
 //! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
 //! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
@@ -61,23 +61,23 @@ pub use self::writer::{CommitStats, IndexBatch};
 /// Motor de busca. É `Sync`: compartilhe via `Arc<Engine>`. Buscas rodam em
 /// paralelo entre si e com a indexação; só um [`IndexBatch`] existe por vez.
 pub struct Engine {
-    pub(crate) db: DB,
-    pub(crate) writer: Mutex<WriterState>,
-    pub(crate) config: Config,
-    pub(crate) stopwords: Stopwords,
+    db: DB,
+    writer: Mutex<WriterState>,
+    config: Config,
+    stopwords: Stopwords,
     /// Stemming gravado no banco (`meta:stemming`).
-    pub(crate) stemmer: Stemmer,
+    stemmer: Stemmer,
     /// Stemmer das flexões na consulta (`meta:inflections`).
-    pub(crate) inflector: Stemmer,
+    inflector: Stemmer,
     /// O banco grava posições (`meta:positions`).
-    pub(crate) positions: bool,
+    positions: bool,
     /// Número do último commit gravado (ver [`EpochCache`]).
-    pub(crate) epoch: AtomicU64,
-    pub(crate) norms: EpochCache<NormBlock>,
+    epoch: AtomicU64,
+    norms: EpochCache<NormBlock>,
     /// Nós rasos da Trie (até `Config::reader_cache_depth`).
-    pub(crate) nodes: EpochCache<TrieNode>,
+    nodes: EpochCache<TrieNode>,
     /// Guardadas para ler as estatísticas depois do `open`.
-    pub(crate) opts: Options,
+    opts: Options,
 }
 
 impl Engine {
@@ -301,7 +301,7 @@ impl Engine {
     /// Uma busca faz várias leituras (um `Get` por caractere, mais as listas).
     /// O snapshot garante que todas vejam o mesmo momento do índice, mesmo que
     /// um commit aconteça no meio.
-    pub(crate) fn view(&self) -> View<'_> {
+    fn view(&self) -> View<'_> {
         // Antes do snapshot: ver `EpochCache`.
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
         View { snap: self.db.snapshot(), epoch, engine: self }

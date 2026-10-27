@@ -43,7 +43,7 @@ pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
 /// Lê o tf de uma entrada e, se houver, o do título: `(tf, tf no título)`.
 /// Sempre embutida: está no laço mais quente da decodificação de listas.
 #[inline(always)]
-pub(crate) fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
+fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
     let packed = r.varint()?;
     let tf = u32::try_from(packed >> 1).map_err(|_| corrupt("tf estourou u32"))?;
     let title_tf = if packed & 1 == 1 { r.u32()? } else { 0 };
@@ -92,17 +92,17 @@ pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
 /// blocos inteiros pela tabela de saltos: achar um documento numa lista de
 /// 100 mil entradas decodifica no máximo um bloco (`SKIP_BLOCK` entradas).
 pub struct PostingsCursor<'a> {
-    pub(crate) r: Reader<'a>,
-    pub(crate) body: usize,
-    pub(crate) n: u64,
-    pub(crate) blocks: Vec<Block>,
+    r: Reader<'a>,
+    body: usize,
+    n: u64,
+    blocks: Vec<Block>,
     /// Bloco da próxima entrada a ler.
-    pub(crate) block: usize,
+    block: usize,
     /// Entradas já lidas.
-    pub(crate) read: u64,
-    pub(crate) prev: DocId,
+    read: u64,
+    prev: DocId,
     /// A última entrada lida (a primeira com documento ≥ o último alvo).
-    pub(crate) current: Option<Posting>,
+    current: Option<Posting>,
 }
 
 impl<'a> PostingsCursor<'a> {

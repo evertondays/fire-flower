@@ -103,7 +103,7 @@ pub enum InflectionMode {
 }
 
 impl Config {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         let in_unit = |v: f64| (0.0..=1.0).contains(&v);
         let ok = self.bm25_k1.is_finite()
             && self.bm25_k1 >= 0.0

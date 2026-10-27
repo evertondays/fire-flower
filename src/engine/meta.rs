@@ -16,7 +16,7 @@ pub const FORMAT_VERSION: u64 = 5;
 
 /// Confere a versão do formato e se o banco tem posições. Num banco novo,
 /// grava as duas coisas.
-pub(crate) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<bool> {
+pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<bool> {
     match read_counter(db, META_FORMAT)? {
         Some(FORMAT_VERSION) => {
             let stored = read_counter(db, META_POSITIONS)?
@@ -46,13 +46,13 @@ pub(crate) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<
     }
 }
 
-pub(crate) fn old_format() -> Error {
+fn old_format() -> Error {
     Error::Config("formato antigo (v1, sem tf nem posições); recarregue o banco".into())
 }
 
 /// O RocksDB grava as opções da última abertura em `OPTIONS-<n>`, inclusive o
 /// nome do merge operator, que muda a cada formato.
-pub(crate) fn previous_merge_operator(path: &Path) -> Option<String> {
+pub(super) fn previous_merge_operator(path: &Path) -> Option<String> {
     let entries = std::fs::read_dir(path).ok()?;
     let (_, latest) = entries
         .filter_map(|e| e.ok())
@@ -70,7 +70,7 @@ pub(crate) fn previous_merge_operator(path: &Path) -> Option<String> {
 
 /// Lê o formato gravado sem abrir para escrita (sem merge operator, sem
 /// recuperar o WAL) e monta o erro: v1 (sem `meta:format`) ou outra versão.
-pub(crate) fn stored_format_error(path: &Path) -> Option<Error> {
+pub(super) fn stored_format_error(path: &Path) -> Option<Error> {
     let db = DB::open_for_read_only(&Options::default(), path, false).ok()?;
     match read_counter(&db, META_FORMAT).ok()? {
         None if read_counter(&db, META_NEXT_NODE).ok()?.is_some() => Some(old_format()),
@@ -83,7 +83,7 @@ pub(crate) fn stored_format_error(path: &Path) -> Option<Error> {
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
 /// (ou o padrão).
-pub(crate) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
+pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
     let normalize = |langs: &[Language]| Stopwords::new(langs).languages().to_vec();
     let stored = match db.get_pinned(META_LANGUAGES)? {
         Some(v) => Some(parse_languages(&String::from_utf8_lossy(&v))?),
@@ -110,7 +110,7 @@ pub(crate) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
 /// Stemming do banco (`key` = `meta:stemming` ou `meta:inflections`). Num
 /// banco sem a chave, grava o da config (ou `Off`); um banco que já tem dados
 /// e não tem a chave é de antes dela: `Off`.
-pub(crate) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
+pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
     let what = if key == META_STEMMING { "stemming" } else { "flexões na consulta" };
     let stored = match db.get_pinned(key)? {
         Some(v) => {
@@ -135,7 +135,7 @@ pub(crate) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) ->
     Ok(stemming)
 }
 
-pub(crate) fn parse_languages(codes: &str) -> Result<Vec<Language>> {
+fn parse_languages(codes: &str) -> Result<Vec<Language>> {
     codes
         .split(',')
         .filter(|c| !c.trim().is_empty())
@@ -143,11 +143,11 @@ pub(crate) fn parse_languages(codes: &str) -> Result<Vec<Language>> {
         .collect()
 }
 
-pub(crate) fn read_counter(db: &DB, key: &[u8]) -> Result<Option<u64>> {
+pub(super) fn read_counter(db: &DB, key: &[u8]) -> Result<Option<u64>> {
     db.get_pinned(key)?.map(|v| codec::get_varint(&v)).transpose()
 }
 
-pub(crate) fn varint(v: u64) -> Vec<u8> {
+pub(super) fn varint(v: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     codec::put_varint(&mut buf, v);
     buf
@@ -157,7 +157,7 @@ pub(crate) fn varint(v: u64) -> Vec<u8> {
 /// gravação mais nova vencendo (ver `codec::merge_postings`). É associativo,
 /// então o RocksDB pode combinar pedaços consecutivos em qualquer agrupamento.
 /// Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
-pub(crate) fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+pub(super) fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
     let inputs = existing.into_iter().chain(operands.iter());
     if key.starts_with(POST) {
         codec::merge_postings(inputs)

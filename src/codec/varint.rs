@@ -17,17 +17,17 @@ pub fn get_varint(bytes: &[u8]) -> Result<u64, Error> {
     Ok(v)
 }
 
-pub(crate) struct Reader<'a> {
-    pub(crate) buf: &'a [u8],
-    pub(crate) pos: usize,
+pub(super) struct Reader<'a> {
+    pub(super) buf: &'a [u8],
+    pub(super) pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
+    pub(super) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    pub(crate) fn byte(&mut self) -> Result<u8, Error> {
+    pub(super) fn byte(&mut self) -> Result<u8, Error> {
         let b = *self.buf.get(self.pos).ok_or_else(|| corrupt("valor truncado"))?;
         self.pos += 1;
         Ok(b)
@@ -35,7 +35,7 @@ impl<'a> Reader<'a> {
 
     /// A maioria dos valores (deltas, tf, posições) cabe em 1 byte.
     #[inline(always)]
-    pub(crate) fn varint(&mut self) -> Result<u64, Error> {
+    pub(super) fn varint(&mut self) -> Result<u64, Error> {
         if let Some(&b) = self.buf.get(self.pos)
             && b < 0x80
         {
@@ -46,7 +46,7 @@ impl<'a> Reader<'a> {
     }
 
     #[cold]
-    pub(crate) fn varint_slow(&mut self) -> Result<u64, Error> {
+    fn varint_slow(&mut self) -> Result<u64, Error> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
             let b = self.byte()?;
@@ -58,13 +58,13 @@ impl<'a> Reader<'a> {
         Err(corrupt("varint longo demais"))
     }
 
-    pub(crate) fn u32(&mut self) -> Result<u32, Error> {
+    pub(super) fn u32(&mut self) -> Result<u32, Error> {
         u32::try_from(self.varint()?).map_err(|_| corrupt("valor estourou u32"))
     }
 
     /// Pula `k` varints sem decodificar: conta os bytes de fim (bit alto zerado).
     #[inline]
-    pub(crate) fn skip_varints(&mut self, mut k: u64) -> Result<(), Error> {
+    pub(super) fn skip_varints(&mut self, mut k: u64) -> Result<(), Error> {
         while k > 0 {
             let b = *self.buf.get(self.pos).ok_or_else(|| corrupt("valor truncado"))?;
             self.pos += 1;
@@ -73,11 +73,11 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish(&self) -> Result<(), Error> {
+    pub(super) fn finish(&self) -> Result<(), Error> {
         if self.pos == self.buf.len() { Ok(()) } else { Err(corrupt("bytes sobrando no valor")) }
     }
 }
 
-pub(crate) fn corrupt(msg: &str) -> Error {
+pub(super) fn corrupt(msg: &str) -> Error {
     Error::Corrupt(msg.to_string())
 }

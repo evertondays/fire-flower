@@ -27,7 +27,7 @@ impl View<'_> {
     ///
     /// Num termo frequente, a maior parte da lista (tf baixo) fica de fora sem
     /// leitura de tamanho nem nota exata.
-    pub(crate) fn top_single_term(&self, list: &[Posting], weight: f64, bound: &Bound, bm25: &Bm25, k: usize) -> Result<Vec<Hit>> {
+    pub(super) fn top_single_term(&self, list: &[Posting], weight: f64, bound: &Bound, bm25: &Bm25, k: usize) -> Result<Vec<Hit>> {
         self.top_by_levels(
             list,
             |p| p.doc,
@@ -42,7 +42,7 @@ impl View<'_> {
     /// Uma palavra com flexões sozinha: como [`View::top_single_term`], com a
     /// chave da exata somada à das flexões (com peso `alpha`) e arredondada
     /// para cima, que continua sendo um limite da nota.
-    pub(crate) fn top_single_group(
+    pub(super) fn top_single_group(
         &self,
         entries: &[(Posting, Posting)],
         weight: f64,
@@ -76,7 +76,7 @@ impl View<'_> {
     /// O top-k de uma parte só, por níveis de chave: `key` é um limite da nota
     /// (pela tabela de `bound`) e `score`, a nota exata.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn top_by_levels<T>(
+    fn top_by_levels<T>(
         &self,
         list: &[T],
         doc_of: impl Fn(&T) -> DocId,
@@ -148,13 +148,13 @@ impl View<'_> {
 
 /// Os `k` melhores resultados vistos até agora.
 pub(crate) struct TopK {
-    pub(crate) k: usize,
+    k: usize,
     /// O topo do heap é o pior dos guardados.
-    pub(crate) heap: BinaryHeap<Worst>,
+    heap: BinaryHeap<Worst>,
 }
 
 /// Ordem de "pior": nota menor; no empate, ID maior.
-pub(crate) struct Worst(pub(crate) Hit);
+struct Worst(pub(crate) Hit);
 
 impl PartialEq for Worst {
     fn eq(&self, other: &Self) -> bool {
@@ -183,13 +183,13 @@ impl TopK {
 
     /// Nota do pior guardado, quando já há `k`: só entra quem passar dela.
     #[inline]
-    pub(crate) fn threshold(&self) -> Option<f64> {
+    pub(super) fn threshold(&self) -> Option<f64> {
         self.worst().map(|w| w.score)
     }
 
     /// O pior guardado, quando já há `k`.
     #[inline]
-    pub(crate) fn worst(&self) -> Option<Hit> {
+    fn worst(&self) -> Option<Hit> {
         if self.heap.len() < self.k { None } else { self.heap.peek().map(|w| w.0) }
     }
 

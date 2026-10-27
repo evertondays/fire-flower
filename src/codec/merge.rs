@@ -8,22 +8,22 @@ use crate::codec::varint::{Reader, corrupt};
 
 /// Uma lista codificada, pronta para o merge.
 pub(crate) struct Scan {
-    pub(crate) n: u64,
-    pub(crate) first: DocId,
-    pub(crate) last: DocId,
+    n: u64,
+    first: DocId,
+    last: DocId,
     /// Onde começa a primeira entrada (depois da tabela).
-    pub(crate) body: usize,
+    body: usize,
     /// Onde termina o Δdoc da primeira entrada.
-    pub(crate) after_first_delta: usize,
+    after_first_delta: usize,
     /// Tabela de saltos (vazia numa lista pequena).
-    pub(crate) skips: Vec<SkipEntry>,
+    skips: Vec<SkipEntry>,
 }
 
 /// Lista grande: o último documento vem da tabela e o primeiro da primeira
 /// entrada, sem percorrer o resto (o merge na leitura de um termo frequente
 /// com pedaços pendentes fazia isso a cada leitura). Lista pequena: percorre
 /// e valida.
-pub(crate) fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
+fn scan(bytes: &[u8], positions: bool) -> Result<Scan, Error> {
     let header = ListHeader::parse(bytes, true)?;
     let n = header.n;
     let mut r = Reader { buf: bytes, pos: header.body };
@@ -63,7 +63,7 @@ pub fn merge_positions<'a>(inputs: impl Iterator<Item = &'a [u8]>) -> Option<Vec
     merge_lists(inputs, true)
 }
 
-pub(crate) fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions: bool) -> Option<Vec<u8>> {
+pub(super) fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions: bool) -> Option<Vec<u8>> {
     let mut lists: Vec<(&[u8], Scan)> = Vec::new();
     for bytes in inputs {
         let s = scan(bytes, positions).ok()?;
@@ -113,7 +113,7 @@ pub(crate) fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, positions:
 
 /// Ordenação estável por doc: entre entradas do mesmo doc, a ordem dos
 /// pedaços se mantém e a última (a mais nova) fica.
-pub(crate) fn merge_postings_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
+fn merge_postings_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
     let mut all: Vec<(DocId, u32, u32)> = Vec::with_capacity(lists.iter().map(|(_, s)| s.n as usize).sum());
     for (bytes, _) in lists {
         all.extend(decode_postings(bytes)?.into_iter().map(|p| (p.doc, p.tf, p.title_tf)));
@@ -131,7 +131,7 @@ pub(crate) fn merge_postings_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Er
     Ok(out)
 }
 
-pub(crate) fn merge_positions_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
+fn merge_positions_slow(lists: &[(&[u8], Scan)]) -> Result<Vec<u8>, Error> {
     let mut flat: Vec<u32> = Vec::new();
     // (doc, início em `flat`, quantas)
     let mut all: Vec<(DocId, usize, usize)> = Vec::new();

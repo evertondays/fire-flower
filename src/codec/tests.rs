@@ -612,3 +612,22 @@ fn patch_merge_copies_untouched_blocks() {
     assert!(ListHeader::parse(&shrunk, true).unwrap().blocks.is_empty());
     assert_eq!(decode_postings(&shrunk).unwrap(), full[60..300]);
 }
+
+/// A carga grava uma lista em pedaços crescentes; uma edição depois deles não
+/// pode fazer o merge regravar a lista inteira: os pedaços viram a base do
+/// remendo e só o bloco do documento editado muda.
+#[test]
+fn patch_over_a_list_loaded_in_pieces() {
+    let full = sample_list(3000, 33);
+    let mut pieces: Vec<Vec<u8>> = full.chunks(300).map(encode_postings).collect();
+    let gone = full[1234].doc;
+    pieces.push(tombstones(&[gone]));
+    let merged = merge_postings(pieces.iter().map(Vec::as_slice)).unwrap();
+    let want: Vec<Posting> = full.iter().copied().filter(|p| p.doc != gone).collect();
+    assert_eq!(decode_postings(&merged).unwrap(), want);
+    let concat = merge_postings(pieces[..10].iter().map(Vec::as_slice)).unwrap();
+    let blocks = |b: &[u8]| ListHeader::parse(b, true).unwrap().entries;
+    let (before, after) = (blocks(&concat), blocks(&merged));
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.iter().zip(&after).filter(|(a, b)| a != b).count(), 1, "só o bloco do documento removido muda");
+}

@@ -57,18 +57,17 @@ pub fn merge_positions<'a>(inputs: impl Iterator<Item = &'a [u8]>) -> Option<Vec
 /// Une `inputs` (do mais antigo para o mais novo). `full` descarta as
 /// lápides (merge completo); senão elas ficam (merge parcial).
 ///
-/// Três caminhos, do mais barato para o mais caro:
-/// 1. **Concatenar:** cada pedaço começa depois do fim do anterior (a carga,
-///    com IDs crescentes). Cada pedaço é copiado com um `memcpy`; só o delta
-///    da primeira entrada é refeito.
-/// 2. **Remendo:** o pedaço mais antigo é grande (tem tabela de saltos) e os
-///    outros se sobrepõem a ele (edições, reindexação). Os mais novos são
-///    unidos num remendo pequeno; os blocos da base que o remendo não toca são
-///    copiados, e só os tocados são relidos e regravados.
-/// 3. **Reconstruir:** o resto (pedaços pequenos): percorre tudo e regrava.
+/// A **base** é o maior trecho inicial de pedaços em que cada um começa
+/// depois do fim do anterior (a carga, com IDs crescentes, grava assim); o
+/// **remendo** é o resto (edições, reindexação), unido de uma vez só por
+/// documento. Os blocos da base que o remendo não toca são copiados com um
+/// `memcpy` (só o delta da primeira entrada de cada trecho é refeito), e só
+/// os tocados são relidos e regravados. Sem remendo, isso é a concatenação dos
+/// pedaços; sem base (o primeiro pedaço tem lápides que o merge completo
+/// precisa tirar), tudo é relido e regravado.
 ///
-/// Nenhum dos caminhos decodifica o conteúdo das entradas (tf, posições): os
-/// bytes de cada entrada são copiados como estão.
+/// Nenhum caminho decodifica o conteúdo das entradas (tf, posições): os bytes
+/// de cada entrada são copiados como estão.
 pub fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, kind: ListKind, full: bool) -> Option<Vec<u8>> {
     let mut lists: Vec<Scan<'a>> = Vec::new();
     for bytes in inputs {
@@ -77,28 +76,24 @@ pub fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, kind: ListKind, f
             lists.push(s);
         }
     }
-    let any_tombstone = lists.iter().any(|s| s.header.tombstones);
     let (bytes, blocks) = (lists.iter().map(|s| s.bytes.len()).sum(), lists.iter().map(|s| s.table().len()).sum());
     let mut out = Out::new(full, bytes, blocks);
-    if lists.windows(2).all(|w| w[0].last < w[1].first) && !(full && any_tombstone) {
-        for s in &lists {
-            s.copy_blocks(0..s.table().len(), &mut out).ok()?;
-        }
-        return Some(out.finish());
+    // Uma lista com lápides só entra na base num merge parcial: blocos
+    // copiados levam as lápides junto.
+    let usable = |s: &Scan<'_>| !(full && s.header.tombstones);
+    let mut base = lists.iter().take_while(|s| usable(s)).count().min(1);
+    while base > 0 && base < lists.len() && lists[base - 1].last < lists[base].first && usable(&lists[base]) {
+        base += 1;
     }
-    let patch = lists.first().is_some_and(|b| !(b.header.blocks.is_empty() || full && b.header.tombstones));
-    let result = if patch {
-        let overlay = newest_entries(&lists[1..], kind).ok()?;
-        apply_patch(&lists[0], &overlay, &mut out).map(|_| out.finish())
+    let overlay = newest_entries(&lists[base..], kind).ok()?;
+    if base == 0 {
+        for e in &overlay {
+            out.push(e);
+        }
     } else {
-        newest_entries(&lists, kind).map(|entries| {
-            for e in &entries {
-                out.push(e);
-            }
-            out.finish()
-        })
-    };
-    result.ok()
+        apply_patch(&lists[..base], &overlay, &mut out).ok()?;
+    }
+    Some(out.finish())
 }
 
 /// Uma lista codificada, pronta para o merge.
@@ -245,48 +240,51 @@ fn newest_entries<'a>(lists: &[Scan<'a>], kind: ListKind) -> Result<Vec<Entry<'a
     Ok(all)
 }
 
-/// Aplica `overlay` (mais novo, em ordem de documento) sobre `base` (grande):
-/// os blocos da base sem documento do remendo são copiados; os outros, relidos
-/// e regravados com as entradas do remendo no lugar.
-fn apply_patch(base: &Scan<'_>, overlay: &[Entry<'_>], out: &mut Out) -> Result<(), Error> {
+/// Aplica `overlay` (mais novo, em ordem de documento) sobre `base` (listas
+/// em sequência, cada uma depois do fim da anterior): os blocos sem documento
+/// do remendo são copiados; os outros, relidos e regravados com as entradas
+/// do remendo no lugar.
+fn apply_patch(base: &[Scan<'_>], overlay: &[Entry<'_>], out: &mut Out) -> Result<(), Error> {
     let mut at = 0;
-    // Blocos sem documento do remendo desde `untouched`: copiados juntos.
-    let mut untouched = 0;
-    for (i, blk) in base.table().iter().enumerate() {
-        let end = at + overlay[at..].partition_point(|e| e.doc <= blk.last);
-        if end == at {
-            continue;
-        }
-        base.copy_blocks(untouched..i, out)?;
-        untouched = i + 1;
-        let start = base.start(i);
-        let mut entries = base.entries(start, base.prev_of(i), blk.count);
-        let mut current = entries.next_entry()?;
-        while current.is_some() || at < end {
-            let take_overlay = match (&current, overlay.get(at).filter(|_| at < end)) {
-                (Some(c), Some(o)) => o.doc <= c.doc,
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            if take_overlay {
-                let o = &overlay[at];
-                if current.as_ref().is_some_and(|c| c.doc == o.doc) {
+    for list in base {
+        // Blocos sem documento do remendo desde `untouched`: copiados juntos.
+        let mut untouched = 0;
+        for (i, blk) in list.table().iter().enumerate() {
+            let end = at + overlay[at..].partition_point(|e| e.doc <= blk.last);
+            if end == at {
+                continue;
+            }
+            list.copy_blocks(untouched..i, out)?;
+            untouched = i + 1;
+            let start = list.start(i);
+            let mut entries = list.entries(start, list.prev_of(i), blk.count);
+            let mut current = entries.next_entry()?;
+            while current.is_some() || at < end {
+                let take_overlay = match (&current, overlay.get(at).filter(|_| at < end)) {
+                    (Some(c), Some(o)) => o.doc <= c.doc,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if take_overlay {
+                    let o = &overlay[at];
+                    if current.as_ref().is_some_and(|c| c.doc == o.doc) {
+                        current = entries.next_entry()?;
+                    }
+                    out.push(o);
+                    at += 1;
+                } else {
+                    let c = current.take().expect("há uma entrada da base");
+                    out.push(&c);
                     current = entries.next_entry()?;
                 }
-                out.push(o);
-                at += 1;
-            } else {
-                let c = current.take().expect("há uma entrada da base");
-                out.push(&c);
-                current = entries.next_entry()?;
             }
+            if entries.r.pos != start + blk.bytes {
+                return Err(corrupt("bloco da tabela de saltos não bate com as entradas"));
+            }
+            out.close_block();
         }
-        if entries.r.pos != start + blk.bytes {
-            return Err(corrupt("bloco da tabela de saltos não bate com as entradas"));
-        }
-        out.close_block();
+        list.copy_blocks(untouched..list.table().len(), out)?;
     }
-    base.copy_blocks(untouched..base.table().len(), out)?;
     for e in &overlay[at..] {
         out.push(e);
     }

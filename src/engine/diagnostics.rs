@@ -3,7 +3,7 @@
 use crate::{Config, DocId, Engine, Error, Posting, Result, codec};
 use crate::analysis::normalize_term;
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
-use crate::engine::keys::{Key, META_NEXT_NODE, NORM, POS, ROOT_ID};
+use crate::engine::keys::{FWD, Key, META_NEXT_NODE, NORM, POS, ROOT_ID};
 use crate::engine::meta::read_counter;
 use crate::engine::view::{Source, load_node, missing_node};
 
@@ -52,6 +52,12 @@ impl Engine {
             Some(v) => codec::decode_positions(&v),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Nós terminais dos termos de um documento, como gravados em `fwd:`
+    /// (`None` se o documento não existe ou o banco não grava `fwd:`).
+    pub fn document_nodes(&self, doc_id: DocId) -> Result<Option<Vec<u64>>> {
+        self.view().snap.get_bytes(Key::new(FWD, doc_id).as_ref())?.map(|v| codec::decode_node_set(&v)).transpose()
     }
 
     /// Percorre os tamanhos de todos os documentos (em ordem de bloco):

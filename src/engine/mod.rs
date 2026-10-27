@@ -28,7 +28,7 @@ use crate::engine::keys::{
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::meta::{
-    full_merge, partial_merge, previous_merge_operator, read_counter, resolve_format, resolve_languages,
+    Features, full_merge, partial_merge, previous_merge_operator, read_counter, resolve_format, resolve_languages,
     resolve_stemming, stored_format_error,
 };
 use crate::engine::view::View;
@@ -71,6 +71,8 @@ pub struct Engine {
     inflector: Stemmer,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
+    /// O banco grava os termos de cada documento (`meta:edits`, `fwd:`).
+    edits: bool,
     /// Número do último commit gravado (ver [`EpochCache`]).
     epoch: AtomicU64,
     norms: EpochCache<NormBlock>,
@@ -133,7 +135,7 @@ impl Engine {
             // recuperação, porque o merge operator não entende o formato antigo.
             Err(e) => return Err(stored_format_error(path).unwrap_or(Error::Db(e))),
         };
-        let positions = resolve_format(&db, config.positions)?;
+        let Features { positions, edits } = resolve_format(&db, config.positions, config.edits)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
         let stats = IndexStats {
@@ -166,6 +168,7 @@ impl Engine {
             stemmer,
             inflector,
             positions,
+            edits,
             epoch: AtomicU64::new(0),
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
@@ -191,7 +194,9 @@ impl Engine {
             cache_limit: self.config.writer_cache_nodes,
             dirty: Vec::new(),
             pending: FxHashMap::default(),
-            lengths: Vec::new(),
+            ops: Vec::new(),
+            last_op: FxHashMap::default(),
+            repeated: false,
             labels: Vec::new(),
             analyzer,
         }
@@ -202,6 +207,18 @@ impl Engine {
         let mut batch = self.batch();
         batch.add_document(doc_id, text)?;
         batch.commit()
+    }
+
+    /// Atalho para remover um único documento ([`IndexBatch::delete_document`]).
+    pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
+        let mut batch = self.batch();
+        batch.delete_document(doc_id)?;
+        batch.commit()
+    }
+
+    /// O documento está indexado (adicionado e não removido).
+    pub fn contains(&self, doc_id: DocId) -> Result<bool> {
+        Ok(self.doc_len(doc_id)?.is_some())
     }
 
     /// Busca full-text. Termos separados por espaço são combinados com E
@@ -296,6 +313,12 @@ impl Engine {
     /// O banco grava posições (busca por frase disponível).
     pub fn has_positions(&self) -> bool {
         self.positions
+    }
+
+    /// O banco grava os termos de cada documento: dá para substituir e
+    /// remover documentos ([`Config::edits`]).
+    pub fn has_edits(&self) -> bool {
+        self.edits
     }
 
     /// Uma busca faz várias leituras (um `Get` por caractere, mais as listas).

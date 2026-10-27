@@ -431,6 +431,17 @@ fn norm_block_roundtrip_and_updates() {
     assert_eq!(decoded.get(1023), None, "depois do último deslocamento");
     assert_eq!(decoded.len(), 3);
     assert!(NormBlock::decode(&NormBlock::default().encode()).unwrap().is_empty());
+    // Remover devolve os tamanhos e deixa o bloco igual ao decodificado.
+    let mut block = decoded;
+    assert_eq!(block.remove(900), Some(l(7, 0, 0)));
+    assert_eq!(block.remove(900), None, "já removido");
+    assert_eq!(block.remove(3), None, "nunca existiu");
+    assert_eq!(block.len(), 2);
+    assert_eq!(NormBlock::decode(&block.encode()).unwrap(), block);
+    assert_eq!(block.remove(2), Some(l(0, 0, 0)));
+    assert_eq!(block.remove(5), Some(l(40, 2, 5)));
+    assert!(block.is_empty());
+    assert_eq!(block, NormBlock::default());
 }
 
 fn tombstones(docs: &[DocId]) -> Vec<u8> {

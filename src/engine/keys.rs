@@ -12,6 +12,9 @@ pub(super) const META_FORMAT: &[u8] = b"meta:format";
 /// `1` se o banco grava posições (`pos:`), `0` se não.
 pub(super) const META_POSITIONS: &[u8] = b"meta:positions";
 
+/// `1` se o banco grava os termos de cada documento (`fwd:`), `0` se não.
+pub(super) const META_EDITS: &[u8] = b"meta:edits";
+
 pub(super) const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 
 pub(super) const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
@@ -42,6 +45,9 @@ pub(super) const POS: &[u8] = b"pos:";
 pub(super) const NORM: &[u8] = b"norm:";
 
 pub(super) const DOC: &[u8] = b"doc:";
+
+/// `fwd:<doc>`: os nós terminais dos termos do documento, para editar e remover.
+pub(super) const FWD: &[u8] = b"fwd:";
 
 /// Chave `<prefixo><número>` montada na pilha: o laço do commit monta uma
 /// por termo, e `format!` alocaria uma `String` a cada vez.

@@ -4,6 +4,7 @@
 use fire_flower::{Config, Engine, Posting};
 
 mod concurrency;
+mod editing;
 mod indexing;
 mod phrases;
 mod ranking;

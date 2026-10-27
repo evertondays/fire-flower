@@ -46,8 +46,8 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
     let sample = |rng: &mut Rng, pool: &[&str]| -> Vec<String> {
         if pool.is_empty() { Vec::new() } else { (0..per_set).map(|_| rng.pick(pool).to_string()).collect() }
     };
-    sets.insert("t-raro".into(), sample(&mut rng, &rare));
-    sets.insert("t-medio".into(), sample(&mut rng, &medium));
+    sets.insert("t-rare".into(), sample(&mut rng, &rare));
+    sets.insert("t-mid".into(), sample(&mut rng, &medium));
     sets.insert("t-freq".into(), sample(&mut rng, &freq));
     for len in [3, 8, 15] {
         sets.insert(format!("t-len-{len}"), sample(&mut rng, &by_len(len)));
@@ -74,7 +74,7 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
     let and_of = |rng: &mut Rng, pools: &[&[&str]]| -> String {
         pools.iter().map(|p| *rng.pick(p)).collect::<Vec<_>>().join(" ")
     };
-    sets.insert("and-raro-freq".into(), (0..per_set).map(|_| and_of(&mut rng, &[&rare, &freq])).collect());
+    sets.insert("and-rare-freq".into(), (0..per_set).map(|_| and_of(&mut rng, &[&rare, &freq])).collect());
     sets.insert(
         "and-freq".into(),
         (0..per_set).map(|i| if i % 2 == 0 { and_of(&mut rng, &[&freq, &freq]) } else { and_of(&mut rng, &[&freq, &freq, &freq]) }).collect(),
@@ -115,7 +115,7 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
             p_rare.push(cut(term, n));
         }
     }
-    for (name, list) in [("1", &p1), ("2", &p2), ("4", &p4), ("raro", &p_rare)] {
+    for (name, list) in [("1", &p1), ("2", &p2), ("4", &p4), ("rare", &p_rare)] {
         sets.insert(format!("p-{name}"), list.iter().map(|p| format!("{p}*")).collect());
         sets.insert(format!("s-{name}"), list.clone());
     }
@@ -153,21 +153,21 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
             }
         }
     }
-    sets.insert("titulos".into(), titles);
+    sets.insert("titles".into(), titles);
 
     // Misto: 70% títulos/termos médios, 20% AND, 10% prefixo.
     let mut mixed = Vec::new();
     for i in 0..per_set {
         let source = match i % 10 {
-            0..=3 => "titulos",
-            4..=6 => "t-medio",
+            0..=3 => "titles",
+            4..=6 => "t-mid",
             7 => "and-2",
-            8 => "and-raro-freq",
+            8 => "and-rare-freq",
             _ => "p-4",
         };
         mixed.push(rng.pick(&sets[source]).clone());
     }
-    sets.insert("misto".into(), mixed);
+    sets.insert("mixed".into(), mixed);
 
     // Frases (Fase E do plano de frases e ranking), tiradas de trechos reais.
     let df: HashMap<&str, u32> = vocab.iter().map(|v| (v.term.as_str(), v.df)).collect();
@@ -208,10 +208,10 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
         .take(per_set)
         .map(|w| quote(&w))
         .collect();
-    for (name, list) in [("frase-2", &f2), ("frase-3", &f3), ("frase-stop", &fstop), ("frase-freq", &ffreq)] {
+    for (name, list) in [("phrase-2", &f2), ("phrase-3", &f3), ("phrase-stop", &fstop), ("phrase-freq", &ffreq)] {
         sets.insert(name.into(), list.iter().map(|w| quote(w)).collect());
     }
-    sets.insert("frase-miss".into(), fmiss);
+    sets.insert("phrase-miss".into(), fmiss);
 
     // Ranking (medidos com os 10 melhores): termo frequente, E de termos
     // que aparecem juntos e títulos.
@@ -233,7 +233,7 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
         }
     }
     sets.insert("rank-and".into(), rank_and);
-    sets.insert("rank-titulos".into(), sets["titulos"].clone());
+    sets.insert("rank-titles".into(), sets["titles"].clone());
 
     // Palavras de frequência média cuja forma regular de plural ou singular
     // também está no índice (para medir o custo de somar as flexões). Gerador
@@ -244,7 +244,7 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
         .copied()
         .filter(|t| regular_inflections(t).iter().any(|v| df.get(v.as_str()).is_some_and(|&n| n >= 10)))
         .collect();
-    sets.insert("t-flexao".into(), sample(&mut frng, &with_other));
+    sets.insert("t-inflection".into(), sample(&mut frng, &with_other));
 
     let out = out.unwrap_or_else(|| project_dir().join("bench/queries"));
     std::fs::create_dir_all(&out)?;

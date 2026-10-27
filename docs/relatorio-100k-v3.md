@@ -1,6 +1,6 @@
 # Relatório: rodada de performance 100k — formato v3 (BM25F)
 
-Rodada `python3 scripts/perf.py tudo --escala 100k` de 26/10/2026, no commit
+Rodada `python3 scripts/perf.py all --scale 100k` de 26/10/2026, no commit
 `d088f12` (formato v3, BM25F com peso de título 50). Comparada com a rodada de
 100k de 25/10, no commit `4fe734a` (formato v2, antes do cache de nós, do
 ranking sem reordenar, dos filtros particionados e do plano de relevância).
@@ -82,18 +82,18 @@ BM25F (diferença relativa < 1e-4), inclusive com títulos reais como consulta.
 | Conjunto | p50 em 25/10 | p50 agora | p99 agora |
 |---|---|---|---|
 | `t-miss` | 120 µs | **8 µs** | 32 µs |
-| `t-medio` | 127 µs | **21 µs** | 59 µs |
+| `t-mid` | 127 µs | **21 µs** | 59 µs |
 | `t-freq` | 162 µs | **51 µs** | 98 µs |
-| `titulos` | 248 µs | **35 µs** | 214 µs |
+| `titles` | 248 µs | **35 µs** | 214 µs |
 | `and-2` | 249 µs | **39 µs** | 72 µs |
 | `rank-freq` | 394 µs | **194 µs** | 432 µs |
 | `rank-and` | 422 µs | **117 µs** | 517 µs |
-| `rank-titulos` | 253 µs | **41 µs** | 235 µs |
-| `frase-2` | 454 µs | **181 µs** | 1,4 ms |
-| `frase-freq` | 926 µs | **719 µs** | 1,6 ms |
+| `rank-titles` | 253 µs | **41 µs** | 235 µs |
+| `phrase-2` | 454 µs | **181 µs** | 1,4 ms |
+| `phrase-freq` | 926 µs | **719 µs** | 1,6 ms |
 | `s-2` (autocompletar) | 155 µs | **44 µs** | 107 µs |
 | `p-2` (prefixo de 2 letras) | 2,4 ms | 2,5 ms | 4,9 ms |
-| `misto` | 246 µs | **31 µs** | 1,0 ms |
+| `mixed` | 246 µs | **31 µs** | 1,0 ms |
 
 - **O que trouxe o ganho:** o cache da raiz e dos primeiros níveis da Trie
   (`3e1b2fe`) e o ranking de termo único sem reordenar a lista (`ab395fd`).
@@ -107,11 +107,11 @@ BM25F (diferença relativa < 1e-4), inclusive com títulos reais como consulta.
 | Conjunto | p50 antes de compactar | p50 depois |
 |---|---|---|
 | `t-freq` | 96 µs | 51 µs |
-| `titulos` | 48 µs | 35 µs |
+| `titles` | 48 µs | 35 µs |
 | `and-freq` | 393 µs | 284 µs |
 | `rank-freq` | 259 µs | 194 µs |
-| `frase-2` | 311 µs | 181 µs |
-| `frase-freq` | 1,1 ms | 719 µs |
+| `phrase-2` | 311 µs | 181 µs |
+| `phrase-freq` | 1,1 ms | 719 µs |
 
 A compactação leva 2,7 s (banco de 254 → 237 MB), e abrir o banco + 1 busca
 cai de 32 ms para 18 ms.
@@ -120,9 +120,9 @@ cai de 32 ms para 18 ms.
 
 | Conjunto | 64 MB | 256 MB | 1 GB |
 |---|---|---|---|
-| `t-medio` | 19 µs | 21 µs | 19 µs |
-| `titulos` | 36 µs | 35 µs | 32 µs |
-| `misto` | 37 µs | 31 µs | 32 µs |
+| `t-mid` | 19 µs | 21 µs | 19 µs |
+| `titles` | 36 µs | 35 µs | 32 µs |
+| `mixed` | 37 µs | 31 µs | 32 µs |
 | `p-2` | 2,9 ms | 2,5 ms | 2,5 ms |
 
 Em 25/10, com 64 MB, eram 2,2 ms, 3,6 ms, 3,6 ms e 158 ms. Com os filtros
@@ -131,7 +131,7 @@ cache, e um cache pequeno não derruba mais as buscas.
 
 ## 4. Concorrência
 
-### Só leitura (`misto`)
+### Só leitura (`mixed`)
 
 | Threads | qps | Ganho vs. 1 | p50 | p99 |
 |---|---|---|---|---|
@@ -163,10 +163,10 @@ base de antes do plano.
 
 | Conjunto | top-1 | top-3 | top-10 | MRR |
 |---|---|---|---|---|
-| `rel-titulo` (título → artigo) | 99,3% (81,3%) | 100% (92,8%) | 100% (97,1%) | 0,996 (0,875) |
-| `rel-digitando` (`coreia do nor*`) | 84,4% (64,6%) | 94,2% (81,2%) | 98,0% (90,1%) | 0,897 (0,741) |
+| `rel-title` (título → artigo) | 99,3% (81,3%) | 100% (92,8%) | 100% (97,1%) | 0,996 (0,875) |
+| `rel-typing` (`coreia do nor*`) | 84,4% (64,6%) | 94,2% (81,2%) | 98,0% (90,1%) | 0,897 (0,741) |
 | `rel-hub` (artigo principal em 1º) | 97,9% (38,6%) | 99,9% (68,2%) | 100% (89,0%) | 0,989 (0,560) |
-| `rel-corpo` (busca pelo conteúdo) | 49,5% (49,8%) | 68,4% (68,7%) | 81,5% (81,4%) | 0,610 (0,612) |
+| `rel-body` (busca pelo conteúdo) | 49,5% (49,8%) | 68,4% (68,7%) | 81,5% (81,4%) | 0,610 (0,612) |
 | `rel-manual` (36 consultas à mão) | 66,7% (8,3%) | 94,4% (36,1%) | 100% (55,6%) | 0,811 (0,251) |
 
 O peso do título melhorou tudo o que depende dele sem piorar a busca pelo
@@ -197,7 +197,7 @@ formato.
    disputada por todas as threads. Saídas possíveis: dividir o cache em partes
    ou dar uma cópia de leitura por thread, atualizada a cada commit.
 2. **Os prefixos curtos são a consulta mais cara.** `p-1` e `p-2` levam
-   1,9–2,5 ms, fazem 500 a 850 leituras na Trie e puxam o p99 do `misto`
+   1,9–2,5 ms, fazem 500 a 850 leituras na Trie e puxam o p99 do `mixed`
    para 1 ms. O custo está nos níveis fundos da Trie, onde o cache não
    chega. Um índice ordenado de termos (`term:<palavra>`) resolveria o
    prefixo com uma varredura só.
@@ -211,7 +211,7 @@ formato.
    base inteira serão ~1.100, e a rodada completa vai mostrar se a
    compactação em segundo plano acompanha.
 5. **Ranking com título custa mais que antes do BM25F.** Comparando bancos
-   carregados do mesmo jeito, `rank-and`, `rank-titulos` e `misto` ficaram
+   carregados do mesmo jeito, `rank-and`, `rank-titles` e `mixed` ficaram
    21–25% mais lentos que no v2, contra a meta de ≤ 20%. Com peso 50, o
    limite de um documento com o termo no título fica alto e o corte do top-k
    descarta menos. A busca sem ranking e o `rank-freq` não mudaram.
@@ -236,5 +236,5 @@ formato.
 2. Concorrência: tirar o lock compartilhado dos caches de leitura.
 3. Prefixos curtos: índice ordenado de termos.
 4. Relevância: bônus para título idêntico à consulta.
-5. Rodar a base completa (`perf.py tudo --escala full`) com lote de 10 mil
+5. Rodar a base completa (`perf.py all --scale full`) com lote de 10 mil
    documentos na carga.

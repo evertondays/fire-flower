@@ -91,9 +91,9 @@ pub(crate) fn unique_terms(body: &str, stopwords: &Stopwords) -> Vec<String> {
     index_terms(body, stopwords)
 }
 
-/// "pt,en", "en" ou "nenhum".
+/// "pt,en", "en" ou "none".
 pub(crate) fn parse_languages(codes: &str) -> AnyResult<Vec<Language>> {
-    if codes.trim().eq_ignore_ascii_case("nenhum") {
+    if codes.trim().eq_ignore_ascii_case("none") {
         return Ok(Vec::new());
     }
     codes

@@ -58,14 +58,14 @@ fn bench_tokenize(c: &mut Criterion) {
     let docs = articles();
     let bytes: usize = docs.iter().map(String::len).sum();
     let stopwords = Stopwords::default();
-    let mut g = c.benchmark_group("texto");
+    let mut g = c.benchmark_group("text");
     g.throughput(Throughput::Bytes(bytes as u64));
     g.sample_size(20);
-    g.bench_function("tokenize_1000_artigos", |b| {
+    g.bench_function("tokenize_1000_articles", |b| {
         b.iter(|| docs.iter().map(|d| tokenize(black_box(d)).len()).sum::<usize>())
     });
     // O que a indexação faz por documento: tokens, stopwords e posições por termo.
-    g.bench_function("analyzer_1000_artigos", |b| {
+    g.bench_function("analyzer_1000_articles", |b| {
         let mut analyzer = Analyzer::default();
         b.iter(|| docs.iter().map(|d| analyzer.run(black_box(d), &stopwords) as usize).sum::<usize>())
     });
@@ -96,7 +96,7 @@ fn bench_postings(c: &mut Criterion) {
     // Pedaço que sobrepõe a lista: força o merge lento (ordenação).
     let overlap = encode_postings(&[Posting::new(area[area.len() / 2].doc, 3)]);
 
-    let mut g = c.benchmark_group("listas");
+    let mut g = c.benchmark_group("lists");
     g.bench_function(format!("decode_area_{}_postings", area.len()), |b| {
         b.iter(|| decode_postings(black_box(&area_bytes)).unwrap())
     });
@@ -104,16 +104,16 @@ fn bench_postings(c: &mut Criterion) {
     g.bench_function(format!("decode_positions_area_{}_bytes", area_pos_bytes.len()), |b| {
         b.iter(|| decode_positions(black_box(&area_pos_bytes)).unwrap())
     });
-    g.bench_function("merge_area_mais_8_pedacos", |b| {
+    g.bench_function("merge_area_over_8_chunks", |b| {
         b.iter(|| merge_postings(std::iter::once(black_box(area_bytes.as_slice())).chain(pieces.iter().map(Vec::as_slice))).unwrap())
     });
-    g.bench_function("merge_area_sobreposto", |b| {
+    g.bench_function("merge_area_overlapping", |b| {
         b.iter(|| merge_postings([black_box(area_bytes.as_slice()), overlap.as_slice()].into_iter()).unwrap())
     });
-    g.bench_function(format!("intersect_raro{}_x_area{}", rare.len(), area.len()), |b| {
+    g.bench_function(format!("intersect_rare{}_x_area{}", rare.len(), area.len()), |b| {
         b.iter(|| intersect(black_box(&rare), black_box(&area_docs)))
     });
-    g.bench_function(format!("intersect_populacao{}_x_area{}", population.len(), area.len()), |b| {
+    g.bench_function(format!("intersect_population{}_x_area{}", population.len(), area.len()), |b| {
         b.iter(|| intersect(black_box(&population), black_box(&area_docs)))
     });
     g.finish();
@@ -121,18 +121,18 @@ fn bench_postings(c: &mut Criterion) {
 
 fn bench_search(c: &mut Criterion) {
     let Some(engine) = open_db() else { return };
-    let mut g = c.benchmark_group("busca_100k");
+    let mut g = c.benchmark_group("search_100k");
     for (name, q) in [
-        ("raro", "astrofisica"),
-        ("titulo", "revolução francesa"),
-        ("frequente", "brasil"),
-        ("prefixo", "port*"),
-        ("inexistente", "constituicaox"),
-        ("frase", "\"revolução francesa\""),
+        ("rare", "astrofisica"),
+        ("title", "revolução francesa"),
+        ("frequent", "brasil"),
+        ("prefix", "port*"),
+        ("missing", "constituicaox"),
+        ("phrase", "\"revolução francesa\""),
     ] {
         g.bench_function(name, |b| b.iter(|| engine.search(black_box(q)).unwrap().len()));
     }
-    for (name, q) in [("top10_frequente", "brasil"), ("top10_titulo", "revolução francesa"), ("top10_prefixo", "port*")] {
+    for (name, q) in [("top10_frequent", "brasil"), ("top10_title", "revolução francesa"), ("top10_prefix", "port*")] {
         g.bench_function(name, |b| b.iter(|| engine.search_top(black_box(q), 10).unwrap().len()));
     }
     g.bench_function("suggest_por", |b| b.iter(|| engine.suggest(black_box("por"), 10).unwrap()));
@@ -142,7 +142,7 @@ fn bench_search(c: &mut Criterion) {
 fn bench_index(c: &mut Criterion) {
     let docs = articles();
     let bytes: usize = docs.iter().map(String::len).sum();
-    let mut g = c.benchmark_group("indexacao");
+    let mut g = c.benchmark_group("indexing");
     g.throughput(Throughput::Bytes(bytes as u64));
     g.sample_size(10);
     g.bench_function("1000_artigos_banco_vazio", |b| {

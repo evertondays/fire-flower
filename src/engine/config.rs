@@ -79,7 +79,7 @@ pub struct Config {
     /// Filtros de Bloom e índices dos SSTs em partições de 4 KB (ligado por
     /// padrão). Desligar volta ao filtro inteiro, que num banco grande passa
     /// do tamanho de uma parte do block cache e é relido a cada `Get`; existe
-    /// só para medir esse efeito (`wiki load --filtro-inteiro`).
+    /// só para medir esse efeito (`wiki load --whole-filter`).
     pub partition_filters: bool,
     /// Parâmetro `k1` do BM25: quanto a nota cresce com a frequência do termo.
     pub bm25_k1: f64,

@@ -67,21 +67,21 @@ pub(crate) fn load(
     let result = json!({
         "db": db, "corpus": corpus_path, "batch": batch_size, "skip": skip, "take": take,
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
-        "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
-        "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
+        "languages": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
+        "format": fire_flower::FORMAT_VERSION, "positions": engine.has_positions(),
         "stemming": engine.stemmer().stemming().code(),
-        "flexoes": engine.inflector().stemming().code(),
-        "docs": docs, "bytes_corpus": bytes, "segundos": secs,
-        "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
-        "pico_rss": peak, "banco_bytes": db_bytes,
-        "banco_por_texto": db_bytes as f64 / bytes.max(1) as f64,
-        "nos_trie": engine.trie_node_count()?,
-        "chaves_estimadas": engine.property("rocksdb.estimate-num-keys").and_then(|v| v.parse::<u64>().ok()),
-        "arquivos_l0": engine.property("rocksdb.num-files-at-level0").and_then(|v| v.parse::<u64>().ok()),
-        "escrita": write_metrics(&engine),
-        "swap_aumento": swap_used().saturating_sub(swap_before),
-        "janelas": monitor.windows, "colapso": collapse,
-        "commit_etapas": monitor.all.json(secs, docs as f64),
+        "inflections": engine.inflector().stemming().code(),
+        "docs": docs, "bytes_corpus": bytes, "seconds": secs,
+        "docs_per_s": docs as f64 / secs, "mb_per_s": mb(bytes) / secs,
+        "peak_rss": peak, "db_bytes": db_bytes,
+        "db_per_text": db_bytes as f64 / bytes.max(1) as f64,
+        "trie_nodes": engine.trie_node_count()?,
+        "estimated_keys": engine.property("rocksdb.estimate-num-keys").and_then(|v| v.parse::<u64>().ok()),
+        "l0_files": engine.property("rocksdb.num-files-at-level0").and_then(|v| v.parse::<u64>().ok()),
+        "write": write_metrics(&engine),
+        "swap_growth": swap_used().saturating_sub(swap_before),
+        "windows": monitor.windows, "collapse": collapse,
+        "commit_steps": monitor.all.json(secs, docs as f64),
     });
     println!(
         "{docs} docs em {secs:.1}s: {:.0} docs/s, {:.1} MB/s, pico RSS {:.0} MB, banco {:.0} MB ({:.2}× o texto)",
@@ -154,14 +154,14 @@ impl CommitTotals {
     pub(crate) fn json(&self, secs: f64, docs: f64) -> Value {
         let f = |v: f64| v / secs.max(1e-9);
         json!({
-            "commit_fracao": f(self.total), "ordenar_fracao": f(self.sort), "trie_fracao": f(self.trie),
-            "codificar_fracao": f(self.encode), "nos_fracao": f(self.nodes), "gravar_fracao": f(self.write),
-            "descarte_fracao": f(self.evict), "commits": self.commits,
-            "termos_por_commit": self.terms as f64 / self.commits.max(1) as f64,
-            "leituras_commit_por_doc": self.node_reads as f64 / docs.max(1.0),
-            "nos_novos_por_doc": self.new_nodes as f64 / docs.max(1.0),
-            "lote_mb": mb(self.batch_bytes) / self.commits.max(1) as f64,
-            "cache_nos": self.cache_nodes,
+            "commit_fraction": f(self.total), "sort_fraction": f(self.sort), "trie_fraction": f(self.trie),
+            "encode_fraction": f(self.encode), "nodes_fraction": f(self.nodes), "write_fraction": f(self.write),
+            "evict_fraction": f(self.evict), "commits": self.commits,
+            "terms_per_commit": self.terms as f64 / self.commits.max(1) as f64,
+            "commit_reads_per_doc": self.node_reads as f64 / docs.max(1.0),
+            "new_nodes_per_doc": self.new_nodes as f64 / docs.max(1.0),
+            "batch_mb": mb(self.batch_bytes) / self.commits.max(1) as f64,
+            "node_cache": self.cache_nodes,
         })
     }
 }
@@ -194,17 +194,17 @@ impl LoadMonitor {
         let n = (docs - self.docs).max(1) as f64;
         let (cur, _) = rss();
         let mut w = json!({
-            "docs": docs, "segundos": started.elapsed().as_secs_f64(), "janela_s": dt, "janela_mb": mb(bytes - self.bytes),
-            "docs_por_s": (docs - self.docs) as f64 / dt, "mb_por_s": mb(bytes - self.bytes) / dt,
-            "gets_por_doc": (reads - self.reads) as f64 / n,
-            "filtro_mb": mb(delta("rocksdb.block.cache.filter.bytes.insert")),
-            "filtro_miss": delta("rocksdb.block.cache.filter.miss"),
-            "dados_miss": delta("rocksdb.block.cache.data.miss"),
+            "docs": docs, "seconds": started.elapsed().as_secs_f64(), "window_s": dt, "window_mb": mb(bytes - self.bytes),
+            "docs_per_s": (docs - self.docs) as f64 / dt, "mb_per_s": mb(bytes - self.bytes) / dt,
+            "gets_per_doc": (reads - self.reads) as f64 / n,
+            "filter_mb": mb(delta("rocksdb.block.cache.filter.bytes.insert")),
+            "filter_miss": delta("rocksdb.block.cache.filter.miss"),
+            "data_miss": delta("rocksdb.block.cache.data.miss"),
             "stall_s": delta("rocksdb.stall.micros") as f64 / 1e6,
             "l0": prop("rocksdb.num-files-at-level0"),
-            "compactacao_pendente_mb": mb(prop("rocksdb.estimate-pending-compaction-bytes")),
-            "rss_mb": mb(cur), "ram_livre_mb": mb(machine()["ram_livre"].as_u64().unwrap_or(0)),
-            "swap_mb": mb(swap_used()), "banco_mb": mb(dir_size(db)),
+            "pending_compaction_mb": mb(prop("rocksdb.estimate-pending-compaction-bytes")),
+            "rss_mb": mb(cur), "ram_free_mb": mb(machine()["ram_free"].as_u64().unwrap_or(0)),
+            "swap_mb": mb(swap_used()), "db_mb": mb(dir_size(db)),
         });
         if let (Value::Object(map), Value::Object(extra)) = (&mut w, self.commits.json(dt, n)) {
             map.extend(extra);
@@ -212,10 +212,10 @@ impl LoadMonitor {
         let f = |k: &str| w[k].as_f64().unwrap_or(0.0);
         eprintln!(
             "{docs:>9} docs {:>6.0} docs/s {:>5.1} MB/s | commit {:>3.0}% (trie {:>3.0}% codif {:>3.0}% grava {:>3.0}% nós {:>2.0}%) leituras/doc {:>5.1} cache {:>4.0}k | filtro {:>4.0} MB stall {:>3.1}s L0 {:>2} | RSS {:>5.0} MB ({:.0}s)",
-            f("docs_por_s"), f("mb_por_s"), f("commit_fracao") * 100.0, f("trie_fracao") * 100.0,
-            f("codificar_fracao") * 100.0, f("gravar_fracao") * 100.0, f("nos_fracao") * 100.0,
-            f("leituras_commit_por_doc"), f("cache_nos") / 1000.0, f("filtro_mb"), f("stall_s"), f("l0"),
-            f("rss_mb"), f("segundos")
+            f("docs_per_s"), f("mb_per_s"), f("commit_fraction") * 100.0, f("trie_fraction") * 100.0,
+            f("encode_fraction") * 100.0, f("write_fraction") * 100.0, f("nodes_fraction") * 100.0,
+            f("commit_reads_per_doc"), f("node_cache") / 1000.0, f("filter_mb"), f("stall_s"), f("l0"),
+            f("rss_mb"), f("seconds")
         );
         self.windows.push(w);
         *self = Self {
@@ -241,7 +241,7 @@ impl LoadMonitor {
         let speeds: Vec<(f64, &Value)> = self
             .windows
             .chunks(group)
-            .map(|c| (c.iter().map(|w| num(w, "janela_mb")).sum::<f64>() / c.iter().map(|w| num(w, "janela_s")).sum::<f64>().max(1e-9), c.last().unwrap()))
+            .map(|c| (c.iter().map(|w| num(w, "window_mb")).sum::<f64>() / c.iter().map(|w| num(w, "window_s")).sum::<f64>().max(1e-9), c.last().unwrap()))
             .collect();
         for i in 3..speeds.len() {
             let mut before: Vec<f64> = speeds[i.saturating_sub(10)..i].iter().map(|s| s.0).collect();
@@ -251,10 +251,10 @@ impl LoadMonitor {
             if speed < 0.2 * median {
                 eprintln!(
                     "\n⚠ colapso em {} docs: {:.1} → {:.1} MB/s; filtro relido {:.0} MB, Gets/doc {:.0}, stall {:.1}s, L0 {}, RAM livre {:.0} MB",
-                    w["docs"], median, speed, num(w, "filtro_mb"), num(w, "gets_por_doc"), num(w, "stall_s"), w["l0"],
-                    num(w, "ram_livre_mb")
+                    w["docs"], median, speed, num(w, "filter_mb"), num(w, "gets_per_doc"), num(w, "stall_s"), w["l0"],
+                    num(w, "ram_free_mb")
                 );
-                return json!({ "docs": w["docs"], "mb_por_s_antes": median, "janela": w });
+                return json!({ "docs": w["docs"], "mb_per_s_before": median, "window": w });
             }
         }
         Value::Null

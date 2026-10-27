@@ -151,7 +151,7 @@ por ele relê e redecodifica os 6 MB do filtro. Foi o que derrubava a carga de
 quando a compactação gera o arquivo). Por isso o `Engine::open` usa filtros e
 índices **particionados**: blocos de 4 KB, mais um índice de topo pequeno
 fixado no cache. O teste `bloom_filters_larger_than_a_cache_shard_...`
-reproduz o problema em escala pequena, e `perf.py carga-longa` o vigia na
+reproduz o problema em escala pequena, e `perf.py long-load` o vigia na
 carga inteira.
 
 ### Três recursos que o projeto usa de forma especial
@@ -485,7 +485,7 @@ comuns dos idiomas do banco. As listas ficam em `src/analysis/stopwords/pt.txt` 
 binário; `src/analysis/stopwords/mod.rs` as normaliza num `FxHashSet`, consultado uma vez
 por token.
 
-Os idiomas são escolhidos na criação (`Config::languages`, ou `--idiomas` na
+Os idiomas são escolhidos na criação (`Config::languages`, ou `--languages` na
 CLI; o padrão é português e inglês) e gravados em `meta:languages`. Abrir o
 banco depois usa o que está gravado; pedir outros idiomas é erro, porque
 índice e consulta precisam descartar as mesmas palavras. Para um idioma
@@ -502,7 +502,7 @@ da palavra (`docs/plano-stemming.md`), e os dois usam os stemmers de
 `corr`) ou o de plural (`pt-plural`: "eleicoes" → "eleicao", "casas" →
 "casa", "mercadores" → "mercador", e nada mais).
 
-- **Flexões na consulta** (`Config::inflections`, `--flexoes`): o índice
+- **Flexões na consulta** (`Config::inflections`, `--inflections`): o índice
   guarda as palavras como estão. Quando uma palavra aparece pela primeira vez
   na Trie, o commit grava o nó dela em `stem:<radical>` (um conjunto de nós,
   unido pelo merge operator). Na busca, cada palavra exata vira um grupo
@@ -622,7 +622,7 @@ O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
 falhar, nada muda: nem o banco, nem os contadores.
 
-O `index-jsonl` faz commit a cada 10 mil documentos (`--lote`), e o `index`
+O `index-jsonl` faz commit a cada 10 mil documentos (`--batch`), e o `index`
 de arquivos, a cada 1.000: o lote guarda os termos de todos os documentos até
 o commit. Lotes maiores dividem o custo de percorrer a Trie por mais
 documentos: na Wikipédia inteira, a carga cai de 242 s (lote de 1.000) para
@@ -761,7 +761,7 @@ fica: `"azul e a casa"` vira `azul@0, casa@3`. Uma frase de um termo só
    documento 2, `azul` está em 2 e `casa` em 5: casa. No documento 1, `azul`
    está em 2 e `casa` em 1: não.
 
-Num banco criado sem posições (`--sem-posicoes`), uma frase dá erro de
+Num banco criado sem posições (`--no-positions`), uma frase dá erro de
 configuração em vez de um resultado errado.
 
 **Limitações:** a stopword só conta a distância (`"casa de papel"` também casa

@@ -36,7 +36,7 @@ impl Check {
     }
 
     pub(crate) fn json(&self) -> Value {
-        json!({ "verificacao": self.name, "casos": self.checked, "divergencias": self.divergences,
-                "exemplos": self.examples, "notas": self.notes })
+        json!({ "check": self.name, "cases": self.checked, "divergences": self.divergences,
+                "examples": self.examples, "notes": self.notes })
     }
 }

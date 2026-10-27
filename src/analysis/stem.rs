@@ -35,10 +35,10 @@ pub enum Stemming {
 }
 
 impl Stemming {
-    /// Como é gravado no banco: "nenhum", "pt", "en", "pt-plural", "en-plural".
+    /// Como é gravado no banco: "none", "pt", "en", "pt-plural", "en-plural".
     pub fn code(self) -> &'static str {
         match self {
-            Stemming::Off => "nenhum",
+            Stemming::Off => "none",
             Stemming::Snowball(lang) => lang.code(),
             Stemming::Plural(Language::Portuguese) => "pt-plural",
             Stemming::Plural(Language::English) => "en-plural",
@@ -47,7 +47,7 @@ impl Stemming {
 
     pub fn from_code(code: &str) -> Option<Self> {
         match code.trim() {
-            "nenhum" | "" => Some(Stemming::Off),
+            "none" | "" => Some(Stemming::Off),
             other => match other.strip_suffix("-plural") {
                 Some(lang) => Language::from_code(lang).map(Stemming::Plural),
                 None => Language::from_code(other).map(Stemming::Snowball),

@@ -32,7 +32,7 @@ funcionalidade é só leitura e consulta (Fases B a D).
 
 | # | Decisão | Recomendação | Por quê |
 |---|---|---|---|
-| D1 | Posições obrigatórias ou opcionais | **Opcionais por banco, ligadas por padrão** (`Config::positions`, `--sem-posicoes`), gravadas em `meta:positions` | quem não precisa de frase não paga o espaço; tf e tamanhos são baratos e ficam sempre |
+| D1 | Posições obrigatórias ou opcionais | **Opcionais por banco, ligadas por padrão** (`Config::positions`, `--no-positions`), gravadas em `meta:positions` | quem não precisa de frase não paga o espaço; tf e tamanhos são baratos e ficam sempre |
 | D2 | Onde ficam as posições | **Chave separada `pos:<nó>`**, `post:<nó>` continua só com doc + tf | buscas comuns não leem posições (é o que o Lucene faz com `.doc` e `.pos`) |
 | D3 | Tamanho do documento | **Exato (u32), em blocos** `norm:<id ÷ 1024>`, com cache em memória | 1,1 M docs × 4 bytes ≈ 4 MB; exato deixa o oráculo trivial. Quantizar em 1 byte (como o Lucene) fica para se o espaço pesar |
 | D4 | O que conta no tamanho | **Tokens indexados** (sem stopwords) | o BM25 compara documentos pelo que foi indexado |
@@ -92,15 +92,15 @@ já tem tudo o que as Fases B a D precisam.
 5. **Normas e estatísticas:** blocos `norm:`, `meta:doc_count` e
    `meta:total_len`, atualizados no mesmo `WriteBatch` atômico do lote.
 6. **Versão:** `meta:format = 2`, `meta:positions`, erro claro em banco v1.
-7. **Harness:** `digest` inclui tf e posições (a checagem `lotes_vs_unico`
+7. **Harness:** `digest` inclui tf e posições (a checagem `batches_vs_single`
    continua valendo); `sizes` mostra o espaço de `pos:` e `norm:`;
-   `wiki load --sem-posicoes`.
+   `wiki load --no-positions`.
 8. **Oráculo:** o índice em memória guarda tf e posições e confere, para
    todos os termos, a lista completa de (doc, tf, posições), mais os tamanhos
    e as estatísticas.
 
 **Pronto quando:** oráculo de 10k com zero divergências (inclusive tf,
-posições e tamanhos); idempotência e `lotes_vs_unico` ok; o `perf.py tudo`
+posições e tamanhos); idempotência e `batches_vs_single` ok; o `perf.py all`
 mede o custo novo de carga e de espaço.
 
 ## 5. Fase B — Ranking BM25
@@ -119,7 +119,7 @@ nota(d)    = soma das notas dos termos (prefixo: um termo só, R1 de plano-relev
 1. `search_top(query, k)`: faz o E pelas listas como hoje, calcula a nota de
    cada documento que sobrou e mantém os *k* melhores num heap (D10).
 2. `Config { bm25_k1, bm25_b }` (D9).
-3. **CLI:** `search` ordena por nota e mostra a nota; `--por-id` mantém o
+3. **CLI:** `search` ordena por nota e mostra a nota; `--by-id` mantém o
    comportamento antigo.
 4. **TUI:** resultados por nota; a nota aparece ao lado do título.
 5. **Oráculo:** calcula o BM25 em memória para as mesmas consultas e compara
@@ -178,10 +178,10 @@ Novos conjuntos em `bench/queries/` (gerados pelo `wiki queries`):
 
 | Conjunto | O que mede |
 |---|---|
-| `frase-2`, `frase-3` | frases reais de 2 e 3 palavras |
-| `frase-stop` | frases com stopword no meio (`"copa do mundo"`) |
-| `frase-freq` | frases de termos frequentes (muitos candidatos para conferir) |
-| `frase-miss` | frases que não existem |
+| `phrase-2`, `phrase-3` | frases reais de 2 e 3 palavras |
+| `phrase-stop` | frases com stopword no meio (`"copa do mundo"`) |
+| `phrase-freq` | frases de termos frequentes (muitos candidatos para conferir) |
+| `phrase-miss` | frases que não existem |
 | `rank-freq` | top-10 de termo frequente (nota em centenas de milhares de docs na carga total) |
 | `rank-and` | top-10 de E de 2 a 3 termos |
 
@@ -191,7 +191,7 @@ Novos conjuntos em `bench/queries/` (gerados pelo `wiki queries`):
 | Carga 10k sem posições | 1.586 docs/s | queda ≤ 10% |
 | Banco ÷ texto, com posições | 0,23 | registrar |
 | p50 de `rank-freq` vs. `t-freq` | — | ≤ 2× |
-| p50 de `frase-2` | — | registrar |
+| p50 de `phrase-2` | — | registrar |
 | Título → artigo (MRR) | — | registrar e acompanhar |
 
 Otimizações que só entram se a medição pedir:
@@ -280,7 +280,7 @@ oficial vai para o `RESULTADOS.md` de fire-flower-bench):**
 | Banco compactado | 17 MB | 51 MB com posições, 21 MB sem | registrar |
 | p50 `t-freq` (todos os IDs) | 56 µs | 53–57 µs | — |
 | p50 `rank-freq` ÷ `t-freq` | — | ~1,8× | ≤ 2× |
-| p50 `frase-2` | — | ~150 µs | registrar |
+| p50 `phrase-2` | — | ~150 µs | registrar |
 | Título → artigo | — | top-1 80,5%, top-10 96,2%, MRR 0,872 | linha de base |
 | Oráculo 10k | 0 divergências | 0 divergências (tf, posições, tamanhos, frases, ranking) | 0 |
 

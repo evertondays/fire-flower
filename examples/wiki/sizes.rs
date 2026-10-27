@@ -79,17 +79,17 @@ pub(crate) fn sizes(db: &Path) -> AnyResult {
         let id = key.split_once(':').and_then(|(_, id)| id.parse::<u64>().ok());
         let term = id.and_then(|i| names.get(&i)).map_or(String::new(), |t| format!(" ({t})"));
         println!("  {size:>10} B  {key}{term}");
-        top.push(json!({ "chave": key, "bytes": size, "termo": term.trim().trim_matches(['(', ')']) }));
+        top.push(json!({ "key": key, "bytes": size, "term": term.trim().trim_matches(['(', ')']) }));
     }
     save_result(
         "sizes",
         &stem(db),
         json!({
             "db": db,
-            "espacos": spaces.iter().map(|(n, s)| json!({"espaco": n, "chaves": s.keys, "bytes_chaves": s.key_bytes, "bytes_valores": s.value_bytes})).collect::<Vec<_>>(),
-            "raiz_bytes": root_size, "nos_trie": engine.trie_node_count()?,
-            "listas": watched_sizes, "listas_pos": watched_pos, "maiores": top,
-            "posicoes": engine.has_positions(),
+            "spaces": spaces.iter().map(|(n, s)| json!({"space": n, "keys": s.keys, "key_bytes": s.key_bytes, "value_bytes": s.value_bytes})).collect::<Vec<_>>(),
+            "root_bytes": root_size, "trie_nodes": engine.trie_node_count()?,
+            "lists": watched_sizes, "pos_lists": watched_pos, "largest": top,
+            "positions": engine.has_positions(),
         }),
     )?;
     Ok(())

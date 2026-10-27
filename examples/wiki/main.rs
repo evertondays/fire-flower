@@ -2,7 +2,7 @@
 //!
 //! Todos os subcomandos leem o corpus JSONL da Wikipédia
 //! (`{"id", "title", "text"}` por linha) e gravam resultados em
-//! `results/<data>-<commit>-<tipo>-<rótulo>.json` do repositório
+//! `results/<data>-<commit>-<kind>-<rótulo>.json` do repositório
 //! fire-flower-bench, clonado ao lado deste (`FF_BENCH_DIR` para mudar).
 //!
 //! ```text
@@ -82,26 +82,26 @@ enum Cmd {
         #[arg(long)]
         streaming: bool,
         /// Nós da Trie que o escritor guarda entre lotes (0 desliga o cache)
-        #[arg(long = "cache-nos", value_name = "CACHE_NOS")]
+        #[arg(long)]
         node_cache: Option<usize>,
-        /// Idiomas das stopwords de um banco novo ("pt,en", "en" ou "nenhum").
+        /// Idiomas das stopwords de um banco novo ("pt,en", "en" ou "none").
         /// Sem a opção, usa o que está gravado no banco (ou pt,en)
-        #[arg(long = "idiomas", value_name = "IDIOMAS")]
+        #[arg(long)]
         languages: Option<String>,
         /// Cria o banco sem posições (sem busca por frase)
-        #[arg(long = "sem-posicoes")]
+        #[arg(long)]
         no_positions: bool,
-        /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "nenhum"). Sem a opção,
+        /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "none"). Sem a opção,
         /// usa o que está gravado no banco (ou nenhum)
         #[arg(long)]
         stemming: Option<String>,
         /// Flexões na consulta num banco novo: o stemmer do mapa `stem:` ("pt",
-        /// "pt-plural" ou "nenhum"). Sem a opção, usa o que está gravado
-        #[arg(long = "flexoes", value_name = "FLEXOES")]
+        /// "pt-plural" ou "none"). Sem a opção, usa o que está gravado
+        #[arg(long)]
         inflections: Option<String>,
         /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
         /// colapso da carga quando o filtro passa de uma parte do block cache
-        #[arg(long = "filtro-inteiro")]
+        #[arg(long)]
         whole_filter: bool,
         #[arg(long)]
         label: Option<String>,
@@ -111,7 +111,7 @@ enum Cmd {
         #[arg(long)]
         corpus: PathBuf,
         /// Idiomas das stopwords, como no banco que será medido
-        #[arg(long = "idiomas", value_name = "IDIOMAS", default_value = "pt,en")]
+        #[arg(long, default_value = "pt,en")]
         languages: String,
         #[arg(long)]
         take: Option<u64>,
@@ -125,7 +125,7 @@ enum Cmd {
         #[arg(long)]
         corpus: PathBuf,
         /// Idiomas das stopwords, como no banco que será medido
-        #[arg(long = "idiomas", value_name = "IDIOMAS", default_value = "pt,en")]
+        #[arg(long, default_value = "pt,en")]
         languages: String,
         #[arg(long, default_value_t = 42)]
         seed: u64,
@@ -168,17 +168,16 @@ enum Cmd {
         label: Option<String>,
     },
     /// Avalia a ordenação com consultas de resposta conhecida (docs/plano-relevancia.md)
-    #[command(name = "relevancia")]
     Relevance {
         #[arg(long)]
         db: PathBuf,
         #[arg(long)]
         corpus: PathBuf,
-        /// Pasta dos conjuntos rel-*.tsv. Os que faltarem (todos, com --gerar)
+        /// Pasta dos conjuntos rel-*.tsv. Os que faltarem (todos, com --generate)
         /// são gerados do corpus e gravados ali
         #[arg(long)]
         sets: PathBuf,
-        /// Consultas escritas à mão (padrão: bench/relevancia/manual.tsv)
+        /// Consultas escritas à mão (padrão: bench/relevance/manual.tsv)
         #[arg(long)]
         manual: Option<PathBuf>,
         #[arg(long)]
@@ -188,16 +187,16 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         per_set: usize,
         /// Gera os conjuntos de novo mesmo que já existam
-        #[arg(long = "gerar")]
+        #[arg(long)]
         generate: bool,
         /// Peso do título no BM25F (padrão: o do Config)
-        #[arg(long = "peso-titulo", value_name = "PESO_TITULO")]
+        #[arg(long)]
         title_weight: Option<f64>,
         /// `b` do título no BM25F (padrão: o do Config)
-        #[arg(long = "b-titulo", value_name = "B_TITULO")]
+        #[arg(long)]
         title_b: Option<f64>,
         /// Não imprime as consultas à mão (para a grade)
-        #[arg(long = "resumo")]
+        #[arg(long)]
         brief: bool,
         #[command(flatten)]
         inflections: InflectionArgs,
@@ -222,8 +221,8 @@ enum Cmd {
         /// Mede também tempos no PerfContext (mais preciso, mas pesa na latência)
         #[arg(long)]
         perf_time: bool,
-        /// Profundidade do cache de nós das buscas ("nenhum" desliga)
-        #[arg(long = "cache-leitura", value_name = "CACHE_LEITURA")]
+        /// Profundidade do cache de nós das buscas ("none" desliga)
+        #[arg(long)]
         reader_cache: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
@@ -270,7 +269,7 @@ fn main() -> AnyResult {
     match Cli::parse().command {
         Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, label } => {
             let languages = languages.as_deref().map(parse_languages).transpose()?;
-            let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)"));
+            let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou none)"));
             let stemming = stemming.map(code).transpose()?;
             let inflections = inflections.map(code).transpose()?;
             let config = Config {
@@ -295,7 +294,7 @@ fn main() -> AnyResult {
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, label })
         }
         Cmd::Relevance { db, corpus, sets, manual, take, seed, per_set, generate, title_weight, title_b, brief, inflections, label } => {
-            let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
+            let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevance").join("manual.tsv"));
             let defaults = Config::default();
             let config = inflections.apply(Config {
                 title_weight: title_weight.unwrap_or(defaults.title_weight),
@@ -307,7 +306,7 @@ fn main() -> AnyResult {
         Cmd::Bench { db, queries, threads, passes, cold, perf_time, reader_cache, cache_mb, inflections, label } => {
             let mut config = inflections.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = reader_cache {
-                config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
+                config.reader_cache_depth = if depth == "none" { None } else { Some(depth.parse()?) };
             }
             bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, config, label)
         }
@@ -320,14 +319,14 @@ fn main() -> AnyResult {
 }
 
 /// Peso e modo das flexões na consulta (valem por busca; o banco precisa ter
-/// sido criado com `--flexoes`).
+/// sido criado com `--inflections`).
 #[derive(clap::Args)]
 struct InflectionArgs {
     /// α: quanto as flexões valem perto da palavra exata (0 a 1)
-    #[arg(long = "peso-flexoes", value_name = "PESO_FLEXOES")]
+    #[arg(long)]
     inflection_weight: Option<f64>,
-    /// "sempre" ou N: só quando a busca exata acha menos de N documentos
-    #[arg(long = "modo-flexoes", value_name = "MODO_FLEXOES")]
+    /// "always" ou N: só quando a busca exata acha menos de N documentos
+    #[arg(long)]
     inflection_mode: Option<String>,
 }
 
@@ -338,7 +337,7 @@ impl InflectionArgs {
         }
         if let Some(m) = &self.inflection_mode {
             config.inflection_mode = match m.as_str() {
-                "sempre" => fire_flower::InflectionMode::Always,
+                "always" => fire_flower::InflectionMode::Always,
                 n => fire_flower::InflectionMode::IfFewer(n.parse().map_err(|_| format!("modo das flexões: {m:?} (use sempre ou um número)"))?),
             };
         }

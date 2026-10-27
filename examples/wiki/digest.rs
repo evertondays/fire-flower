@@ -62,8 +62,8 @@ pub(crate) fn digest(db: &Path) -> AnyResult {
     h.write(&stats.total_title_len.to_le_bytes());
     println!(
         "{}",
-        json!({ "db": db, "termos": nodes.len(), "postagens": postings, "posicoes": positions,
-                "documentos": stats.doc_count, "tamanho_total": stats.total_len, "digest": format!("{:016x}", h.0) })
+        json!({ "db": db, "terms": nodes.len(), "postings": postings, "positions": positions,
+                "documents": stats.doc_count, "total_size": stats.total_len, "digest": format!("{:016x}", h.0) })
     );
     Ok(())
 }

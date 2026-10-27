@@ -25,7 +25,7 @@ pub(super) const META_TOTAL_TITLE_LEN: &[u8] = b"meta:total_title_len";
 /// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
 pub(super) const META_LANGUAGES: &[u8] = b"meta:languages";
 
-/// Stemming do banco ("nenhum", "pt", "en"; ver [`Stemming::code`]).
+/// Stemming do banco ("none", "pt", "en"; ver [`Stemming::code`]).
 pub(super) const META_STEMMING: &[u8] = b"meta:stemming";
 
 /// Stemmer das flexões na consulta (`Config::inflections`), no mesmo código.

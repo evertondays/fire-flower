@@ -97,9 +97,9 @@ pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<
         "concurrent",
         &label.unwrap_or_else(|| format!("{}-t{threads}", stem(db))),
         json!({ "db": db, "corpus": corpus_path, "skip": skip, "take": take, "threads": threads, "batch": batch_size,
-                "leitura_sem_escrita": a, "leitura_com_escrita": b,
-                "indexacao": { "docs": docs, "bytes": bytes, "segundos": write_secs, "docs_por_s": docs as f64 / write_secs },
-                "escrita_antes": before, "escrita_depois": after }),
+                "read_without_write": a, "read_with_write": b,
+                "indexing": { "docs": docs, "bytes": bytes, "seconds": write_secs, "docs_per_s": docs as f64 / write_secs },
+                "write_before": before, "write_after": after }),
     )?;
     Ok(())
 }

@@ -10,11 +10,11 @@ Suporta:
 - stopwords por idioma (português e inglês por enquanto: `de`, `o`, `the`…)
   ficam fora do índice e são ignoradas na consulta (`casa de papel` busca
   `casa` E `papel`). Os idiomas são escolhidos na criação do banco
-  (`--idiomas pt,en`, o padrão) e ficam gravados nele;
+  (`--languages pt,en`, o padrão) e ficam gravados nele;
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
 - **plural e flexões** opcionais: `--stemming pt-plural` ("planetas" acha
-  o artigo "Planeta", quase sem custo), `--flexoes pt-plural` (o mesmo, com a
+  o artigo "Planeta", quase sem custo), `--inflections pt-plural` (o mesmo, com a
   palavra exata valendo mais que a flexão, mas buscas ~2× mais lentas) e
   `--stemming pt` (Snowball). São escolhidos na criação do banco e ficam
   gravados nele;
@@ -76,12 +76,12 @@ python3 scripts/carregar_wikipedia.py
 Por padrão lê `~/datasets/ptwiki/ptwiki.jsonl` e grava em
 `~/bench-db/ptwiki-full`, apagando o banco anterior (pede confirmação). O
 painel mostra artigos/s, MB/s, tempo restante, memória e tamanho do banco.
-`Ctrl+C` interrompe e mostra o comando `--pular N` para continuar de onde
+`Ctrl+C` interrompe e mostra o comando `--skip N` para continuar de onde
 parou. No fim, o banco é compactado (~10 s; deixa as buscas 30–50% mais
 rápidas) e um resumo vai para `~/bench-db/ptwiki-full.carga.json`. A carga
 inteira leva ~2 minutos, com lotes de 10 mil artigos e pico de ~1,4 GB de
-memória. Veja `--help` para `--corpus`, `--banco`, `--lote` e
-`--sem-compactar`.
+memória. Veja `--help` para `--corpus`, `--db`, `--batch` e
+`--no-compact`.
 
 Por baixo, o script chama:
 
@@ -95,7 +95,7 @@ como rótulo. No `index` de arquivos, o título é o nome do arquivo sem a
 extensão.
 
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
-usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
+usa. Com `--no-positions` (em `index`, `index-jsonl` e
 `scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
 frases dão erro. A escolha fica gravada no banco, como os idiomas.
 
@@ -107,7 +107,7 @@ criação; ver [docs/plano-stemming.md](docs/plano-stemming.md)):
   Na Wikipédia inteira, a carga e o tamanho ficam iguais, termos e E custam
   +2–10% e frases +17–35%; a ordenação perde pouco (o artigo "Torre" pode
   ficar atrás de "Torres").
-- `--flexoes pt-plural`: o índice guarda as palavras como estão e um mapa
+- `--inflections pt-plural`: o índice guarda as palavras como estão e um mapa
   radical → palavras; a busca soma à palavra exata as outras do mesmo
   radical, com peso menor (`Config::inflection_weight`, 0,5). A ordenação fica
   como sem stemming e frases, prefixos e autocompletar ficam exatos, mas
@@ -126,7 +126,7 @@ Busca e autocompletar sem interface, para scripts:
 ./target/release/fire-flower search /tmp/indice "coração bras*"
 ```
 
-A saída é `nota  id  rótulo`, da nota maior para a menor. `--por-id` lista
+A saída é `nota  id  rótulo`, da nota maior para a menor. `--by-id` lista
 todos os documentos em ordem de ID, sem ranking. Frases vão entre aspas
 simples no shell:
 
@@ -194,7 +194,7 @@ Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
-| `stem:<radical>` | nós das palavras com esse radical (só com `--flexoes`) |
+| `stem:<radical>` | nós das palavras com esse radical (só com `--inflections`) |
 | `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | formato, se grava posições, idiomas das stopwords, stemming e flexões |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
@@ -226,7 +226,7 @@ lado deste (`../fire-flower-bench`, ou `FF_BENCH_DIR`); os mais recentes estão 
 [RESULTADOS.md](https://github.com/evertondays/fire-flower-bench/blob/main/RESULTADOS.md).
 
 ```bash
-python3 scripts/perf.py tudo --escala 10k
+python3 scripts/perf.py all --scale 10k
 ```
 
 ## Diferenças em relação ao documento de design original
@@ -261,7 +261,7 @@ python3 scripts/perf.py tudo --escala 10k
   papel"` também casa "casa da papel"); frase só de stopwords fica vazia; não
   há prefixo dentro de frase (`"revolução franc*"`).
 - **Posições custam espaço.** Na fatia de 10k da Wikipédia, o banco
-  compactado tem ~51 MB com posições e ~21 MB sem; use `--sem-posicoes` se
+  compactado tem ~51 MB com posições e ~21 MB sem; use `--no-positions` se
   não precisar de frases.
 - **Uma leitura por caractere.** Buscar uma palavra de 10 letras faz 7 `Get`s
   (a raiz e os quatro níveis seguintes vêm do cache de nós das buscas,
@@ -273,13 +273,13 @@ python3 scripts/perf.py tudo --escala 10k
   ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
   que têm alguma completação, e o tf é a soma das completações no documento.
 - **Plural desligado por padrão** ("casa" e "casas" são termos
-  diferentes; use `--stemming pt-plural` ou `--flexoes pt-plural`). O `pt-plural` só junta plural e
+  diferentes; use `--stemming pt-plural` ou `--inflections pt-plural`). O `pt-plural` só junta plural e
   singular; o Snowball (`pt`) junta também verbos e derivados, mas às vezes
   palavras sem relação (`coreia` e `cor` viram `cor`).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam
   valendo (`de*` acha "dezembro"). As listas estão em `src/analysis/stopwords/*.txt`;
-  para usar outro idioma, crie o banco com `--idiomas en` (ou `nenhum`).
+  para usar outro idioma, crie o banco com `--languages en` (ou `none`).
 
 ## Compilação
 

@@ -163,14 +163,14 @@ pub(crate) fn summarize(name: &str, mode: &str, samples: &[Sample], wall: f64, t
     let n = samples.len().max(1) as f64;
     let avg = |f: fn(&Sample) -> u64| samples.iter().map(f).sum::<u64>() as f64 / n;
     json!({
-        "conjunto": name, "modo": mode, "consultas": samples.len(), "threads": threads,
+        "set": name, "mode": mode, "queries": samples.len(), "threads": threads,
         "p50_us": percentile(&lat, 0.50), "p95_us": percentile(&lat, 0.95),
         "p99_us": percentile(&lat, 0.99), "max_us": percentile(&lat, 1.0),
-        "media_us": avg(|s| s.nanos) / 1000.0, "qps": samples.len() as f64 / wall,
-        "resultados_media": samples.iter().map(|s| s.results).sum::<usize>() as f64 / n,
-        "gets_por_consulta": avg(|s| s.gets), "cache_hits_por_consulta": avg(|s| s.cache_hits),
-        "block_reads_por_consulta": avg(|s| s.block_reads), "bloom_util_por_consulta": avg(|s| s.bloom_useful),
-        "merges_por_consulta": avg(|s| s.merges), "merge_us_por_consulta": avg(|s| s.merge_nanos) / 1000.0,
+        "mean_us": avg(|s| s.nanos) / 1000.0, "qps": samples.len() as f64 / wall,
+        "mean_results": samples.iter().map(|s| s.results).sum::<usize>() as f64 / n,
+        "gets_per_query": avg(|s| s.gets), "cache_hits_per_query": avg(|s| s.cache_hits),
+        "block_reads_per_query": avg(|s| s.block_reads), "bloom_util_per_query": avg(|s| s.bloom_useful),
+        "merges_per_query": avg(|s| s.merges), "merge_us_per_query": avg(|s| s.merge_nanos) / 1000.0,
     })
 }
 
@@ -215,7 +215,7 @@ pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize,
         let f = |k: &str| summary[k].as_f64().unwrap_or(0.0);
         println!(
             "| {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.1} | {:.1} | {:.2} |",
-            set.name, f("p50_us"), f("p95_us"), f("p99_us"), f("max_us"), f("qps"), f("resultados_media"), f("gets_por_consulta"), f("block_reads_por_consulta")
+            set.name, f("p50_us"), f("p95_us"), f("p99_us"), f("max_us"), f("qps"), f("mean_results"), f("gets_per_query"), f("block_reads_per_query")
         );
         results.push(summary);
     }
@@ -226,8 +226,8 @@ pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize,
     save_result(
         "bench",
         &label,
-        json!({ "db": db, "threads": threads, "passes": passes, "frio": cold, "perf_time": perf_time,
-                "config": config_json(&config), "conjuntos": results }),
+        json!({ "db": db, "threads": threads, "passes": passes, "cold": cold, "perf_time": perf_time,
+                "config": config_json(&config), "sets": results }),
     )?;
     Ok(())
 }

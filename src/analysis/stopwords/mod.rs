@@ -57,10 +57,10 @@ impl Language {
     }
 }
 
-/// Lista de idiomas legível: "pt, en" ou "nenhum".
+/// Lista de idiomas legível: "pt, en" ou "none".
 pub fn describe(languages: &[Language]) -> String {
     if languages.is_empty() {
-        return "nenhum".to_string();
+        return "none".to_string();
     }
     languages.iter().map(|l| l.code()).collect::<Vec<_>>().join(", ")
 }

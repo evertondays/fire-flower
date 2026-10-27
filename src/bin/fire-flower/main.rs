@@ -26,16 +26,14 @@ enum Command {
     #[command(visible_alias = "ui")]
     Tui {
         /// Pasta do banco
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
     },
     /// Indexa arquivos de texto/HTML (pastas recursivamente)
     Index {
         /// Pasta do banco (criada se não existir)
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
         /// Arquivos ou pastas
-        #[arg(required = true, value_name = "CAMINHOS")]
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[command(flatten)]
         languages: LanguageArgs,
@@ -47,19 +45,17 @@ enum Command {
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
     IndexJsonl {
         /// Pasta do banco (criada se não existir)
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
         /// Arquivo .jsonl
-        #[arg(value_name = "ARQUIVO")]
         file: PathBuf,
         /// Documentos por commit
-        #[arg(long = "lote", value_name = "LOTE", default_value_t = 10000)]
+        #[arg(long, default_value_t = 10000)]
         batch: usize,
         /// Pula as N primeiras linhas (para retomar uma carga interrompida)
-        #[arg(long = "pular", value_name = "PULAR", default_value_t = 0)]
+        #[arg(long, default_value_t = 0)]
         skip: u64,
         /// Emite o progresso como JSON na saída padrão
-        #[arg(long = "progresso-json")]
+        #[arg(long)]
         progress_json: bool,
         #[command(flatten)]
         languages: LanguageArgs,
@@ -70,30 +66,26 @@ enum Command {
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos
     Compact {
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
     },
     /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
     /// Os resultados saem por relevância (BM25), com a nota.
     Search {
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
-        #[arg(required = true, value_name = "CONSULTA")]
+        #[arg(required = true)]
         query: Vec<String>,
         /// Quantos resultados imprimir
-        #[arg(short = 'n', long = "limite", value_name = "LIMITE", default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Ordena por ID do documento, sem ranking
-        #[arg(long = "por-id")]
+        #[arg(long)]
         by_id: bool,
     },
     /// Autocompletar: palavras indexadas que começam com o prefixo
     Suggest {
-        #[arg(value_name = "BANCO")]
         db: PathBuf,
-        #[arg(value_name = "PREFIXO")]
         prefix: String,
-        #[arg(default_value_t = 10, value_name = "LIMITE")]
+        #[arg(default_value_t = 10)]
         limit: usize,
     },
 }
@@ -101,9 +93,9 @@ enum Command {
 #[derive(clap::Args)]
 struct LanguageArgs {
     /// Idiomas das stopwords de um banco novo: códigos separados por vírgula
-    /// (pt, en) ou "nenhum". Padrão: pt,en. Num banco existente, precisa
+    /// (pt, en) ou "none". Padrão: pt,en. Num banco existente, precisa
     /// combinar com o que foi gravado na criação.
-    #[arg(long = "idiomas", value_name = "IDIOMAS", value_parser = parse_languages)]
+    #[arg(long, value_parser = parse_languages)]
     languages: Option<LanguageList>,
 }
 
@@ -111,7 +103,7 @@ struct LanguageArgs {
 struct PositionArgs {
     /// Cria o banco sem posições: menor e mais rápido de carregar, mas sem
     /// busca por frase. Num banco existente, precisa combinar com a criação.
-    #[arg(long = "sem-posicoes")]
+    #[arg(long)]
     no_positions: bool,
 }
 
@@ -119,20 +111,20 @@ struct PositionArgs {
 struct StemmingArgs {
     /// Flexões na consulta num banco novo (o recomendado para achar plurais):
     /// "pt-plural" ("planetas" acha "Planeta", com a palavra exata valendo
-    /// mais), "pt" (Snowball) ou "nenhum" (o padrão). Não combina com
+    /// mais), "pt" (Snowball) ou "none" (o padrão). Não combina com
     /// --stemming. Num banco existente, precisa combinar com a criação.
-    #[arg(long = "flexoes", value_name = "FLEXOES", value_parser = parse_stemming)]
+    #[arg(long, value_parser = parse_stemming)]
     inflections: Option<Stemming>,
     /// Stemming de um banco novo: "pt" (Snowball do português, "correndo"
     /// acha "corrida"), "pt-plural" (só o plural: "casas" acha "casa"), "en",
-    /// "en-plural" ou "nenhum" (o padrão). Num banco existente, precisa
+    /// "en-plural" ou "none" (o padrão). Num banco existente, precisa
     /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_stemming)]
     stemming: Option<Stemming>,
 }
 
 fn parse_stemming(s: &str) -> Result<Stemming, String> {
-    Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, pt-plural, en, en-plural ou \"nenhum\""))
+    Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, pt-plural, en, en-plural ou \"none\""))
 }
 
 impl PositionArgs {
@@ -147,12 +139,12 @@ impl PositionArgs {
 struct LanguageList(Vec<Language>);
 
 fn parse_languages(s: &str) -> Result<LanguageList, String> {
-    if s.trim().eq_ignore_ascii_case("nenhum") {
+    if s.trim().eq_ignore_ascii_case("none") {
         return Ok(LanguageList(Vec::new()));
     }
     let valid = || Language::ALL.iter().map(|l| l.code()).collect::<Vec<_>>().join(", ");
     s.split(',')
-        .map(|c| Language::from_code(c).ok_or_else(|| format!("idioma desconhecido {c:?}; use {} ou \"nenhum\"", valid())))
+        .map(|c| Language::from_code(c).ok_or_else(|| format!("idioma desconhecido {c:?}; use {} ou \"none\"", valid())))
         .collect::<Result<_, _>>()
         .map(LanguageList)
 }

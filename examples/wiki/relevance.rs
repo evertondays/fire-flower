@@ -1,4 +1,4 @@
-//! `wiki relevancia`: consultas com resposta conhecida (top-1, top-3, top-10, MRR).
+//! `wiki relevance`: consultas com resposta conhecida (top-1, top-3, top-10, MRR).
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -26,11 +26,11 @@ pub(crate) struct RelCase {
 /// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
 /// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
 pub(crate) const REL_SETS: [(&str, usize); 6] = [
-    ("rel-titulo", 1),
-    ("rel-digitando", 1),
+    ("rel-title", 1),
+    ("rel-typing", 1),
     ("rel-hub", 1),
-    ("rel-corpo", 10),
-    ("rel-flexao", 10),
+    ("rel-body", 10),
+    ("rel-inflection", 10),
     ("rel-plural", 10),
 ];
 
@@ -70,7 +70,7 @@ pub(crate) fn regular_inflections(w: &str) -> Vec<String> {
 
 pub(crate) fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
     let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "# consulta\tIDs esperados\ttítulo (gerado por `wiki relevancia`)")?;
+    writeln!(w, "# consulta\tIDs esperados\ttítulo (gerado por `wiki relevance`)")?;
     for c in cases {
         let ids: Vec<String> = c.expected.iter().map(u64::to_string).collect();
         writeln!(w, "{}\t{}\t{}", c.query, ids.join(","), c.title)?;
@@ -110,18 +110,18 @@ pub(crate) fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usi
 
 /// Gera os conjuntos rel-* a partir do corpus (seed fixa: mesmas consultas).
 ///
-/// - `rel-titulo`: o título inteiro → o artigo.
-/// - `rel-digitando`: o título com a última palavra cortada em ~60% e `*`,
+/// - `rel-title`: o título inteiro → o artigo.
+/// - `rel-typing`: o título com a última palavra cortada em ~60% e `*`,
 ///   como o TUI busca enquanto se digita (`coreia do nor*`).
 /// - `rel-hub`: títulos cujos termos aparecem em ≥ 3 outros títulos
 ///   ("Coreia do Norte" ⊂ "Bandeira da Coreia do Norte"): o artigo principal
 ///   tem que vir em 1º, acima dos derivados.
-/// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
+/// - `rel-body`: 2 termos de frequência média do corpo, fora do título: o
 ///   artigo no top-10. Segura o exagero do peso do título.
-/// - `rel-plural`: como o `rel-flexao`, mas com o plural ou o singular
+/// - `rel-plural`: como o `rel-inflection`, mas com o plural ou o singular
 ///   regular (`regular_inflections`), sem depender do Snowball: o artigo no
 ///   top-10.
-/// - `rel-flexao`: as consultas do `rel-corpo` com cada palavra trocada pela
+/// - `rel-inflection`: as consultas do `rel-body` com cada palavra trocada pela
 ///   flexão mais comum do mesmo radical (Snowball do português) que não está
 ///   no artigo ("eleitos" → "eleito"): o artigo no top-10. Sem stemming não
 ///   tem como achar; mede o que o stemming recupera.
@@ -286,11 +286,11 @@ pub(crate) fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &St
         plural.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
     }
     Ok(vec![
-        ("rel-titulo", by_title),
-        ("rel-digitando", typing),
+        ("rel-title", by_title),
+        ("rel-typing", typing),
         ("rel-hub", hubs),
-        ("rel-corpo", body_cases),
-        ("rel-flexao", inflected),
+        ("rel-body", body_cases),
+        ("rel-inflection", inflected),
         ("rel-plural", plural),
     ])
 }
@@ -372,14 +372,14 @@ pub(crate) fn run_relevance(
     }
     sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
     // Flexões escritas à mão, ao lado do `manual.tsv`.
-    let inflection_manual = manual.with_file_name("flexao-manual.tsv");
+    let inflection_manual = manual.with_file_name("inflection-manual.tsv");
     if inflection_manual.exists() {
-        sets.push(("rel-flexao-manual".into(), 3, read_manual(&inflection_manual, corpus, take)?));
+        sets.push(("rel-inflection-manual".into(), 3, read_manual(&inflection_manual, corpus, take)?));
     }
 
     let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
     let mut results = Vec::new();
-    println!("{:<14} {:>8} {:>7} {:>7} {:>7} {:>7} {:>9}", "conjunto", "consultas", "top-1", "top-3", "top-10", "MRR", "fora 1000");
+    println!("{:<14} {:>8} {:>7} {:>7} {:>7} {:>7} {:>9}", "set", "queries", "top-1", "top-3", "top-10", "MRR", "fora 1000");
     let mut manual_lines = Vec::new();
     for (name, hit_at, cases) in &sets {
         let (mut t1, mut t3, mut t10, mut rr, mut out) = (0usize, 0usize, 0usize, 0.0f64, 0usize);
@@ -407,15 +407,15 @@ pub(crate) fn run_relevance(
                 ));
             }
             if !hit && misses.len() < 8 {
-                misses.push(json!({ "consulta": case.query, "esperado": case.title, "posicao": pos.map(|i| i + 1),
+                misses.push(json!({ "query": case.query, "expected": case.title, "position": pos.map(|i| i + 1),
                                     "top3": top3.iter().map(|&d| title_of(d)).collect::<Vec<_>>() }));
             }
         }
         let n = cases.len().max(1) as f64;
         let (top1, top3, top10, mrr) = (t1 as f64 / n, t3 as f64 / n, t10 as f64 / n, rr / n);
         println!("{name:<14} {:>8} {:>6.1}% {:>6.1}% {:>6.1}% {mrr:>7.3} {out:>9}", cases.len(), top1 * 100.0, top3 * 100.0, top10 * 100.0);
-        results.push(json!({ "conjunto": name, "consultas": cases.len(), "acerto_ate": hit_at, "top1": top1, "top3": top3,
-                             "top10": top10, "mrr": mrr, "fora_do_top1000": out, "erros": misses }));
+        results.push(json!({ "set": name, "queries": cases.len(), "hit_at": hit_at, "top1": top1, "top3": top3,
+                             "top10": top10, "mrr": mrr, "outside_top1000": out, "errors": misses }));
     }
     if !brief {
         println!("\nconsultas à mão (posição do esperado → os 3 primeiros):");
@@ -427,10 +427,10 @@ pub(crate) fn run_relevance(
 
     let label = label.unwrap_or_else(|| stem(sets_dir));
     save_result(
-        "relevancia",
+        "relevance",
         &label,
         json!({ "db": db, "corpus": corpus, "take": take, "seed": seed, "config": config_json(engine.config()),
-                "conjuntos": results }),
+                "sets": results }),
     )?;
     Ok(())
 }

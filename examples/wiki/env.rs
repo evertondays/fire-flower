@@ -31,7 +31,7 @@ pub(crate) fn git_commit() -> String {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    let hash = run(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "desconhecido".into());
+    let hash = run(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     // bench/ fica de fora: o perf.py regrava consultas, baseline e relatório no meio da rodada.
     let dirty = run(&["status", "--porcelain", "--untracked-files=no", "--", ".", ":!bench"]).is_some_and(|s| !s.is_empty());
     if dirty { format!("{hash}-modificado") } else { hash }
@@ -87,17 +87,17 @@ pub(crate) fn machine() -> Value {
             .map_or(0, |kb| kb * 1024)
     };
     json!({
-        "nucleos": std::thread::available_parallelism().map_or(0, |n| n.get()),
+        "cores": std::thread::available_parallelism().map_or(0, |n| n.get()),
         "ram_total": mem("MemTotal:"),
-        "ram_livre": mem("MemAvailable:"),
-        "swap_usado": mem("SwapTotal:").saturating_sub(mem("SwapFree:")),
+        "ram_free": mem("MemAvailable:"),
+        "swap_used": mem("SwapTotal:").saturating_sub(mem("SwapFree:")),
         "kernel": std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim(),
     })
 }
 
 /// Swap em uso no sistema inteiro, em bytes.
 pub(crate) fn swap_used() -> u64 {
-    machine()["swap_usado"].as_u64().unwrap_or(0)
+    machine()["swap_used"].as_u64().unwrap_or(0)
 }
 
 pub(crate) fn config_json(config: &Config) -> Value {
@@ -115,7 +115,7 @@ pub(crate) fn config_json(config: &Config) -> Value {
         "bm25_b": config.bm25_b,
         "inflection_weight": config.inflection_weight,
         "inflection_mode": match config.inflection_mode {
-            fire_flower::InflectionMode::Always => json!("sempre"),
+            fire_flower::InflectionMode::Always => json!("always"),
             fire_flower::InflectionMode::IfFewer(n) => json!(n),
         },
     })
@@ -128,11 +128,11 @@ pub(crate) fn save_result(kind: &str, label: &str, mut value: Value) -> AnyResul
     let commit = git_commit();
     let ts = timestamp();
     if let Value::Object(map) = &mut value {
-        map.insert("tipo".into(), json!(kind));
-        map.insert("rotulo".into(), json!(label));
+        map.insert("kind".into(), json!(kind));
+        map.insert("label".into(), json!(label));
         map.insert("commit".into(), json!(commit));
-        map.insert("quando".into(), json!(ts));
-        map.insert("maquina".into(), machine());
+        map.insert("when".into(), json!(ts));
+        map.insert("machine".into(), machine());
     }
     let path = dir.join(format!("{ts}-{commit}-{kind}-{label}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&value)? + "\n")?;
@@ -160,9 +160,9 @@ pub(crate) fn write_metrics(engine: &Engine) -> Value {
     let flush = get("rocksdb.flush.write.bytes");
     let compact = get("rocksdb.compact.write.bytes");
     json!({
-        "bytes_escritos_usuario": user,
+        "user_bytes_written": user,
         "bytes_flush": flush,
-        "bytes_compactacao": compact,
+        "compaction_bytes": compact,
         "write_amp": if user > 0 { (flush + compact) as f64 / user as f64 } else { 0.0 },
         "stall_micros": get("rocksdb.stall.micros"),
         "block_cache_hit": get("rocksdb.block.cache.hit"),

@@ -394,8 +394,8 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     checks.push(and);
 
     // 9. Prefixo e autocompletar.
-    let mut prefix = Check::new("prefixo");
-    let mut suggest = Check::new("autocompletar");
+    let mut prefix = Check::new("prefix");
+    let mut suggest = Check::new("autocomplete");
     let (mut truncated, mut ignored_terms) = (0usize, 0usize);
     for _ in 0..args.prefixes {
         let term = rng.pick(&vocab);
@@ -448,8 +448,8 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     checks.push(recall);
     let n_titles = titles.len().max(1) as f64;
     let relevance = json!({
-        "consultas": titles.len(), "top1": top1 as f64 / n_titles, "top10": top10 as f64 / n_titles,
-        "mrr": rr / n_titles, "fora_do_top1000": missing,
+        "queries": titles.len(), "top1": top1 as f64 / n_titles, "top10": top10 as f64 / n_titles,
+        "mrr": rr / n_titles, "outside_top1000": missing,
     });
 
     // 11. Normalização.
@@ -463,7 +463,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     checks.push(norm);
 
     // 12. Frases: o esperado sai dos tokens do trecho, sem o `parse_query`.
-    let mut phrase = Check::new("frases");
+    let mut phrase = Check::new("phrases");
     let (mut phrase_hits, mut phrase_empty) = (0usize, 0usize);
     for window in &phrase_cases {
         let query = quote(window);
@@ -525,7 +525,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
 
     // Relatório.
     let total: usize = checks.iter().map(|c| c.divergences).sum();
-    println!("\n{:<24} {:>8} {:>12}", "verificação", "casos", "divergências");
+    println!("\n{:<24} {:>8} {:>12}", "verificação", "cases", "divergências");
     for c in &checks {
         println!("{:<24} {:>8} {:>12}", c.name, c.checked, c.divergences);
         for ex in &c.examples {
@@ -549,10 +549,10 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
         "oracle",
         &label,
         json!({ "db": args.db, "corpus": args.corpus, "take": args.take, "remap_ids": args.remap_ids,
-                "docs": docs, "termos_oraculo": vocab.len(), "divergencias": total, "posicoes": has_positions,
+                "docs": docs, "oracle_terms": vocab.len(), "divergences": total, "positions": has_positions,
                 "stemming": stemmer.stemming().code(),
-                "flexoes": engine.inflector().stemming().code(),
-                "verificacoes": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevancia": relevance }),
+                "inflections": engine.inflector().stemming().code(),
+                "checks": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevance": relevance }),
     )?;
     if total > 0 {
         std::process::exit(1);

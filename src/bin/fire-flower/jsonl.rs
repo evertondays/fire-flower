@@ -19,30 +19,23 @@ struct Article {
     text: String,
 }
 
-/// Uma linha de progresso. Com `--progresso-json`, vai para a saída padrão
+/// Uma linha de progresso. Com `--progress-json`, vai para a saída padrão
 /// como JSON (é o que o `scripts/carregar_wikipedia.py` lê).
 /// As chaves do JSON ficam em português: é o formato que o script lê.
 #[derive(Serialize, Default)]
 struct Progress {
-    /// `indexando`, `gravando` (commit em andamento) ou `fim`.
-    #[serde(rename = "fase")]
+    /// `indexing`, `writing` (commit em andamento) ou `done`.
     phase: &'static str,
-    #[serde(rename = "linhas")]
     lines: u64,
-    #[serde(rename = "documentos")]
     documents: u64,
-    #[serde(rename = "invalidas")]
     invalid: u64,
     bytes: u64,
     bytes_total: u64,
-    /// Linhas já gravadas de forma definitiva. `--pular` com este valor
+    /// Linhas já gravadas de forma definitiva. `--skip` com este valor
     /// retoma uma carga interrompida sem perder nada.
-    #[serde(rename = "linhas_gravadas")]
     lines_committed: u64,
     commits: u64,
-    #[serde(rename = "segundos")]
     seconds: f64,
-    #[serde(rename = "ultimo_titulo")]
     last_title: String,
 }
 
@@ -90,7 +83,7 @@ pub fn index(engine: &Engine, path: &Path, opts: &Options) -> Result<(), Box<dyn
         }
 
         if batch.len() >= opts.batch_size {
-            progress.phase = "gravando";
+            progress.phase = "writing";
             report(&mut progress, started, opts.json);
             batch.commit()?;
             progress.commits += 1;
@@ -98,18 +91,18 @@ pub fn index(engine: &Engine, path: &Path, opts: &Options) -> Result<(), Box<dyn
             batch = engine.batch();
         }
         if last_report.elapsed() >= REPORT_EVERY {
-            progress.phase = "indexando";
+            progress.phase = "indexing";
             report(&mut progress, started, opts.json);
             last_report = Instant::now();
         }
     }
 
-    progress.phase = "gravando";
+    progress.phase = "writing";
     report(&mut progress, started, opts.json);
     batch.commit()?;
     progress.commits += 1;
     progress.lines_committed = progress.lines;
-    progress.phase = "fim";
+    progress.phase = "done";
     report(&mut progress, started, opts.json);
     if !opts.json {
         eprintln!();

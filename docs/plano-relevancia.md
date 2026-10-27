@@ -77,23 +77,23 @@ nota    = idf(df) · tf~ · (k1 + 1) / (tf~ + k1)
 
 ## 3. Fase 1 — Avaliação de relevância (antes de mudar o motor)
 
-Sem isso, "melhorou" vira opinião. Um subcomando `wiki relevancia` gera os
+Sem isso, "melhorou" vira opinião. Um subcomando `wiki relevance` gera os
 conjuntos do corpus (seed fixa), roda as consultas com `search_top` e grava
 top-1, top-3, top-10, MRR e "fora do top-1000" em `results/` (fire-flower-bench). O
 relatório ganha uma seção "Relevância".
 
 | Conjunto | Consulta | Resposta esperada | O que mede |
 |---|---|---|---|
-| `rel-titulo` | o título inteiro ("Revolução Francesa") | o artigo | o que já existe hoje (fica para comparar) |
-| `rel-digitando` | o título com a última palavra cortada em ~60% (≥ 3 letras) + `*` (`coreia do nor*`) | o artigo | **problema 1**: o que o TUI busca enquanto se digita |
+| `rel-title` | o título inteiro ("Revolução Francesa") | o artigo | o que já existe hoje (fica para comparar) |
+| `rel-typing` | o título com a última palavra cortada em ~60% (≥ 3 letras) + `*` (`coreia do nor*`) | o artigo | **problema 1**: o que o TUI busca enquanto se digita |
 | `rel-hub` | títulos que aparecem dentro de ≥ 3 outros títulos ("Coreia do Norte" ⊂ "Bandeira da Coreia do Norte", …) | o artigo do título exato em **1º** | **problema 2**: o artigo principal acima dos derivados |
-| `rel-corpo` | 2–3 termos raros do **corpo** de um artigo, que não estão no título | o artigo no top-10 | proteção: o peso do título não pode afundar a busca pelo conteúdo |
-| `rel-manual` | ~30 consultas escritas à mão em `bench/relevancia/manual.tsv` (consulta, IDs esperados, nota) | os IDs no top-3 | casos reais: `coreia do norte` → 3899, `coreia do nor` → 3899, `brasil`, `são paulo`, `segunda guerra mundial`, `revolução francesa`… |
+| `rel-body` | 2–3 termos raros do **corpo** de um artigo, que não estão no título | o artigo no top-10 | proteção: o peso do título não pode afundar a busca pelo conteúdo |
+| `rel-manual` | ~30 consultas escritas à mão em `bench/relevance/manual.tsv` (consulta, IDs esperados, nota) | os IDs no top-3 | casos reais: `coreia do norte` → 3899, `coreia do nor` → 3899, `brasil`, `são paulo`, `segunda guerra mundial`, `revolução francesa`… |
 
 - Os conjuntos `rel-*` são gerados de 100k e versionados em
   `bench/queries/100k/`, como os de latência.
 - A primeira rodada é a **linha de base** com o ranking atual: dá o número de
-  "horrível" (espero `rel-hub` e `rel-digitando` baixos).
+  "horrível" (espero `rel-hub` e `rel-typing` baixos).
 - O oráculo continua conferindo que as notas do motor batem com a fórmula; a
   avaliação confere se a fórmula ordena bem. São coisas diferentes.
 
@@ -110,8 +110,8 @@ relatório ganha uma seção "Relevância".
    `norte`; tf somado com duas completações no mesmo documento.
 4. Atualizar D8 em `plano-frases-e-ranking.md` (substituída por R1) e
    `como-funciona.md`.
-5. Medir: `rel-digitando` e `rel-manual` vs. a linha de base; latência de
-   `p-*` e `misto` (deve ficar igual ou melhor: menos trabalho por documento).
+5. Medir: `rel-typing` e `rel-manual` vs. a linha de base; latência de
+   `p-*` e `mixed` (deve ficar igual ou melhor: menos trabalho por documento).
 
 Entrega sozinha: corrige o problema 1 antes do formato novo.
 
@@ -147,11 +147,11 @@ formato está certo" de "a fórmula ordena bem".
 2. Limite superior com os dois tf (seção 1). `top_single_term` agrupa por
    nível do limite (não mais só do tf), para manter o corte exato.
 3. `Config::title_weight`, `Config::title_b` (validados: `b < 1`, peso ≥ 0)
-   e as opções no `wiki` (`--peso-titulo`, `--b-titulo`) para a grade.
+   e as opções no `wiki` (`--title-weight`, `--title-b`) para a grade.
 4. Oráculo: BM25F, diferença relativa < 1e-4 como hoje.
 5. **Grade** em 100k: peso ∈ {1, 2, 3, 5, 8} × `b_título` ∈ {0,3; 0,5;
-   0,75}, sobre `rel-hub`, `rel-digitando`, `rel-titulo` e `rel-corpo`.
-   Escolher o melhor MRR médio sem piorar `rel-corpo`; **confirmar com outra
+   0,75}, sobre `rel-hub`, `rel-typing`, `rel-title` e `rel-body`.
+   Escolher o melhor MRR médio sem piorar `rel-body`; **confirmar com outra
    seed** (amostra diferente) para não ajustar ao acaso. O vencedor vira o
    padrão do `Config`.
 6. Testes: título igual à consulta vence o mesmo termo só no corpo; título
@@ -168,11 +168,11 @@ partida.
 |---|---|
 | `rel-manual` | **todas** no top-3; `coreia do norte` e `coreia do nor` → "Coreia do Norte" em **1º** |
 | `rel-hub` top-1 | ≥ 90% |
-| `rel-digitando` MRR | ≥ 0,8 |
-| `rel-titulo` top-1 | ≥ 95% (hoje 82%) |
-| `rel-corpo` top-10 | ≥ linha de base − 2 pontos |
+| `rel-typing` MRR | ≥ 0,8 |
+| `rel-title` top-1 | ≥ 95% (hoje 82%) |
+| `rel-body` top-10 | ≥ linha de base − 2 pontos |
 | Oráculo | 0 divergências (fixa) |
-| p50 de `rank-freq`, `rank-titulos`, `misto` | ≤ +20% |
+| p50 de `rank-freq`, `rank-titles`, `mixed` | ≤ +20% |
 | Carga (MB/s) | ≤ −10% |
 | Banco compactado | ≤ +10% |
 
@@ -182,9 +182,9 @@ partida.
 
 - **Ajustar demais à Wikipédia.** Títulos da Wikipédia são curtos e
   descritivos; em outro corpus o peso ideal muda. Por isso o peso é
-  `Config`, e `rel-corpo` segura o exagero.
-- **`rel-titulo`/`rel-hub` favorecem o título por construção.** As metas
-  são lidas junto com `rel-corpo` e `rel-manual`, nunca sozinhas.
+  `Config`, e `rel-body` segura o exagero.
+- **`rel-title`/`rel-hub` favorecem o título por construção.** As metas
+  são lidas junto com `rel-body` e `rel-manual`, nunca sozinhas.
 - **Corte do top-k.** Com dois campos, o limite fica mais frouxo (o título
   pode multiplicar o tf). O teste `top_k_pruning_is_exact` ganha casos com
   título, e a latência de `rank-freq` é medida na Fase 4.
@@ -199,7 +199,7 @@ partida.
 
 | Fase | Muda o formato? | Tamanho | Entrega sozinha |
 |---|---|---|---|
-| 1. Avaliação | não | médio (`wiki relevancia`, conjuntos, ~30 consultas à mão) | os números de hoje |
+| 1. Avaliação | não | médio (`wiki relevance`, conjuntos, ~30 consultas à mão) | os números de hoje |
 | 2. Prefixo | não | pequeno | corrige o problema 1 |
 | 3. Título no formato | **sim (v3)** | grande | título gravado, ranking igual |
 | 4. BM25F + grade | não (usa o v3) | médio | corrige o problema 2 |
@@ -212,7 +212,7 @@ rodada.
 
 ## 10. Checklist
 
-- [x] Fase 1: `wiki relevancia`, conjuntos `rel-*` em 100k, `manual.tsv`, seção no relatório
+- [x] Fase 1: `wiki relevance`, conjuntos `rel-*` em 100k, `manual.tsv`, seção no relatório
 - [x] Fase 1: linha de base com o ranking atual
 - [x] Fase 2: prefixo como um termo só + oráculo + testes
 - [x] Fase 2: D8 substituída por R1 nos docs; avaliação e latência
@@ -237,16 +237,16 @@ Fase 4.
 |---|---|---|---|---|---|
 | `rel-manual` (36 consultas) | 8,3% → **66,7%** | 36,1% → **94,4%** | 55,6% → 100% | 0,251 → 0,811 | todas no top-3 ✗ (34 de 36) |
 | `rel-hub` | 38,6% → **97,9%** | 68,2% → 99,9% | 89,0% → 100% | 0,560 → 0,989 | top-1 ≥ 90% ✔ |
-| `rel-digitando` | 64,6% → **84,4%** | 81,2% → 94,2% | 90,1% → 98,0% | 0,741 → **0,897** | MRR ≥ 0,8 ✔ |
-| `rel-titulo` | 81,3% → **99,3%** | 92,8% → 100% | 97,1% → 100% | 0,875 → 0,996 | top-1 ≥ 95% ✔ |
-| `rel-corpo` | 49,8% → 49,5% | 68,7% → 68,4% | 81,4% → **81,5%** | 0,612 → 0,610 | ≥ base − 2 ✔ |
+| `rel-typing` | 64,6% → **84,4%** | 81,2% → 94,2% | 90,1% → 98,0% | 0,741 → **0,897** | MRR ≥ 0,8 ✔ |
+| `rel-title` | 81,3% → **99,3%** | 92,8% → 100% | 97,1% → 100% | 0,875 → 0,996 | top-1 ≥ 95% ✔ |
+| `rel-body` | 49,8% → 49,5% | 68,7% → 68,4% | 81,4% → **81,5%** | 0,612 → 0,610 | ≥ base − 2 ✔ |
 
 As duas consultas à mão fora do top-3 são ambíguas: `lula` (o molusco; a
 página de desambiguação vem em 1º) e `brasi*` (prefixo curto: "Brasileiros",
 "Brasiguaios", "Brasília" antes de "Brasil"). `coreia do norte` e `coreia do
 nor*` dão "Coreia do Norte" em 1º.
 
-O que sobra de erro em `rel-hub` e `rel-digitando`: páginas "(desambiguação)"
+O que sobra de erro em `rel-hub` e `rel-typing`: páginas "(desambiguação)"
 antes do artigo principal e prefixos curtos que casam vários títulos
 (`astron*` → "Astrônomo" antes de "Astronomia").
 
@@ -254,7 +254,7 @@ antes do artigo principal e prefixos curtos que casam vários títulos
 
 Peso do título × `b` do título em 100k, depois confirmada com outra amostra
 (seed 7). A média do MRR de título, digitando e hub sobe até peso ~50 e
-depois quase não muda (0,961 em 50; 0,965 em 1000), e `rel-corpo` não mexe
+depois quase não muda (0,961 em 50; 0,965 em 1000), e `rel-body` não mexe
 em nenhum ponto. Escolha: **peso 50, `b` do título 0,9** (0,9 em vez de 1,0:
 mesma qualidade, e o limite do corte do top-k continua finito).
 
@@ -284,11 +284,11 @@ Mesmo conteúdo, carregado do mesmo jeito (v2 da Fase 2 vs. v3 com BM25F,
 
 | Conjunto | p50 v2 | p50 v3 | Diferença |
 |---|---|---|---|
-| `t-medio`, `titulos`, `and-2` (sem ranking) | 33 / 50 / 67 µs | 34 / 50 / 69 µs | ~0 |
+| `t-mid`, `titles`, `and-2` (sem ranking) | 33 / 50 / 67 µs | 34 / 50 / 69 µs | ~0 |
 | `rank-freq` | 258 µs | 259 µs | 0% |
 | `rank-and` | 165 µs | 200 µs | +21% |
-| `rank-titulos` | 59 µs | 73 µs | +25% |
-| `misto` | 59 µs | 72 µs | +22% |
+| `rank-titles` | 59 µs | 73 µs | +25% |
+| `mixed` | 59 µs | 72 µs | +22% |
 
 Acima da meta de +20% nos rankings com vários termos ou com título: com
 peso 50 o limite de um documento com o termo no título fica alto e o corte

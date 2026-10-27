@@ -7,7 +7,8 @@
 //!   o título vem primeiro, e o texto começa `TITLE_GAP` posições depois
 //! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
-//! - `meta:*`       -> formato, contadores de ID, estatísticas e idiomas
+//! - `stem:<radical>` -> nós das palavras com esse radical (só com flexões na consulta)
+//! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas e stemming
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -22,7 +23,8 @@ use rustc_hash::FxHashMap;
 
 use crate::codec::{self, DocLens, NORM_BLOCK_DOCS, NormBlock, PositionsCursor, PostingsCursor, TrieNode};
 use crate::stopwords::{self, Language, Stopwords};
-use crate::text::{Analyzer, Clause, normalize_term, parse_query};
+use crate::stem::{Stemmer, Stemming};
+use crate::text::{Analyzer, Clause, normalize_term, parse_query_stemmed};
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
 
 pub const ROOT_ID: u64 = 0;
@@ -43,6 +45,11 @@ const META_TOTAL_LEN: &[u8] = b"meta:total_len";
 const META_TOTAL_TITLE_LEN: &[u8] = b"meta:total_title_len";
 /// Códigos dos idiomas das stopwords, separados por vírgula ("pt,en").
 const META_LANGUAGES: &[u8] = b"meta:languages";
+/// Stemming do banco ("nenhum", "pt", "en"; ver [`Stemming::code`]).
+const META_STEMMING: &[u8] = b"meta:stemming";
+/// Stemmer das flexões na consulta (`Config::inflections`), no mesmo código.
+const META_INFLECTIONS: &[u8] = b"meta:inflections";
+const STEM: &[u8] = b"stem:";
 
 const NODE: &[u8] = b"node:";
 const POST: &[u8] = b"post:";
@@ -130,6 +137,30 @@ pub struct Config {
     /// faz o `open` falhar. Sem posições o banco fica menor e a carga mais
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
+    /// Reduz as palavras ao radical (Snowball) na indexação e na busca:
+    /// "correndo" acha "corrida". Ver [`crate::stem`].
+    ///
+    /// Como os idiomas, é decidido na criação do banco: `None` usa o que está
+    /// gravado (ou [`Stemming::Off`], num banco novo; bancos de antes do
+    /// stemming são `Off`), e `Some` diferente do gravado faz o `open` falhar.
+    pub stemming: Option<Stemming>,
+    /// Flexões na consulta (`docs/plano-stemming.md`, Fase 3): o índice guarda
+    /// as palavras como estão e, para cada radical, as palavras que o têm
+    /// (`stem:<radical>`). A busca soma à palavra exata as outras do mesmo
+    /// radical, com peso [`Config::inflection_weight`]: "planetas" acha o
+    /// artigo "Planeta", mas "Austral" continua acima de "Austrália".
+    ///
+    /// Decidido na criação do banco, como o stemming (o mapa precisa existir
+    /// desde o começo); não combina com `stemming`. `None` usa o gravado (ou
+    /// [`Stemming::Off`], num banco novo).
+    pub inflections: Option<Stemming>,
+    /// Quanto as flexões valem perto da palavra exata (α, de 0 a 1), como um
+    /// campo do BM25F: `tf~ = tf~_exata + α · tf~_flexões`, com o idf da
+    /// união (α = 1 é o stemming na indexação). Vale por busca (não fica
+    /// gravado).
+    pub inflection_weight: f64,
+    /// Quando somar as flexões (vale por busca).
+    pub inflection_mode: InflectionMode,
     /// Filtros de Bloom e índices dos SSTs em partições de 4 KB (ligado por
     /// padrão). Desligar volta ao filtro inteiro, que num banco grande passa
     /// do tamanho de uma parte do block cache e é relido a cada `Get`; existe
@@ -146,6 +177,16 @@ pub struct Config {
     pub title_b: f64,
 }
 
+/// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflectionMode {
+    /// Em toda busca.
+    Always,
+    /// Só quando a busca exata acha menos que tantos documentos: as consultas
+    /// que já acham bastante ficam como sem flexões.
+    IfFewer(usize),
+}
+
 impl Config {
     fn validate(&self) -> Result<()> {
         let in_unit = |v: f64| (0.0..=1.0).contains(&v);
@@ -154,14 +195,15 @@ impl Config {
             && in_unit(self.bm25_b)
             && in_unit(self.title_b)
             && self.title_weight.is_finite()
-            && self.title_weight >= 0.0;
+            && self.title_weight >= 0.0
+            && in_unit(self.inflection_weight);
         if ok {
             Ok(())
         } else {
             Err(Error::Config(format!(
-                "parâmetros de ranking inválidos: k1 = {}, b = {}, peso do título = {}, b do título = {} \
-                 (k1 e peso ≥ 0; b entre 0 e 1)",
-                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b
+                "parâmetros de ranking inválidos: k1 = {}, b = {}, peso do título = {}, b do título = {}, \
+                 peso das flexões = {} (k1 e peso ≥ 0; b e peso das flexões entre 0 e 1)",
+                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b, self.inflection_weight
             )))
         }
     }
@@ -178,6 +220,14 @@ impl Default for Config {
             reader_cache_depth: Some(4),
             languages: None,
             positions: None,
+            stemming: None,
+            inflections: None,
+            // Escolhidos pela grade da Fase 4 do plano de stemming (100k da
+            // Wikipédia, com `pt-plural`): com α = 0,5 título e hub ficam como
+            // sem flexões e o plural escrito à mão acha o artigo em 93% (top-3).
+            // "Só se faltar" não ajuda: "planetas" já acha documentos demais.
+            inflection_weight: 0.5,
+            inflection_mode: InflectionMode::Always,
             partition_filters: true,
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,
@@ -198,6 +248,10 @@ pub struct Engine {
     writer: Mutex<WriterState>,
     config: Config,
     stopwords: Stopwords,
+    /// Stemming gravado no banco (`meta:stemming`).
+    stemmer: Stemmer,
+    /// Stemmer das flexões na consulta (`meta:inflections`).
+    inflector: Stemmer,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
     /// Número do último commit gravado (ver [`EpochCache`]).
@@ -218,6 +272,8 @@ struct WriterState {
     /// e só o devolve no commit: um lote descartado leva o cache junto, e
     /// nada que não foi gravado sobrevive.
     cache: NodeCache,
+    /// Buffers da análise e radicais já calculados, entre um lote e outro.
+    analyzer: Analyzer,
 }
 
 #[derive(Default)]
@@ -366,12 +422,29 @@ impl Engine {
             total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
         };
         let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
-        let writer = Mutex::new(WriterState { next_node_id, next_doc_id, stats, cache: NodeCache::default() });
+        let stemmer = Stemmer::new(resolve_stemming(&db, META_STEMMING, config.stemming)?);
+        let inflector = Stemmer::new(resolve_stemming(&db, META_INFLECTIONS, config.inflections)?);
+        if stemmer.is_on() && inflector.is_on() {
+            return Err(Error::Config(format!(
+                "stemming ({}) e flexões na consulta ({}) não combinam: escolha um",
+                stemmer.stemming(),
+                inflector.stemming()
+            )));
+        }
+        let writer = Mutex::new(WriterState {
+            next_node_id,
+            next_doc_id,
+            stats,
+            cache: NodeCache::default(),
+            analyzer: Analyzer::default(),
+        });
         Ok(Self {
             db,
             writer,
             config,
             stopwords,
+            stemmer,
+            inflector,
             positions,
             epoch: AtomicU64::new(0),
             norms: EpochCache::default(),
@@ -387,6 +460,7 @@ impl Engine {
         // continua válido mesmo se outra thread entrou em pânico com o lock.
         let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let cache = std::mem::take(&mut state.cache);
+        let analyzer = std::mem::take(&mut state.analyzer);
         IndexBatch {
             engine: self,
             next_node_id: state.next_node_id,
@@ -399,7 +473,7 @@ impl Engine {
             pending: FxHashMap::default(),
             lengths: Vec::new(),
             labels: Vec::new(),
-            analyzer: Analyzer::default(),
+            analyzer,
         }
     }
 
@@ -430,9 +504,10 @@ impl Engine {
         self.view().search_ranked(query, k)
     }
 
-    /// Documentos que contêm exatamente `term` (normalizado aqui).
+    /// Documentos que contêm exatamente `term` (normalizado aqui e, com
+    /// stemming, reduzido ao radical, como numa busca).
     pub fn postings(&self, term: &str) -> Result<Vec<DocId>> {
-        let Some(term) = normalize_term(term) else { return Ok(Vec::new()) };
+        let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
             Some(node) => view.load_docs(node),
@@ -442,7 +517,7 @@ impl Engine {
 
     /// Como [`Engine::postings`], com a frequência do termo em cada documento.
     pub fn term_postings(&self, term: &str) -> Result<Vec<Posting>> {
-        let Some(term) = normalize_term(term) else { return Ok(Vec::new()) };
+        let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
             Some(node) => view.load_postings(node),
@@ -450,8 +525,22 @@ impl Engine {
         }
     }
 
+    /// O termo do índice para uma palavra: normalizada e, com stemming,
+    /// reduzida ao radical. `None` se não houver nada indexável.
+    pub fn index_term(&self, word: &str) -> Option<String> {
+        let term = normalize_term(word)?;
+        Some(if self.stemmer.is_on() { self.stemmer.stem(&term) } else { term })
+    }
+
+    /// Separa a consulta em partes como a busca faz (stopwords e stemming do
+    /// banco); ver [`crate::text::parse_query`].
+    pub fn parse_query(&self, query: &str) -> Vec<Clause> {
+        parse_query_stemmed(query, &self.stopwords, &self.stemmer)
+    }
+
     /// Autocompletar: até `limit` palavras indexadas que começam com `prefix`,
-    /// das mais curtas para as mais longas e em ordem alfabética.
+    /// das mais curtas para as mais longas e em ordem alfabética. Com
+    /// stemming, as palavras indexadas são radicais.
     pub fn suggest(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
         let Some(prefix) = normalize_term(prefix) else { return Ok(Vec::new()) };
         let words = self.view().words_with_prefix(&prefix, limit)?;
@@ -506,6 +595,16 @@ impl Engine {
     /// Idiomas das stopwords deste banco.
     pub fn languages(&self) -> &[Language] {
         self.stopwords.languages()
+    }
+
+    /// Stemming deste banco (o gravado nele).
+    pub fn stemmer(&self) -> &Stemmer {
+        &self.stemmer
+    }
+
+    /// Stemmer das flexões na consulta deste banco (o gravado nele).
+    pub fn inflector(&self) -> &Stemmer {
+        &self.inflector
     }
 }
 
@@ -628,6 +727,50 @@ enum Scorer {
     /// texto e no título, pela posição) e idf = soma dos idfs dos termos
     /// (como o Lucene).
     Phrase { weight: f64, phrase: usize, bound: Bound },
+    /// Palavra com flexões (`Config::inflections`): um termo só, como no
+    /// BM25F, em que as flexões são um campo de peso α: `tf~ = tf~_exata + α ·
+    /// tf~_flexões`, com uma saturação só. O idf é o do maior df entre as
+    /// palavras (como o `SynonymQuery` do Lucene), que vem dos cabeçalhos das
+    /// listas sem decodificá-las. Com α < 1, a palavra exata ganha os empates.
+    /// `list` é a lista do grupo no E; `group`, onde ficam as entradas (exata,
+    /// flexões) de cada documento quando ela é decodificada.
+    Group { weight: f64, alpha: f64, list: usize, group: usize, bound: Box<Bound> },
+}
+
+/// (exata, flexões) de cada documento da união de um [`Scorer::Group`].
+type GroupParts = Vec<(Posting, Posting)>;
+
+/// Une a lista da palavra exata e a das flexões (as duas em ordem de
+/// documento): a união para o E e as duas entradas de cada documento.
+fn align_group(exact: &[Posting], variants: &[Posting]) -> (Vec<Posting>, GroupParts) {
+    let none = |doc| Posting { doc, tf: 0, title_tf: 0 };
+    let (mut union, mut parts) = (Vec::with_capacity(exact.len() + variants.len()), GroupParts::new());
+    let (mut i, mut j) = (0, 0);
+    while i < exact.len() || j < variants.len() {
+        let (e, v) = match (exact.get(i), variants.get(j)) {
+            (Some(e), Some(v)) if e.doc == v.doc => {
+                i += 1;
+                j += 1;
+                (*e, *v)
+            }
+            (Some(e), Some(v)) if e.doc < v.doc => {
+                i += 1;
+                (*e, none(e.doc))
+            }
+            (Some(e), None) => {
+                i += 1;
+                (*e, none(e.doc))
+            }
+            (_, Some(v)) => {
+                j += 1;
+                (none(v.doc), *v)
+            }
+            (None, None) => unreachable!(),
+        };
+        union.push(Posting { doc: e.doc, tf: e.tf.saturating_add(v.tf), title_tf: e.title_tf.saturating_add(v.title_tf) });
+        parts.push((e, v));
+    }
+    (union, parts)
 }
 
 /// Normalização de um campo pelo tamanho: `B(len) = 1 − b + b · len / média`.
@@ -781,12 +924,31 @@ impl Bound {
     fn get(&self, tf: u32, title_tf: u32) -> f64 {
         self.get_key(self.key(tf, title_tf))
     }
+
+    /// Limite de um grupo de flexões: as chaves da exata e das flexões, as
+    /// das flexões com peso `alpha` (cada chave já é um limite do seu tf~).
+    #[inline]
+    fn get_mixed(&self, exact: (u32, u32), variants: (u32, u32), alpha: f64) -> f64 {
+        if !self.max_body.is_finite() {
+            return self.weight * BOUND_MARGIN;
+        }
+        let key = f64::from(self.key(exact.0, exact.1)) + alpha * f64::from(self.key(variants.0, variants.1));
+        let p = self.max_body * key;
+        self.weight * p / (p + self.k1) * BOUND_MARGIN
+    }
 }
 
 /// Nota de um documento (já posicionado em todas as listas): soma das
 /// partes, na ordem da consulta.
 #[inline]
-fn doc_score(bm25: &Bm25, scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)], norm: DocNorm) -> f64 {
+fn doc_score(
+    bm25: &Bm25,
+    scorers: &[Scorer],
+    sources: &[AndList<'_>],
+    groups: &[GroupParts],
+    counts: &[(u32, u32)],
+    norm: DocNorm,
+) -> f64 {
     let mut score = 0.0;
     for scorer in scorers {
         score += match scorer {
@@ -798,6 +960,11 @@ fn doc_score(bm25: &Bm25, scorers: &[Scorer], sources: &[AndList<'_>], counts: &
                 let (tf, title_tf) = counts[*phrase];
                 bm25.score(*weight, Bm25::pseudo_tf(norm, tf, title_tf))
             }
+            Scorer::Group { weight, alpha, list, group, .. } => {
+                let (e, v) = sources[*list].group_parts(groups, *group);
+                let pseudo = Bm25::pseudo_tf(norm, e.tf, e.title_tf) + alpha * Bm25::pseudo_tf(norm, v.tf, v.title_tf);
+                bm25.score(*weight, pseudo)
+            }
         };
     }
     score
@@ -806,7 +973,7 @@ fn doc_score(bm25: &Bm25, scorers: &[Scorer], sources: &[AndList<'_>], counts: &
 /// Limite superior de [`doc_score`]: a mesma soma, com o maior valor
 /// possível de cada parte.
 #[inline]
-fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)]) -> f64 {
+fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], groups: &[GroupParts], counts: &[(u32, u32)]) -> f64 {
     let mut bound = 0.0;
     for scorer in scorers {
         bound += match scorer {
@@ -817,6 +984,10 @@ fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)])
             Scorer::Phrase { phrase, bound, .. } => {
                 let (tf, title_tf) = counts[*phrase];
                 bound.get(tf, title_tf)
+            }
+            Scorer::Group { alpha, list, group, bound, .. } => {
+                let (e, v) = sources[*list].group_parts(groups, *group);
+                bound.get_mixed((e.tf, e.title_tf), (v.tf, v.title_tf), *alpha)
             }
         };
     }
@@ -829,15 +1000,50 @@ fn doc_bound(scorers: &[Scorer], sources: &[AndList<'_>], counts: &[(u32, u32)])
 enum Member<T> {
     Bytes { idx: usize, len: usize },
     Decoded(Vec<T>),
+    /// Palavra com flexões: os bytes das listas (`true` = a palavra exata) e a
+    /// soma dos tamanhos (um limite da união).
+    Group { parts: Vec<(bool, usize)>, len: usize },
 }
 
 impl<T> Member<T> {
     fn len(&self) -> usize {
         match self {
-            Member::Bytes { len, .. } => *len,
+            Member::Bytes { len, .. } | Member::Group { len, .. } => *len,
             Member::Decoded(list) => list.len(),
         }
     }
+}
+
+/// Documentos de um grupo de flexões: a união das listas.
+fn decode_group_docs(bytes: &[rocksdb::DBPinnableSlice<'_>], parts: &[(bool, usize)]) -> Result<Vec<DocId>> {
+    let mut all = Vec::new();
+    for &(_, idx) in parts {
+        all.extend(codec::decode_docs(&bytes[idx])?);
+    }
+    all.sort(); // trechos já ordenados: ver `View::union_postings`
+    all.dedup();
+    Ok(all)
+}
+
+/// Um grupo de flexões decodificado: a união e as entradas (exata, flexões).
+fn decode_group(bytes: &[rocksdb::DBPinnableSlice<'_>], parts: &[(bool, usize)]) -> Result<(Vec<Posting>, GroupParts)> {
+    let (mut exact, mut variants) = (Vec::new(), Vec::new());
+    for &(is_exact, idx) in parts {
+        let list = codec::decode_postings(&bytes[idx])?;
+        if is_exact { exact = list } else { variants.extend(list) }
+    }
+    variants.sort_by_key(|p| p.doc);
+    let mut merged: Vec<Posting> = Vec::with_capacity(variants.len());
+    for p in variants {
+        match merged.last_mut() {
+            Some(last) if last.doc == p.doc => {
+                last.tf = last.tf.saturating_add(p.tf);
+                last.title_tf = last.title_tf.saturating_add(p.title_tf);
+            }
+            _ => merged.push(p),
+        }
+    }
+    Ok(align_group(&exact, &merged))
 }
 
 /// Uma lista do E no ranking, já posicionada: decodificada (a que conduz e as
@@ -845,6 +1051,9 @@ impl<T> Member<T> {
 enum AndList<'s> {
     Decoded { list: Vec<Posting>, at: usize },
     Cursor { cursor: PostingsCursor<'s>, current: Posting },
+    /// Grupo de flexões que não conduz: um cursor por lista, sem decodificar;
+    /// `current` = (exata, flexões) do documento.
+    Group { cursors: Vec<(bool, PostingsCursor<'s>)>, current: (Posting, Posting) },
 }
 
 impl AndList<'_> {
@@ -854,6 +1063,20 @@ impl AndList<'_> {
         match self {
             AndList::Decoded { list, at } => list[*at],
             AndList::Cursor { current, .. } => *current,
+            AndList::Group { current: (e, v), .. } => {
+                Posting { doc: e.doc, tf: e.tf.saturating_add(v.tf), title_tf: e.title_tf.saturating_add(v.title_tf) }
+            }
+        }
+    }
+
+    /// (exata, flexões) do documento atual de um grupo de flexões: dos
+    /// cursores, ou de `groups[group]` se a lista foi decodificada.
+    #[inline]
+    fn group_parts(&self, groups: &[GroupParts], group: usize) -> (Posting, Posting) {
+        match self {
+            AndList::Decoded { at, .. } => groups[group][*at],
+            AndList::Group { current, .. } => *current,
+            AndList::Cursor { .. } => unreachable!("grupo de flexões em cursor simples"),
         }
     }
 
@@ -869,6 +1092,23 @@ impl AndList<'_> {
                 }
                 _ => Ok(false),
             },
+            AndList::Group { cursors, current } => {
+                let none = Posting { doc, tf: 0, title_tf: 0 };
+                let (mut e, mut v) = (none, none);
+                let mut found = false;
+                for (is_exact, cursor) in cursors.iter_mut() {
+                    if let Some(p) = cursor.seek(doc)?
+                        && p.doc == doc
+                    {
+                        found = true;
+                        let part = if *is_exact { &mut e } else { &mut v };
+                        part.tf = part.tf.saturating_add(p.tf);
+                        part.title_tf = part.title_tf.saturating_add(p.title_tf);
+                    }
+                }
+                *current = (e, v);
+                Ok(found)
+            }
         }
     }
 }
@@ -879,24 +1119,60 @@ impl View<'_> {
         self.snap.get_bytes(Key::new(POST, node).as_ref())
     }
 
+    /// Se e quando a busca soma as flexões: `None` sem flexões no banco.
+    fn inflection_mode(&self) -> Option<InflectionMode> {
+        self.engine.inflector.is_on().then_some(self.engine.config.inflection_mode)
+    }
+
+    /// A palavra exata e as outras do mesmo radical (`stem:`), sem a exata.
+    fn inflections(&self, term: &str) -> Result<(Option<u64>, Vec<u64>)> {
+        let exact = self.term_node(term)?;
+        let stem = self.engine.inflector.stem(term);
+        let mut variants = match self.snap.get_bytes(&stem_key(&stem))? {
+            Some(v) => codec::decode_node_set(&v)?,
+            None => Vec::new(),
+        };
+        variants.retain(|&n| Some(n) != exact);
+        Ok((exact, variants))
+    }
+
     fn search(&self, query: &str) -> Result<Vec<DocId>> {
-        let clauses = parse_query(query, &self.engine.stopwords);
+        let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
+        match self.inflection_mode() {
+            None => self.search_with(&clauses, false),
+            Some(InflectionMode::Always) => self.search_with(&clauses, true),
+            Some(InflectionMode::IfFewer(n)) => {
+                let exact = self.search_with(&clauses, false)?;
+                if exact.len() < n { self.search_with(&clauses, true) } else { Ok(exact) }
+            }
+        }
+    }
+
+    /// `expand`: palavras exatas casam também as flexões (frases e prefixos não).
+    fn search_with(&self, clauses: &[Clause], expand: bool) -> Result<Vec<DocId>> {
         // Listas exatas ficam como bytes até se saber quem conduz o E.
         let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
         let mut members: Vec<Member<DocId>> = Vec::new();
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
-        for clause in &clauses {
+        for clause in clauses {
             match clause {
                 Clause::Term(t) if t.prefix => {
-                    let list = self.prefix_docs(&t.text)?;
+                    let list = self.prefix_docs(&t.text, t.stem.as_deref())?;
                     if list.is_empty() {
                         return Ok(Vec::new());
                     }
                     members.push(Member::Decoded(list));
                 }
                 Clause::Term(t) => {
-                    if self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut members)? == 0 {
+                    let (exact, variants) =
+                        if expand { self.inflections(&t.text)? } else { (self.term_node(&t.text)?, Vec::new()) };
+                    let df = if variants.is_empty() {
+                        self.add_exact(exact, &mut bytes, &mut members)?
+                    } else {
+                        self.add_group(exact, variants, &mut bytes, &mut members)?
+                    };
+                    if df == 0 {
                         return Ok(Vec::new());
                     }
                 }
@@ -927,8 +1203,11 @@ impl View<'_> {
         let mut result = match members.next().expect("há pelo menos uma lista") {
             Member::Bytes { idx, .. } => codec::decode_docs(&bytes[idx])?,
             Member::Decoded(list) => list,
+            Member::Group { parts, .. } => decode_group_docs(&bytes, &parts)?,
         };
         let mut cursors: Vec<PostingsCursor<'_>> = Vec::new();
+        // Grupos de flexões: o documento precisa estar em alguma das listas.
+        let mut group_cursors: Vec<Vec<PostingsCursor<'_>>> = Vec::new();
         let mut decoded: Vec<(Vec<DocId>, usize)> = Vec::new();
         for m in members {
             match m {
@@ -937,13 +1216,28 @@ impl View<'_> {
                 }
                 Member::Bytes { idx, .. } => decoded.push((codec::decode_docs(&bytes[idx])?, 0)),
                 Member::Decoded(list) => decoded.push((list, 0)),
+                Member::Group { parts, len } if use_cursor(len, result.len()) => group_cursors
+                    .push(parts.iter().map(|&(_, idx)| PostingsCursor::new(&bytes[idx])).collect::<Result<_>>()?),
+                Member::Group { parts, .. } => decoded.push((decode_group_docs(&bytes, &parts)?, 0)),
             }
         }
-        if !cursors.is_empty() || !decoded.is_empty() {
+        if !cursors.is_empty() || !decoded.is_empty() || !group_cursors.is_empty() {
             let mut kept = Vec::with_capacity(result.len());
             'docs: for &doc in &result {
                 for c in cursors.iter_mut() {
                     if c.seek(doc)?.is_none_or(|p| p.doc != doc) {
+                        continue 'docs;
+                    }
+                }
+                for group in group_cursors.iter_mut() {
+                    let mut found = false;
+                    for c in group.iter_mut() {
+                        if c.seek(doc)?.is_some_and(|p| p.doc == doc) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         continue 'docs;
                     }
                 }
@@ -973,6 +1267,37 @@ impl View<'_> {
         Ok(result)
     }
 
+    /// Guarda os bytes das listas de uma palavra e das suas flexões como um
+    /// grupo e devolve o maior df entre elas (0 se nenhuma existe).
+    fn add_group<'s, T>(
+        &'s self,
+        exact: Option<u64>,
+        variants: Vec<u64>,
+        bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+        members: &mut Vec<Member<T>>,
+    ) -> Result<usize> {
+        let mut parts = Vec::with_capacity(variants.len() + 1);
+        let (mut max_df, mut len) = (0usize, 0usize);
+        let mut push = |is_exact: bool, value: rocksdb::DBPinnableSlice<'s>| -> Result<()> {
+            let n = codec::list_len(&value)? as usize;
+            max_df = max_df.max(n);
+            len += n;
+            parts.push((is_exact, bytes.len()));
+            bytes.push(value);
+            Ok(())
+        };
+        if let Some(value) = exact.map(|n| self.post_bytes(n)).transpose()?.flatten() {
+            push(true, value)?;
+        }
+        for value in self.get_many(POST, variants.into_iter())?.into_iter().flatten() {
+            push(false, value)?;
+        }
+        if len > 0 {
+            members.push(Member::Group { parts, len });
+        }
+        Ok(max_df)
+    }
+
     /// Guarda os bytes da lista `post:` do termo e devolve o df (0 se o termo
     /// não existe).
     fn add_exact<'s, T>(
@@ -990,11 +1315,23 @@ impl View<'_> {
     }
 
     fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
-        let clauses = parse_query(query, &self.engine.stopwords);
+        let clauses = self.engine.parse_query(query);
         self.check_phrases(&clauses)?;
         if clauses.is_empty() {
             return Ok(TopHits::default());
         }
+        match self.inflection_mode() {
+            None => self.search_ranked_with(&clauses, k, false),
+            Some(InflectionMode::Always) => self.search_ranked_with(&clauses, k, true),
+            Some(InflectionMode::IfFewer(n)) => {
+                let exact = self.search_ranked_with(&clauses, k, false)?;
+                if exact.total < n { self.search_ranked_with(&clauses, k, true) } else { Ok(exact) }
+            }
+        }
+    }
+
+    /// `expand`: como em [`View::search_with`].
+    fn search_ranked_with(&self, clauses: &[Clause], k: usize, expand: bool) -> Result<TopHits> {
         let stats = self.stats()?;
         let config = &self.engine.config;
         let bm25 = Bm25::new(config, stats);
@@ -1006,22 +1343,42 @@ impl View<'_> {
         let mut lists: Vec<Member<Posting>> = Vec::new();
         let mut scorers: Vec<Scorer> = Vec::with_capacity(clauses.len());
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
-        for clause in &clauses {
+        let mut groups: Vec<GroupParts> = Vec::new();
+        for clause in clauses {
             match clause {
                 Clause::Term(t) if !t.prefix => {
-                    let df = self.add_exact(self.term_node(&t.text)?, &mut bytes, &mut lists)?;
-                    if df == 0 {
+                    let (exact, variants) =
+                        if expand { self.inflections(&t.text)? } else { (self.term_node(&t.text)?, Vec::new()) };
+                    if variants.is_empty() {
+                        let df = self.add_exact(exact, &mut bytes, &mut lists)?;
+                        if df == 0 {
+                            return Ok(TopHits::default());
+                        }
+                        let weight = bm25.weight(bm25.idf(df));
+                        scorers.push(Scorer::Term { weight, list: lists.len() - 1, bound: Bound::new(weight, &bm25) });
+                        continue;
+                    }
+                    let list = lists.len();
+                    let max_df = self.add_group(exact, variants, &mut bytes, &mut lists)?;
+                    if max_df == 0 {
                         return Ok(TopHits::default());
                     }
-                    let weight = bm25.weight(bm25.idf(df));
-                    scorers.push(Scorer::Term { weight, list: lists.len() - 1, bound: Bound::new(weight, &bm25) });
+                    let weight = bm25.weight(bm25.idf(max_df));
+                    scorers.push(Scorer::Group {
+                        weight,
+                        alpha: self.engine.config.inflection_weight,
+                        list,
+                        group: groups.len(),
+                        bound: Box::new(Bound::new(weight, &bm25)),
+                    });
+                    groups.push(GroupParts::new());
                 }
                 Clause::Term(t) => {
                     // Prefixo como um termo só: um documento por entrada, com o
                     // tf somado das completações que ele contém, e o idf do
                     // conjunto. Uma completação rara não vale mais que a
                     // palavra comum (R1 do plano de relevância).
-                    let list = self.prefix_postings(&t.text)?;
+                    let list = self.prefix_postings(&t.text, t.stem.as_deref())?;
                     if list.is_empty() {
                         return Ok(TopHits::default());
                     }
@@ -1054,19 +1411,39 @@ impl View<'_> {
         // (ocorrências da frase, quantas no título), por frase.
         let mut counts = vec![(0u32, 0u32); matchers.len()];
 
-        // Decodifica uma lista inteira.
-        let decode = |m: Member<Posting>| -> Result<Vec<Posting>> {
+        // O grupo de flexões de cada lista que é um.
+        let mut group_of: Vec<Option<usize>> = vec![None; lists.len()];
+        for scorer in &scorers {
+            if let Scorer::Group { list, group, .. } = scorer {
+                group_of[*list] = Some(*group);
+            }
+        }
+        // Decodifica uma lista inteira (a de um grupo guarda as entradas em `groups`).
+        let decode = |m: Member<Posting>, i: usize, groups: &mut Vec<GroupParts>| -> Result<Vec<Posting>> {
             match m {
                 Member::Bytes { idx, .. } => codec::decode_postings(&bytes[idx]),
                 Member::Decoded(list) => Ok(list),
+                Member::Group { parts, .. } => {
+                    let (union, entries) = decode_group(&bytes, &parts)?;
+                    groups[group_of[i].expect("lista de grupo")] = entries;
+                    Ok(union)
+                }
             }
         };
         if let [Scorer::Term { weight, bound, .. }] = scorers.as_slice()
             && matchers.is_empty()
         {
-            let list = decode(lists.pop().expect("um termo, uma lista"))?;
+            let list = decode(lists.pop().expect("um termo, uma lista"), 0, &mut groups)?;
             let hits = self.top_single_term(&list, *weight, bound, &bm25, k)?;
             return Ok(TopHits { hits, total: list.len() });
+        }
+        if let [Scorer::Group { weight, alpha, bound, .. }] = scorers.as_slice()
+            && matchers.is_empty()
+            && let Some(Member::Group { parts, .. }) = lists.pop()
+        {
+            let (_, entries) = decode_group(&bytes, &parts)?;
+            let hits = self.top_single_group(&entries, *weight, *alpha, bound, &bm25, k)?;
+            return Ok(TopHits { hits, total: entries.len() });
         }
 
         // 2. E pelas listas: a menor conduz (decodificada inteira); nas
@@ -1080,12 +1457,17 @@ impl View<'_> {
                 Member::Bytes { idx, len } if i != driver && use_cursor(len, driver_len) => {
                     AndList::Cursor { cursor: PostingsCursor::new(&bytes[idx])?, current: Posting { doc: 0, tf: 1, title_tf: 0 } }
                 }
-                m => AndList::Decoded { list: decode(m)?, at: 0 },
+                Member::Group { parts, len } if i != driver && use_cursor(len, driver_len) => {
+                    let cursors = parts.iter().map(|&(e, idx)| Ok((e, PostingsCursor::new(&bytes[idx])?))).collect::<Result<_>>()?;
+                    let none = Posting { doc: 0, tf: 0, title_tf: 0 };
+                    AndList::Group { cursors, current: (none, none) }
+                }
+                m => AndList::Decoded { list: decode(m, i, &mut groups)?, at: 0 },
             });
         }
         let driver_docs: Vec<DocId> = match &sources[driver] {
             AndList::Decoded { list, .. } => list.iter().map(|p| p.doc).collect(),
-            AndList::Cursor { .. } => unreachable!("quem conduz é decodificada"),
+            AndList::Cursor { .. } | AndList::Group { .. } => unreachable!("quem conduz é decodificada"),
         };
         let mut norms = NormCursor::new(self);
         let mut top = TopK::new(k);
@@ -1121,7 +1503,7 @@ impl View<'_> {
             //    passaria do pior não precisa do tamanho (nem da nota exata).
             //    Empate também perde: os IDs chegam em ordem crescente.
             if let Some(worst) = top.threshold()
-                && doc_bound(&scorers, &sources, &counts) <= worst
+                && doc_bound(&scorers, &sources, &groups, &counts) <= worst
             {
                 continue;
             }
@@ -1129,7 +1511,7 @@ impl View<'_> {
                 Some(l) => l,
                 None => norms.lens(doc)?,
             };
-            let score = doc_score(&bm25, &scorers, &sources, &counts, bm25.doc_norm(lens));
+            let score = doc_score(&bm25, &scorers, &sources, &groups, &counts, bm25.doc_norm(lens));
             top.push(Hit { doc, score });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
@@ -1155,11 +1537,69 @@ impl View<'_> {
     /// Num termo frequente, a maior parte da lista (tf baixo) fica de fora sem
     /// leitura de tamanho nem nota exata.
     fn top_single_term(&self, list: &[Posting], weight: f64, bound: &Bound, bm25: &Bm25, k: usize) -> Result<Vec<Hit>> {
+        self.top_by_levels(
+            list,
+            |p| p.doc,
+            |p| bound.key(p.tf, p.title_tf),
+            |p, norm| bm25.score(weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf)),
+            bound,
+            bm25,
+            k,
+        )
+    }
+
+    /// Uma palavra com flexões sozinha: como [`View::top_single_term`], com a
+    /// chave da exata somada à das flexões (com peso `alpha`) e arredondada
+    /// para cima, que continua sendo um limite da nota.
+    fn top_single_group(
+        &self,
+        entries: &[(Posting, Posting)],
+        weight: f64,
+        alpha: f64,
+        bound: &Bound,
+        bm25: &Bm25,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
+        // A chave tem conta de ponto flutuante: calculada uma vez por entrada.
+        let keyed: Vec<(u32, Posting, Posting)> = entries
+            .iter()
+            .map(|&(e, v)| {
+                let x = f64::from(bound.key(e.tf, e.title_tf)) + alpha * f64::from(bound.key(v.tf, v.title_tf));
+                let key = if x.is_finite() && x < f64::from(u32::MAX - 1) { (x + 1e-9).ceil() as u32 } else { u32::MAX };
+                (key, e, v)
+            })
+            .collect();
+        self.top_by_levels(
+            &keyed,
+            |(_, e, _)| e.doc,
+            |(key, _, _)| *key,
+            |(_, e, v), norm| {
+                bm25.score(weight, Bm25::pseudo_tf(norm, e.tf, e.title_tf) + alpha * Bm25::pseudo_tf(norm, v.tf, v.title_tf))
+            },
+            bound,
+            bm25,
+            k,
+        )
+    }
+
+    /// O top-k de uma parte só, por níveis de chave: `key` é um limite da nota
+    /// (pela tabela de `bound`) e `score`, a nota exata.
+    #[allow(clippy::too_many_arguments)]
+    fn top_by_levels<T>(
+        &self,
+        list: &[T],
+        doc_of: impl Fn(&T) -> DocId,
+        key_of: impl Fn(&T) -> u32,
+        score_of: impl Fn(&T, DocNorm) -> f64,
+        bound: &Bound,
+        bm25: &Bm25,
+        k: usize,
+    ) -> Result<Vec<Hit>> {
         if k == 0 || list.is_empty() {
             return Ok(Vec::new());
         }
         const CAP: usize = 64;
-        let level = |p: &Posting| CAP - (bound.key(p.tf, p.title_tf) as usize).min(CAP);
+        let level = |p: &T| CAP - (key_of(p) as usize).min(CAP);
         // Menor chave de um nível: o limite do nível inteiro.
         let level_key = |l: usize| (CAP - l) as u32;
         let mut count = [0usize; CAP + 1];
@@ -1202,11 +1642,12 @@ impl View<'_> {
             }
             for p in list {
                 let l = level(p);
-                if l < lo || l >= hi || loses(&top, bound.get(p.tf, p.title_tf), p.doc) {
+                let doc = doc_of(p);
+                if l < lo || l >= hi || loses(&top, bound.get_key(key_of(p)), doc) {
                     continue;
                 }
-                let norm = bm25.doc_norm(norms.lens(p.doc)?);
-                top.push(Hit { doc: p.doc, score: bm25.score(weight, Bm25::pseudo_tf(norm, p.tf, p.title_tf)) });
+                let norm = bm25.doc_norm(norms.lens(doc)?);
+                top.push(Hit { doc, score: score_of(p, norm) });
             }
             lo = hi;
         }
@@ -1240,12 +1681,29 @@ impl View<'_> {
     }
 
 
+    /// Nós das completações de `prefix` e, com stemming, o do radical do
+    /// prefixo (ver [`crate::text::QueryTerm::stem`]), sem repetir.
+    fn prefix_nodes(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<u64>> {
+        let mut nodes: Vec<u64> =
+            self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?.into_iter().map(|(_, n)| n).collect();
+        if let Some(node) = stem.map(|s| self.term_node(s)).transpose()?.flatten()
+            && !nodes.contains(&node)
+        {
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
     /// Listas das completações de `prefix` unidas por documento, com o tf
     /// somado: o prefixo como se fosse um termo só.
-    fn prefix_postings(&self, prefix: &str) -> Result<Vec<Posting>> {
-        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
+    fn prefix_postings(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<Posting>> {
+        self.union_postings(self.prefix_nodes(prefix, stem)?.into_iter())
+    }
+
+    /// Listas de vários nós unidas por documento, com o tf somado.
+    fn union_postings(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<Posting>> {
         let mut all: Vec<Posting> = Vec::new();
-        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+        for value in self.get_many(POST, nodes)?.into_iter().flatten() {
             all.extend(codec::decode_postings(&value)?);
         }
         // `all` é a concatenação de listas já ordenadas: a ordenação estável
@@ -1265,10 +1723,14 @@ impl View<'_> {
         Ok(merged)
     }
 
-    fn prefix_docs(&self, prefix: &str) -> Result<Vec<DocId>> {
-        let words = self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?;
+    fn prefix_docs(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<DocId>> {
+        self.union_docs(self.prefix_nodes(prefix, stem)?.into_iter())
+    }
+
+    /// Documentos de vários nós, unidos.
+    fn union_docs(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<DocId>> {
         let mut all = Vec::new();
-        for value in self.get_many(POST, words.iter().map(|(_, node)| *node))?.into_iter().flatten() {
+        for value in self.get_many(POST, nodes)?.into_iter().flatten() {
             all.extend(codec::decode_docs(&value)?);
         }
         all.sort(); // trechos já ordenados: ver `prefix_postings`
@@ -1784,7 +2246,7 @@ impl IndexBatch<'_> {
     /// para pesar o título mais que o resto.
     pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
-        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords);
+        let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords, &self.engine.stemmer);
         let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
             acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
@@ -1859,10 +2321,16 @@ impl IndexBatch<'_> {
         let encode_started = Instant::now();
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
+        // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
+        let inflector = &self.engine.inflector;
+        let mut new_by_stem: FxHashMap<String, Vec<u64>> = FxHashMap::default();
         for (term, mut acc) in terms {
             let t = Instant::now();
-            let id = self.insert_term(&term, &mut path)?;
+            let (id, new_word) = self.insert_term(&term, &mut path)?;
             trie += t.elapsed();
+            if new_word && inflector.is_on() {
+                new_by_stem.entry(inflector.stem(&term)).or_default().push(id);
+            }
             acc.normalize(positions);
             buf.clear();
             codec::encode_postings_into(&mut buf, &acc.docs);
@@ -1872,6 +2340,10 @@ impl IndexBatch<'_> {
                 codec::encode_positions_into(&mut buf, &acc.docs, &acc.positions);
                 wb.merge(Key::new(POS, id), &buf);
             }
+        }
+        for (stem, mut ids) in new_by_stem {
+            ids.sort_unstable();
+            wb.merge(stem_key(&stem), codec::encode_node_set(&ids));
         }
         stats.trie_secs = trie.as_secs_f64();
         stats.encode_secs = encode_started.elapsed().as_secs_f64() - stats.trie_secs;
@@ -1920,6 +2392,7 @@ impl IndexBatch<'_> {
         stats.evict_secs = t.elapsed().as_secs_f64();
         stats.cache_nodes = nodes.len();
         self.state.cache = NodeCache { nodes, generation: self.generation };
+        self.state.analyzer = std::mem::take(&mut self.analyzer);
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
         self.state.stats = stats_index;
@@ -1978,7 +2451,8 @@ impl IndexBatch<'_> {
     /// termo anterior, e a descida recomeça do fim do prefixo comum em vez da
     /// raiz. Os nós desse caminho já estão no mapa do lote (o descarte só
     /// acontece depois do commit).
-    fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<u64> {
+    /// Devolve o nó do termo e se ele virou palavra agora (não estava no índice).
+    fn insert_term(&mut self, term: &str, path: &mut TriePath) -> Result<(u64, bool)> {
         if path.ids.is_empty() {
             path.ids.push(ROOT_ID);
         }
@@ -2012,14 +2486,15 @@ impl IndexBatch<'_> {
             path.ids.push(id);
         }
         let leaf = self.node_mut(id, depth)?;
-        if !leaf.node.is_end_of_word {
+        let new_word = !leaf.node.is_end_of_word;
+        if new_word {
             leaf.node.is_end_of_word = true;
             if !leaf.dirty {
                 leaf.dirty = true;
                 self.dirty.push(id);
             }
         }
-        Ok(id)
+        Ok((id, new_word))
     }
 
     /// Nó do cache, lendo do banco na primeira vez.
@@ -2228,12 +2703,45 @@ fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Languag
     Ok(languages)
 }
 
+/// Stemming do banco (`key` = `meta:stemming` ou `meta:inflections`). Num
+/// banco sem a chave, grava o da config (ou `Off`); um banco que já tem dados
+/// e não tem a chave é de antes dela: `Off`.
+fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
+    let what = if key == META_STEMMING { "stemming" } else { "flexões na consulta" };
+    let stored = match db.get_pinned(key)? {
+        Some(v) => {
+            let code = String::from_utf8_lossy(&v);
+            Some(Stemming::from_code(&code).ok_or_else(|| Error::Corrupt(format!("{what} desconhecido no banco: {code:?}")))?)
+        }
+        None if read_counter(db, META_NEXT_NODE)?.is_some() => Some(Stemming::Off),
+        None => None,
+    };
+    let stemming = match (stored, wanted) {
+        (Some(stored), Some(wanted)) if stored != wanted => {
+            return Err(Error::Config(format!(
+                "o banco foi criado com {what} {stored}, mas a config pede {wanted}; recarregue o banco"
+            )));
+        }
+        (Some(stored), _) => stored,
+        (None, wanted) => wanted.unwrap_or_default(),
+    };
+    if db.get_pinned(key)?.is_none() {
+        db.put(key, stemming.code())?;
+    }
+    Ok(stemming)
+}
+
 fn parse_languages(codes: &str) -> Result<Vec<Language>> {
     codes
         .split(',')
         .filter(|c| !c.trim().is_empty())
         .map(|c| Language::from_code(c).ok_or_else(|| Error::Corrupt(format!("idioma desconhecido no banco: {c:?}"))))
         .collect()
+}
+
+/// `stem:<radical>`.
+fn stem_key(stem: &str) -> Vec<u8> {
+    [STEM, stem.as_bytes()].concat()
 }
 
 fn read_counter(db: &DB, key: &[u8]) -> Result<Option<u64>> {
@@ -2256,6 +2764,8 @@ fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands)
         codec::merge_postings(inputs)
     } else if key.starts_with(POS) {
         codec::merge_positions(inputs)
+    } else if key.starts_with(STEM) {
+        codec::merge_node_sets(inputs)
     } else {
         None
     }

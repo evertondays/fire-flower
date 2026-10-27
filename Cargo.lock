@@ -648,6 +648,7 @@ dependencies = [
  "criterion",
  "ratatui",
  "rocksdb",
+ "rust-stemmers",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -1555,6 +1556,16 @@ checksum = "26ec73b20525cb235bad420f911473b69f9fe27cc856c5461bccd7e4af037f43"
 dependencies = [
  "libc",
  "librocksdb-sys",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

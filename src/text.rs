@@ -1,11 +1,13 @@
 //! Camada de processamento de texto: limpeza, normalização e tokenização.
 //!
 //! A mesma tokenização ([`for_each_token`]) é usada na indexação e na busca,
-//! garantindo que "Ação", "ACAO" e "acao" virem o mesmo termo.
+//! garantindo que "Ação", "ACAO" e "acao" virem o mesmo termo. Com stemming
+//! (ver [`crate::stem`]), o termo é o radical do token.
 
 use rustc_hash::FxHashMap;
 use unicode_normalization::char::{decompose_compatible, is_combining_mark};
 
+use crate::stem::{StemCache, Stemmer};
 use crate::stopwords::Stopwords;
 
 /// Tokens maiores que isso são descartados (hashes, base64, lixo binário),
@@ -71,6 +73,25 @@ pub fn for_each_token(text: &str, mut f: impl FnMut(&str, u32)) {
     flush(&mut token, &mut chars);
 }
 
+/// Chama `f(termo, posição)` para cada token de `text` que não é stopword,
+/// com o termo já reduzido ao radical se o `stemmer` estiver ligado (as
+/// stopwords são conferidas antes, no token inteiro). As posições são as de
+/// [`for_each_token`]: stopwords deixam buraco.
+pub fn for_each_term(text: &str, stopwords: &Stopwords, stemmer: &Stemmer, mut f: impl FnMut(&str, u32)) {
+    let mut stem = String::new();
+    for_each_token(text, |t, p| {
+        if stopwords.contains(t) {
+            return;
+        }
+        if stemmer.is_on() {
+            stemmer.stem_into(t, &mut stem);
+            f(&stem, p);
+        } else {
+            f(t, p);
+        }
+    });
+}
+
 /// Divide o texto em termos normalizados (ver [`for_each_token`]).
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -128,6 +149,8 @@ pub struct Analyzer {
     positions: Vec<u32>,
     /// Posições do título: 0…`title_span` − 1 (stopwords contam).
     title_span: u32,
+    /// Radicais já calculados (só com stemming).
+    stems: StemCache,
 }
 
 /// Vão entre o título e o texto nas posições: uma frase não casa
@@ -139,14 +162,17 @@ impl Analyzer {
     /// Analisa `text` e devolve o tamanho do documento (tokens sem stopwords).
     /// Os termos ficam disponíveis em [`Analyzer::terms`] até a próxima chamada.
     pub fn run(&mut self, text: &str, stopwords: &Stopwords) -> u32 {
-        self.run_fields("", text, stopwords).0
+        self.run_fields("", text, stopwords, &Stemmer::default()).0
     }
 
     /// Analisa um documento com título. O título ocupa as posições
     /// 0…T − 1 e o texto começa em T + [`TITLE_GAP`] (ou em 0, sem título).
     /// Devolve (tamanho do documento inteiro, tamanho do título), sem stopwords.
-    pub fn run_fields(&mut self, title: &str, text: &str, stopwords: &Stopwords) -> (u32, u32) {
-        let Self { text: buf, tokens, group_of, groups, starts, positions, title_span } = self;
+    ///
+    /// Com o `stemmer` ligado, os termos são os radicais (as stopwords são
+    /// conferidas antes, no token inteiro).
+    pub fn run_fields(&mut self, title: &str, text: &str, stopwords: &Stopwords, stemmer: &Stemmer) -> (u32, u32) {
+        let Self { text: buf, tokens, group_of, groups, starts, positions, title_span, stems } = self;
         buf.clear();
         tokens.clear();
         group_of.clear();
@@ -157,7 +183,7 @@ impl Analyzer {
             let kept = !stopwords.contains(t);
             if kept {
                 let start = buf.len() as u32;
-                buf.push_str(t);
+                buf.push_str(stems.get(stemmer, t));
                 tokens.push((start, buf.len() as u32, p));
             }
             kept
@@ -225,8 +251,15 @@ impl Analyzer {
 /// Um termo da consulta, já normalizado. `prefix` vale para `termo*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryTerm {
+    /// O termo como está no índice (o radical, com stemming). Num prefixo, o
+    /// texto digitado, normalizado: os radicais que começam com ele casam.
     pub text: String,
     pub prefix: bool,
+    /// Só em prefixos com stemming: o radical do texto digitado, quando é
+    /// outro (`brasileiro*` → `brasileir`). A busca casa também esse termo
+    /// exato, senão a palavra inteira, digitada sem espaço, não acharia nada
+    /// (nenhum radical começa com `brasileiro`).
+    pub stem: Option<String>,
 }
 
 /// Termo de uma frase e sua distância até o primeiro termo dela.
@@ -252,7 +285,7 @@ impl Clause {
         match self {
             Clause::Term(t) => vec![t.clone()],
             Clause::Phrase(parts) => {
-                parts.iter().map(|p| QueryTerm { text: p.text.clone(), prefix: false }).collect()
+                parts.iter().map(|p| QueryTerm { text: p.text.clone(), prefix: false, stem: None }).collect()
             }
         }
     }
@@ -270,23 +303,29 @@ impl Clause {
 /// - Uma frase com um termo só (`"papel"`, `"o papel"`) é um termo comum; uma
 ///   frase só de stopwords some.
 pub fn parse_query(query: &str, stopwords: &Stopwords) -> Vec<Clause> {
+    parse_query_stemmed(query, stopwords, &Stemmer::default())
+}
+
+/// Como [`parse_query`], com os termos reduzidos ao radical como na
+/// indexação. Prefixos não são reduzidos (ver [`QueryTerm::stem`]).
+pub fn parse_query_stemmed(query: &str, stopwords: &Stopwords, stemmer: &Stemmer) -> Vec<Clause> {
     let mut clauses = Vec::new();
     let mut rest = query;
     while let Some(open) = rest.find('"') {
-        parse_words(&rest[..open], stopwords, &mut clauses);
+        parse_words(&rest[..open], stopwords, stemmer, &mut clauses);
         let inside = &rest[open + 1..];
         let (phrase, after) = match inside.find('"') {
             Some(close) => (&inside[..close], &inside[close + 1..]),
             None => (inside, ""),
         };
-        parse_phrase(phrase, stopwords, &mut clauses);
+        parse_phrase(phrase, stopwords, stemmer, &mut clauses);
         rest = after;
     }
-    parse_words(rest, stopwords, &mut clauses);
+    parse_words(rest, stopwords, stemmer, &mut clauses);
     clauses
 }
 
-fn parse_words(text: &str, stopwords: &Stopwords, out: &mut Vec<Clause>) {
+fn parse_words(text: &str, stopwords: &Stopwords, stemmer: &Stemmer, out: &mut Vec<Clause>) {
     for piece in text.split_whitespace() {
         let (piece, prefix) = match piece.strip_suffix('*') {
             Some(stem) => (stem, true),
@@ -296,27 +335,26 @@ fn parse_words(text: &str, stopwords: &Stopwords, out: &mut Vec<Clause>) {
         let tokens = tokenize(piece);
         let last = tokens.len().saturating_sub(1);
         for (i, text) in tokens.into_iter().enumerate() {
-            let prefix = prefix && i == last;
-            if prefix || !stopwords.contains(&text) {
-                out.push(Clause::Term(QueryTerm { text, prefix }));
+            if prefix && i == last {
+                let stem = Some(stemmer.stem(&text)).filter(|s| stemmer.is_on() && *s != text);
+                out.push(Clause::Term(QueryTerm { text, prefix: true, stem }));
+            } else if !stopwords.contains(&text) {
+                out.push(Clause::Term(QueryTerm { text: stemmer.stem(&text), prefix: false, stem: None }));
             }
         }
     }
 }
 
-fn parse_phrase(text: &str, stopwords: &Stopwords, out: &mut Vec<Clause>) {
+fn parse_phrase(text: &str, stopwords: &Stopwords, stemmer: &Stemmer, out: &mut Vec<Clause>) {
     let mut parts: Vec<PhraseTerm> = Vec::new();
     let mut first = None;
-    for_each_token(text, |t, position| {
-        if stopwords.contains(t) {
-            return;
-        }
+    for_each_term(text, stopwords, stemmer, |t, position| {
         let base = *first.get_or_insert(position);
         parts.push(PhraseTerm { text: t.to_string(), offset: position - base });
     });
     match parts.len() {
         0 => {}
-        1 => out.push(Clause::Term(QueryTerm { text: parts.pop().unwrap().text, prefix: false })),
+        1 => out.push(Clause::Term(QueryTerm { text: parts.pop().unwrap().text, prefix: false, stem: None })),
         _ => out.push(Clause::Phrase(parts)),
     }
 }
@@ -523,7 +561,7 @@ mod tests {
     }
 
     fn term(text: &str, prefix: bool) -> Clause {
-        Clause::Term(QueryTerm { text: text.into(), prefix })
+        Clause::Term(QueryTerm { text: text.into(), prefix, stem: None })
     }
 
     fn phrase(parts: &[(&str, u32)]) -> Clause {
@@ -560,6 +598,40 @@ mod tests {
         assert!(q("\"\" \"").is_empty());
         // Clause::terms serve para o destaque.
         assert_eq!(q("\"casa de papel\"")[0].terms().len(), 2);
+    }
+
+    #[test]
+    fn stemmed_queries_reduce_words_but_not_prefixes() {
+        use crate::stem::Stemming;
+        let sw = Stopwords::default();
+        let stemmer = Stemmer::new(Stemming::Snowball(crate::stopwords::Language::Portuguese));
+        let q = |s: &str| parse_query_stemmed(s, &sw, &stemmer);
+        assert_eq!(q("Corrida das alunas"), [term("corr", false), term("alun", false)]);
+        assert_eq!(q("\"informações do país\""), [phrase(&[("inform", 0), ("pais", 2)])]);
+        assert_eq!(q("\"o país\""), [term("pais", false)]);
+        // O prefixo fica como foi digitado; o radical vai à parte quando é outro.
+        let stem = |text: &str, stem: Option<&str>| {
+            Clause::Term(QueryTerm { text: text.into(), prefix: true, stem: stem.map(String::from) })
+        };
+        assert_eq!(q("brasileiro* bras* de*"), [stem("brasileiro", Some("brasileir")), stem("bras", None), stem("de", None)]);
+        // Sem stemming, igual ao `parse_query`.
+        assert_eq!(parse_query_stemmed("Corrida brasileiro*", &sw, &Stemmer::default()), parse_query("Corrida brasileiro*", &sw));
+    }
+
+    #[test]
+    fn analyzer_stems_terms_after_dropping_stopwords() {
+        use crate::stem::Stemming;
+        let sw = Stopwords::default();
+        let stemmer = Stemmer::new(Stemming::Snowball(crate::stopwords::Language::Portuguese));
+        let mut analyzer = Analyzer::default();
+        let (len, title_len) = analyzer.run_fields("Corridas", "Os alunos correndo e a aluna", &sw, &stemmer);
+        assert_eq!((len, title_len), (4, 1));
+        let mut terms: Vec<(String, Vec<u32>)> = analyzer.terms().map(|(t, p)| (t.into(), p.to_vec())).collect();
+        terms.sort();
+        assert_eq!(terms, [("alun".to_string(), vec![102, 106]), ("corr".into(), vec![0, 103])]);
+        let mut seen = Vec::new();
+        for_each_term("Os alunos correndo", &sw, &stemmer, |t, p| seen.push((t.to_string(), p)));
+        assert_eq!(seen, [("alun".to_string(), 1), ("corr".into(), 2)]);
     }
 
     #[test]

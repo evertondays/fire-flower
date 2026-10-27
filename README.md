@@ -13,6 +13,11 @@ Suporta:
   (`--idiomas pt,en`, o padrão) e ficam gravados nele;
 - várias palavras combinadas com **E** (`roupa rei`);
 - busca por prefixo (`program*`);
+- **plural e flexões** opcionais: `--stemming pt-plural` ("planetas" acha
+  o artigo "Planeta", quase sem custo), `--flexoes pt-plural` (o mesmo, com a
+  palavra exata valendo mais que a flexão, mas buscas ~2× mais lentas) e
+  `--stemming pt` (Snowball). São escolhidos na criação do banco e ficam
+  gravados nele;
 - busca por **frase** (`"casa de papel"`): os termos em sequência, com as
   stopwords contando como buraco;
 - **ranking BM25F**: os resultados saem por relevância (`search_top`), com o
@@ -94,6 +99,25 @@ usa. Com `--sem-posicoes` (em `index`, `index-jsonl` e
 `scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
 frases dão erro. A escolha fica gravada no banco, como os idiomas.
 
+Para achar outras formas da palavra há duas opções (nas mesmas opções de
+criação; ver [docs/plano-stemming.md](docs/plano-stemming.md)):
+
+- `--stemming pt-plural` (a recomendada): plural e singular viram o mesmo
+  termo no índice ("planetas" acha "Planeta", "eleicoes" acha "eleição").
+  Na Wikipédia inteira, a carga e o tamanho ficam iguais, termos e E custam
+  +2–10% e frases +17–35%; a ordenação perde pouco (o artigo "Torre" pode
+  ficar atrás de "Torres").
+- `--flexoes pt-plural`: o índice guarda as palavras como estão e um mapa
+  radical → palavras; a busca soma à palavra exata as outras do mesmo
+  radical, com peso menor (`Config::inflection_weight`, 0,5). A ordenação fica
+  como sem stemming e frases, prefixos e autocompletar ficam exatos, mas
+  termos e E ficam ~2× mais lentos.
+- `--stemming pt` (Snowball): junta também verbos e derivados ("correndo" e
+  "corrida" viram `corr`), mas piora bem a ordenação.
+
+Nos dois, o radical sai da palavra sem acentos ("informacoes" acha
+"informações"). Também ficam gravados no banco: mudar exige recarregar.
+
 ### Busca sem interface
 
 Busca e autocompletar sem interface, para scripts:
@@ -167,7 +191,8 @@ Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
-| `meta:format`, `meta:positions`, `meta:languages` | formato, se grava posições e idiomas das stopwords |
+| `stem:<radical>` | nós das palavras com esse radical (só com `--flexoes`) |
+| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | formato, se grava posições, idiomas das stopwords, stemming e flexões |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
@@ -244,7 +269,10 @@ python3 scripts/perf.py tudo --escala 10k
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
   ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
   que têm alguma completação, e o tf é a soma das completações no documento.
-- **Sem stemming** ("casa" e "casas" são termos diferentes).
+- **Plural desligado por padrão** ("casa" e "casas" são termos
+  diferentes; use `--stemming pt-plural` ou `--flexoes pt-plural`). O `pt-plural` só junta plural e
+  singular; o Snowball (`pt`) junta também verbos e derivados, mas às vezes
+  palavras sem relação (`coreia` e `cor` viram `cor`).
 - **Stopwords não são buscáveis.** "The Who" vira só `who`… que também é
   stopword em inglês, então a consulta fica vazia. Como prefixo continuam
   valendo (`de*` acha "dezembro"). As listas estão em `src/stopwords/*.txt`;

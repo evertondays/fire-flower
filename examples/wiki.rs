@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query, tokenize};
-use fire_flower::{Language, Stopwords};
+use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query_stemmed, tokenize};
+use fire_flower::{Language, Stemming, Stopwords};
 use fire_flower::{CommitStats, Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
 use serde::Deserialize;
@@ -77,6 +77,14 @@ enum Cmd {
         /// Cria o banco sem posições (sem busca por frase)
         #[arg(long)]
         sem_posicoes: bool,
+        /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "nenhum"). Sem a opção,
+        /// usa o que está gravado no banco (ou nenhum)
+        #[arg(long)]
+        stemming: Option<String>,
+        /// Flexões na consulta num banco novo: o stemmer do mapa `stem:` ("pt",
+        /// "pt-plural" ou "nenhum"). Sem a opção, usa o que está gravado
+        #[arg(long)]
+        flexoes: Option<String>,
         /// Filtros de Bloom inteiros (um bloco por SST), como antes: reproduz o
         /// colapso da carga quando o filtro passa de uma parte do block cache
         #[arg(long)]
@@ -140,6 +148,8 @@ enum Cmd {
         rank_queries: usize,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -174,6 +184,8 @@ enum Cmd {
         /// Não imprime as consultas à mão (para a grade)
         #[arg(long)]
         resumo: bool,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -200,6 +212,8 @@ enum Cmd {
         cache_leitura: Option<String>,
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
+        #[command(flatten)]
+        flexoes: FlexoesArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -239,13 +253,18 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, filtro_inteiro, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, cache_nos, idiomas, sem_posicoes, stemming, flexoes, filtro_inteiro, label } => {
             let languages = idiomas.as_deref().map(parse_languages).transpose()?;
+            let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou nenhum)"));
+            let stemming = stemming.map(code).transpose()?;
+            let inflections = flexoes.map(code).transpose()?;
             let config = Config {
                 block_cache_bytes: cache_mb << 20,
                 writer_cache_nodes: cache_nos.unwrap_or(Config::default().writer_cache_nodes),
                 languages,
                 positions: sem_posicoes.then_some(false),
+                stemming,
+                inflections,
                 partition_filters: !filtro_inteiro,
                 statistics: true,
                 ..Config::default()
@@ -256,21 +275,22 @@ fn main() -> AnyResult {
         Cmd::Queries { vocab, corpus, idiomas, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&idiomas)?), seed, per_set, out)
         }
-        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label } => {
-            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, label })
+        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, flexoes, label } => {
+            let config = flexoes.apply(Config::default())?;
+            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, label })
         }
-        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, label } => {
+        Cmd::Relevancia { db, corpus, sets, manual, take, seed, per_set, gerar, peso_titulo, b_titulo, resumo, flexoes, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevancia").join("manual.tsv"));
             let defaults = Config::default();
-            let config = Config {
+            let config = flexoes.apply(Config {
                 title_weight: peso_titulo.unwrap_or(defaults.title_weight),
                 title_b: b_titulo.unwrap_or(defaults.title_b),
                 ..defaults
-            };
+            })?;
             relevancia(&db, &corpus, &sets, &manual, take, seed, per_set, gerar, config, resumo, label)
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, label } => {
-            let mut config = Config { block_cache_bytes: cache_mb << 20, ..Config::default() };
+        Cmd::Bench { db, queries, threads, passes, cold, perf_time, cache_leitura, cache_mb, flexoes, label } => {
+            let mut config = flexoes.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = cache_leitura {
                 config.reader_cache_depth = if depth == "nenhum" { None } else { Some(depth.parse()?) };
             }
@@ -281,6 +301,33 @@ fn main() -> AnyResult {
         Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, label } => {
             concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, label)
         }
+    }
+}
+
+/// Peso e modo das flexões na consulta (valem por busca; o banco precisa ter
+/// sido criado com `--flexoes`).
+#[derive(clap::Args)]
+struct FlexoesArgs {
+    /// α: quanto as flexões valem perto da palavra exata (0 a 1)
+    #[arg(long)]
+    peso_flexoes: Option<f64>,
+    /// "sempre" ou N: só quando a busca exata acha menos de N documentos
+    #[arg(long)]
+    modo_flexoes: Option<String>,
+}
+
+impl FlexoesArgs {
+    fn apply(&self, mut config: Config) -> AnyResult<Config> {
+        if let Some(w) = self.peso_flexoes {
+            config.inflection_weight = w;
+        }
+        if let Some(m) = &self.modo_flexoes {
+            config.inflection_mode = match m.as_str() {
+                "sempre" => fire_flower::InflectionMode::Always,
+                n => fire_flower::InflectionMode::IfFewer(n.parse().map_err(|_| format!("modo das flexões: {m:?} (use sempre ou um número)"))?),
+            };
+        }
+        Ok(config)
     }
 }
 
@@ -488,6 +535,11 @@ fn config_json(config: &Config) -> Value {
         "partition_filters": config.partition_filters,
         "bm25_k1": config.bm25_k1,
         "bm25_b": config.bm25_b,
+        "inflection_weight": config.inflection_weight,
+        "inflection_mode": match config.inflection_mode {
+            fire_flower::InflectionMode::Always => json!("sempre"),
+            fire_flower::InflectionMode::IfFewer(n) => json!(n),
+        },
     })
 }
 
@@ -605,6 +657,8 @@ fn load(
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
         "idiomas": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
         "formato": fire_flower::FORMAT_VERSION, "posicoes": engine.has_positions(),
+        "stemming": engine.stemmer().stemming().code(),
+        "flexoes": engine.inflector().stemming().code(),
         "docs": docs, "bytes_corpus": bytes, "segundos": secs,
         "docs_por_s": docs as f64 / secs, "mb_por_s": mb(bytes) / secs,
         "pico_rss": peak, "banco_bytes": db_bytes,
@@ -1106,6 +1160,17 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
     sets.insert("rank-and".into(), rank_and);
     sets.insert("rank-titulos".into(), sets["titulos"].clone());
 
+    // Palavras de frequência média cuja forma regular de plural ou singular
+    // também está no índice (para medir o custo de somar as flexões). Gerador
+    // próprio: os conjuntos acima não mudam.
+    let mut frng = Rng(seed ^ 0xf1e0_5eed);
+    let with_other: Vec<&str> = medio
+        .iter()
+        .copied()
+        .filter(|t| regular_inflections(t).iter().any(|v| df.get(v.as_str()).is_some_and(|&n| n >= 10)))
+        .collect();
+    sets.insert("t-flexao".into(), sample(&mut frng, &with_other));
+
     let out = out.unwrap_or_else(|| project_dir().join("bench/queries"));
     std::fs::create_dir_all(&out)?;
     for (name, list) in &sets {
@@ -1124,6 +1189,7 @@ fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwords, seed: u
 
 struct OracleArgs {
     db: PathBuf,
+    config: Config,
     corpus: PathBuf,
     take: Option<u64>,
     remap_ids: bool,
@@ -1280,7 +1346,8 @@ impl OPos {
     }
 }
 
-/// Índice ingênuo em memória, construído só com `tokenize` e as stopwords:
+/// Índice ingênuo em memória, construído só com `tokenize`, as stopwords e o
+/// stemmer do banco (o radical de cada token, sem o cache da indexação):
 /// nada da indexação do motor (lote, merge, Trie) é reaproveitado.
 struct Oracle {
     terms: HashMap<String, OTerm>,
@@ -1297,11 +1364,19 @@ struct Oracle {
     title_weight: f64,
     title_b: f64,
     max_prefix: usize,
+    /// Flexões na consulta: radical -> palavras do vocabulário com ele, o
+    /// peso α e o modo (vazio sem flexões).
+    by_root: HashMap<String, Vec<String>>,
+    inflector: Option<fire_flower::Stemmer>,
+    alpha: f64,
+    mode: fire_flower::InflectionMode,
 }
 
 /// Uma parte da consulta resolvida no oráculo.
 enum OClause<'a> {
     Term(&'a OTerm),
+    /// Palavra com flexões: a exata (se existe), as outras e o maior df entre elas.
+    Group(Option<&'a OTerm>, Vec<&'a OTerm>, usize),
     /// As completações e o df do conjunto (documentos com alguma delas).
     Prefix(Vec<&'a OTerm>, usize),
     Phrase(Vec<(u32, &'a OTerm, &'a OPos)>),
@@ -1317,6 +1392,16 @@ impl Oracle {
     /// BM25F do plano de relevância (seção 1), escrito de novo aqui (não usa
     /// a conta do motor): `tf~ = tf_texto / B_texto + w · tf_título / B_título`.
     fn bm25(&self, idf: f64, tf: u32, title_tf: u32, doc: DocId) -> f64 {
+        self.saturate(idf, self.pseudo_tf(tf, title_tf, doc))
+    }
+
+    /// idf · tf~ · (k1 + 1) / (tf~ + k1).
+    fn saturate(&self, idf: f64, ptf: f64) -> f64 {
+        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
+    }
+
+    /// tf~ do BM25F (seção 1 do plano de relevância).
+    fn pseudo_tf(&self, tf: u32, title_tf: u32, doc: DocId) -> f64 {
         let n = self.lens.len().max(1) as f64;
         let (len, title_len) = self.lens[&doc];
         let body_len = f64::from(len - title_len);
@@ -1325,8 +1410,7 @@ impl Oracle {
         let norm = |b: f64, l: f64, avg: f64| if avg > 0.0 { 1.0 - b + b * l / avg } else { 1.0 - b };
         let (b_body, b_title) = (norm(self.b, body_len, avg_body), norm(self.title_b, f64::from(title_len), avg_title));
         let part = |tf: u32, weight: f64, b: f64| if tf == 0 || b <= 0.0 { 0.0 } else { weight * f64::from(tf) / b };
-        let ptf = part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title);
-        idf * ptf * (self.k1 + 1.0) / (ptf + self.k1)
+        part(tf - title_tf, 1.0, b_body) + part(title_tf, self.title_weight, b_title)
     }
 
     /// Termos com o prefixo, na ordem da Trie, até o limite do motor.
@@ -1357,19 +1441,61 @@ impl Oracle {
         (count, in_title)
     }
 
-    /// Documentos que casam com a consulta, em ordem. `None` se alguma frase
-    /// precisaria de posições que o oráculo não coletou.
+    /// As outras palavras do vocabulário com o radical de `word`.
+    fn variants(&self, word: &str) -> Vec<&OTerm> {
+        let Some(inflector) = &self.inflector else { return Vec::new() };
+        self.by_root
+            .get(&inflector.stem(word))
+            .map(|ws| ws.iter().filter(|w| *w != word).map(|w| &self.terms[w]).collect())
+            .unwrap_or_default()
+    }
+
+    /// Se a consulta soma as flexões, pelo modo: com `IfFewer(n)`, só quando
+    /// a busca exata acha menos de `n` documentos.
+    fn should_expand(&self, vocab: &[&str], clauses: &[Clause]) -> Option<bool> {
+        Some(match (&self.inflector, self.mode) {
+            (None, _) => false,
+            (Some(_), fire_flower::InflectionMode::Always) => true,
+            (Some(_), fire_flower::InflectionMode::IfFewer(n)) => self.resolve_with(vocab, clauses, false)?.1.len() < n,
+        })
+    }
+
+    /// Documentos que casam com a consulta, em ordem (com as flexões, se o
+    /// modo pedir). `None` se alguma frase precisaria de posições que o
+    /// oráculo não coletou.
     fn resolve<'s>(&'s self, vocab: &[&str], clauses: &[Clause]) -> Option<(Vec<OClause<'s>>, Vec<DocId>)> {
+        let expand = self.should_expand(vocab, clauses)?;
+        self.resolve_with(vocab, clauses, expand)
+    }
+
+    fn resolve_with<'s>(&'s self, vocab: &[&str], clauses: &[Clause], expand: bool) -> Option<(Vec<OClause<'s>>, Vec<DocId>)> {
         let empty = || Some((Vec::new(), Vec::new()));
         let mut resolved = Vec::new();
         for clause in clauses {
             match clause {
-                Clause::Term(t) if !t.prefix => match self.terms.get(&t.text) {
-                    Some(term) => resolved.push(OClause::Term(term)),
-                    None => return empty(),
-                },
+                Clause::Term(t) if !t.prefix => {
+                    let exact = self.terms.get(&t.text);
+                    let others = if expand { self.variants(&t.text) } else { Vec::new() };
+                    if others.is_empty() {
+                        match exact {
+                            Some(term) => resolved.push(OClause::Term(term)),
+                            None => return empty(),
+                        }
+                    } else {
+                        // idf do maior df entre as palavras (como o motor e o `SynonymQuery` do Lucene).
+                        let df = exact.iter().chain(&others).map(|t| t.docs.len()).max().unwrap_or(0);
+                        resolved.push(OClause::Group(exact, others, df));
+                    }
+                }
                 Clause::Term(t) => {
-                    let terms: Vec<&OTerm> = self.expand(vocab, &t.text).iter().map(|w| &self.terms[*w]).collect();
+                    let mut words = self.expand(vocab, &t.text);
+                    // Com stemming, o radical do prefixo também vale (depois do limite).
+                    if let Some(stem) = t.stem.as_deref().and_then(|s| vocab.iter().copied().find(|w| *w == s))
+                        && !words.contains(&stem)
+                    {
+                        words.push(stem);
+                    }
+                    let terms: Vec<&OTerm> = words.iter().map(|w| &self.terms[*w]).collect();
                     if terms.is_empty() {
                         return empty();
                     }
@@ -1395,6 +1521,12 @@ impl Oracle {
         for c in &resolved {
             match c {
                 OClause::Term(t) => sets.push(t.docs.clone()),
+                OClause::Group(exact, others, _) => {
+                    let mut all: Vec<DocId> = exact.iter().chain(others).flat_map(|t| t.docs.iter().copied()).collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    sets.push(all);
+                }
                 OClause::Prefix(ts, _) => {
                     let mut all: Vec<DocId> = ts.iter().flat_map(|t| t.docs.iter().copied()).collect();
                     all.sort_unstable();
@@ -1430,6 +1562,13 @@ impl Oracle {
                         OClause::Term(t) => {
                             let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
                             self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
+                        }
+                        // Um termo só: tf~ = tf~_exata + α · tf~_flexões, idf do maior df.
+                        OClause::Group(exact, others, df) => {
+                            let (tf, title_tf) = exact.and_then(|t| t.tfs_of(d)).unwrap_or((0, 0));
+                            let (vtf, vtitle) = others.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                            let ptf = self.pseudo_tf(tf, title_tf, d) + self.alpha * self.pseudo_tf(vtf, vtitle, d);
+                            self.saturate(self.idf(*df), ptf)
                         }
                         // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).
                         OClause::Prefix(ts, df) => {
@@ -1470,8 +1609,14 @@ fn oracle(args: OracleArgs) -> AnyResult {
     let started = Instant::now();
     let mut rng = Rng(args.seed);
     // Aberto antes: o oráculo descarta as mesmas stopwords que estão gravadas no banco.
-    let engine = Engine::open(&args.db, Config::default())?;
+    let engine = Engine::open(&args.db, args.config.clone())?;
     let stopwords = engine.stopwords().clone();
+    // E o mesmo stemming: o termo de um token é o radical dele.
+    let stemmer = engine.stemmer().clone();
+    let term_of = |t: &str| if stemmer.is_on() { stemmer.stem(t) } else { t.to_string() };
+    // Radical -> uma palavra que o gera. As consultas são escritas com
+    // palavras: o radical de um radical pode ser outro (`brasileir` → `brasil`).
+    let mut word_of: HashMap<String, String> = HashMap::default();
     let has_positions = engine.has_positions();
     const AND_DOCS: usize = 2000;
     const PHRASE_DOCS: usize = 500;
@@ -1489,6 +1634,10 @@ fn oracle(args: OracleArgs) -> AnyResult {
         title_weight: engine.config().title_weight,
         title_b: engine.config().title_b,
         max_prefix: engine.config().max_prefix_terms,
+        by_root: HashMap::default(),
+        inflector: engine.inflector().is_on().then(|| engine.inflector().clone()),
+        alpha: engine.config().inflection_weight,
+        mode: engine.config().inflection_mode,
     };
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
     let mut phrase_docs: Vec<Vec<String>> = Vec::new();
@@ -1500,18 +1649,22 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let (positioned, n_title) = doc_tokens(&doc.title, &doc.text);
         let tokens: Vec<String> = positioned.iter().map(|(t, _)| t.clone()).collect();
         // termo -> (tf, tf no título)
-        let mut counts: HashMap<&str, (u32, u32)> = HashMap::default();
+        let mut counts: HashMap<String, (u32, u32)> = HashMap::default();
         let (mut len, mut title_len) = (0u32, 0u32);
         for (i, t) in tokens.iter().enumerate().filter(|(_, t)| !stopwords.contains(t)) {
             let in_title = i < n_title;
-            let c = counts.entry(t.as_str()).or_insert((0, 0));
+            let term = term_of(t);
+            if stemmer.is_on() && !word_of.contains_key(&term) {
+                word_of.insert(term.clone(), t.clone());
+            }
+            let c = counts.entry(term).or_insert((0, 0));
             c.0 += 1;
             c.1 += u32::from(in_title);
             len += 1;
             title_len += u32::from(in_title);
         }
         // Reservatórios: documentos para consultas AND e frases, títulos para revocação.
-        let mut unique: Vec<String> = counts.keys().map(|t| t.to_string()).collect();
+        let mut unique: Vec<String> = counts.keys().cloned().collect();
         unique.sort_unstable();
         if sampled_docs.len() < AND_DOCS {
             sampled_docs.push(unique);
@@ -1539,9 +1692,9 @@ fn oracle(args: OracleArgs) -> AnyResult {
             e.title_tfs.push(title_tf);
         };
         for (t, c) in counts {
-            match o.terms.get_mut(t) {
+            match o.terms.get_mut(&t) {
                 Some(e) => add(e, c),
-                None => add(o.terms.entry(t.to_string()).or_default(), c),
+                None => add(o.terms.entry(t).or_default(), c),
             }
         }
         o.spans.insert(doc.id, n_title as u32);
@@ -1563,9 +1716,19 @@ fn oracle(args: OracleArgs) -> AnyResult {
     for t in o.terms.values_mut() {
         t.finish();
     }
+    if let Some(inflector) = &o.inflector {
+        let mut by_root: HashMap<String, Vec<String>> = HashMap::default();
+        for word in o.terms.keys() {
+            by_root.entry(inflector.stem(word)).or_default().push(word.clone());
+        }
+        o.by_root = by_root;
+    }
     let mut vocab: Vec<&str> = o.terms.keys().map(String::as_str).collect();
     vocab.sort_unstable();
     eprintln!("oráculo pronto: {docs} docs, {} termos ({:.0}s)", vocab.len(), started.elapsed().as_secs_f64());
+    // Uma palavra para usar numa consulta no lugar do termo.
+    let word = |t: &str| -> String { word_of.get(t).cloned().unwrap_or_else(|| t.to_string()) };
+    let parse = |q: &str| parse_query_stemmed(q, &stopwords, &stemmer);
 
     // 2. Termos a conferir: todos, ou uma amostra estratificada por df (potências de 2).
     let full = args.sample_terms == 0;
@@ -1620,13 +1783,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let doc = rng.pick(&sampled_docs);
         let query = match i % 6 {
             5 if !titles.is_empty() => rng.pick(&titles).1.clone(),
-            0 if !frequent.is_empty() => rng.pick(&frequent).to_string(),
-            0 | 1 => rng.pick(&vocab).to_string(),
-            2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| rng.pick(doc).clone()).collect::<Vec<_>>().join(" "),
+            0 if !frequent.is_empty() => word(rng.pick::<&str>(&frequent)),
+            0 | 1 => word(rng.pick::<&str>(&vocab)),
+            2 if doc.len() >= 2 => (0..rng.range(2, 3)).map(|_| word(rng.pick(doc).as_str())).collect::<Vec<_>>().join(" "),
             3 if !doc.is_empty() => {
-                let other = rng.pick(doc);
+                let other = word(rng.pick(doc).as_str());
                 let cut: String = other.chars().take(rng.range(2, 4)).collect();
-                format!("{} {cut}*", rng.pick(doc))
+                format!("{} {cut}*", word(rng.pick(doc).as_str()))
             }
             4 if has_positions && !usable.is_empty() => {
                 let tokens = rng.pick(&usable);
@@ -1650,9 +1813,9 @@ fn oracle(args: OracleArgs) -> AnyResult {
         let mut needed: HashSet<String> = HashSet::default();
         if !full {
             needed.extend(check_terms.iter().map(|t| t.to_string()));
-            needed.extend(phrase_cases.iter().flatten().cloned());
+            needed.extend(phrase_cases.iter().flatten().map(|t| term_of(t)));
             for q in &rank_cases {
-                for c in parse_query(q, &stopwords) {
+                for c in parse(q) {
                     if let Clause::Phrase(parts) = c {
                         needed.extend(parts.into_iter().map(|p| p.text));
                     }
@@ -1661,17 +1824,21 @@ fn oracle(args: OracleArgs) -> AnyResult {
         }
         for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
             let doc = doc?;
-            let mut found: HashMap<&str, Vec<u32>> = HashMap::default();
+            let mut found: HashMap<String, Vec<u32>> = HashMap::default();
             let (tokens, _) = doc_tokens(&doc.title, &doc.text);
             for (t, p) in &tokens {
-                if !stopwords.contains(t) && (full || needed.contains(t)) {
-                    found.entry(t.as_str()).or_default().push(*p);
+                if stopwords.contains(t) {
+                    continue;
+                }
+                let term = term_of(t);
+                if full || needed.contains(&term) {
+                    found.entry(term).or_default().push(*p);
                 }
             }
             for (t, ps) in found {
-                match o.positions.get_mut(t) {
+                match o.positions.get_mut(&t) {
                     Some(e) => e.push(doc.id, &ps),
-                    None => o.positions.entry(t.to_string()).or_default().push(doc.id, &ps),
+                    None => o.positions.entry(t).or_default().push(doc.id, &ps),
                 }
             }
         }
@@ -1767,11 +1934,16 @@ fn oracle(args: OracleArgs) -> AnyResult {
             }
             (0..k).map(|_| rng.pick(&frequent).to_string()).collect()
         };
-        let mut expected = o.terms[&terms[0]].docs.clone();
-        for t in &terms[1..] {
-            expected = fire_flower::internals::intersect(&expected, &o.terms[t].docs);
-        }
-        let query = terms.join(" ");
+        let query = terms.iter().map(|t| word(t)).collect::<Vec<_>>().join(" ");
+        let expected = if o.inflector.is_some() {
+            o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default()
+        } else {
+            let mut expected = o.terms[&terms[0]].docs.clone();
+            for t in &terms[1..] {
+                expected = fire_flower::internals::intersect(&expected, &o.terms[t].docs);
+            }
+            expected
+        };
         and.compare(&query, &engine.search(&query)?, &expected);
     }
     checks.push(and);
@@ -1791,7 +1963,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
             truncated += 1;
             ignored_terms += matches.len() - max_prefix;
         }
-        let mut expected: Vec<DocId> = matches.iter().take(max_prefix).flat_map(|t| o.terms[*t].docs.iter().copied()).collect();
+        let mut expanded: Vec<&str> = matches.iter().copied().take(max_prefix).collect();
+        // Com stemming, o radical do prefixo também vale (ver `QueryTerm::stem`).
+        let stem = term_of(&p);
+        if stemmer.is_on() && o.terms.contains_key(&stem) && !expanded.contains(&stem.as_str()) {
+            expanded.push(&stem);
+        }
+        let mut expected: Vec<DocId> = expanded.iter().flat_map(|t| o.terms[*t].docs.iter().copied()).collect();
         expected.sort_unstable();
         expected.dedup();
         prefix.compare(&format!("{p}*"), &engine.search(&format!("{p}*"))?, &expected);
@@ -1844,13 +2022,13 @@ fn oracle(args: OracleArgs) -> AnyResult {
     let (mut phrase_hits, mut phrase_empty) = (0usize, 0usize);
     for window in &phrase_cases {
         let query = quote(window);
-        let mut kept: Vec<(u32, &str)> = Vec::new();
+        let mut kept: Vec<(u32, String)> = Vec::new();
         let first = window.iter().position(|t| !is_stop(t));
         for (i, t) in window.iter().enumerate() {
             if let Some(f) = first
                 && !is_stop(t)
             {
-                kept.push(((i - f) as u32, t.as_str()));
+                kept.push(((i - f) as u32, term_of(t)));
             }
         }
         if !has_positions {
@@ -1862,10 +2040,11 @@ fn oracle(args: OracleArgs) -> AnyResult {
         }
         let expected: Vec<DocId> = match kept.len() {
             0 => Vec::new(),
-            1 => o.terms.get(kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
+            1 if o.inflector.is_some() => o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default(),
+            1 => o.terms.get(&kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
             _ => {
                 let parts: Option<Vec<(u32, &OTerm, &OPos)>> =
-                    kept.iter().map(|&(off, t)| Some((off, o.terms.get(t)?, o.positions.get(t)?))).collect();
+                    kept.iter().map(|(off, t)| Some((*off, o.terms.get(t)?, o.positions.get(t)?))).collect();
                 match parts {
                     Some(parts) => {
                         let mut docs = parts[0].1.docs.clone();
@@ -1888,7 +2067,7 @@ fn oracle(args: OracleArgs) -> AnyResult {
     // 13. Ranking: os 10 primeiros e o total, contra o BM25 calculado aqui.
     let mut ranking = Check::new("ranking BM25 (top 10)");
     for q in &rank_cases {
-        let clauses = parse_query(q, &stopwords);
+        let clauses = parse(q);
         let Some((want, total)) = o.rank(&vocab, &clauses, 10) else { continue };
         let got = engine.search_ranked(q, 10)?;
         ranking.verdict(q, got.total == total && same_ranking(&got.hits, &want), || {
@@ -1926,6 +2105,8 @@ fn oracle(args: OracleArgs) -> AnyResult {
         &label,
         json!({ "db": args.db, "corpus": args.corpus, "take": args.take, "remap_ids": args.remap_ids,
                 "docs": docs, "termos_oraculo": vocab.len(), "divergencias": total, "posicoes": has_positions,
+                "stemming": stemmer.stemming().code(),
+                "flexoes": engine.inflector().stemming().code(),
                 "verificacoes": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevancia": relevance }),
     )?;
     if total > 0 {
@@ -1946,7 +2127,48 @@ struct RelCase {
 
 /// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
 /// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
-const REL_SETS: [(&str, usize); 4] = [("rel-titulo", 1), ("rel-digitando", 1), ("rel-hub", 1), ("rel-corpo", 10)];
+const REL_SETS: [(&str, usize); 6] = [
+    ("rel-titulo", 1),
+    ("rel-digitando", 1),
+    ("rel-hub", 1),
+    ("rel-corpo", 10),
+    ("rel-flexao", 10),
+    ("rel-plural", 10),
+];
+
+/// Plural e singular regulares de uma palavra normalizada (sem acentos),
+/// pelas regras do português, sem stemmer: "eleicoes" → "eleicao",
+/// "papel" → "papeis", "casa" → "casas". Os candidatos podem não existir; quem
+/// chama confere no vocabulário.
+fn regular_inflections(w: &str) -> Vec<String> {
+    let n = w.chars().count();
+    if n < 4 || !w.chars().all(|c| c.is_ascii_lowercase()) {
+        return Vec::new();
+    }
+    let swap = |from: &str, to: &str| w.strip_suffix(from).map(|stem| format!("{stem}{to}"));
+    let mut out: Vec<String> = Vec::new();
+    if w.ends_with('s') {
+        let rules: &[(&str, &str)] = &[
+            ("coes", "cao"), ("oes", "ao"), ("aes", "ao"), ("ais", "al"), ("eis", "el"), ("ois", "ol"),
+            ("uis", "ul"), ("ns", "m"), ("res", "r"), ("zes", "z"), ("s", ""),
+        ];
+        out.extend(rules.iter().filter_map(|(f, t)| swap(f, t)));
+    } else {
+        let rules: &[(&str, &str)] = &[
+            ("cao", "coes"), ("ao", "oes"), ("ao", "aes"), ("ao", "aos"), ("al", "ais"), ("el", "eis"),
+            ("ol", "ois"), ("ul", "uis"), ("m", "ns"),
+        ];
+        out.extend(rules.iter().filter_map(|(f, t)| swap(f, t)));
+        match w.chars().last() {
+            Some('r' | 'z') => out.push(format!("{w}es")),
+            Some('a' | 'e' | 'i' | 'o' | 'u') => out.push(format!("{w}s")),
+            _ => {}
+        }
+    }
+    out.retain(|v| v != w && v.chars().count() >= 3);
+    out.dedup();
+    out
+}
 
 fn write_rel_set(path: &Path, cases: &[RelCase]) -> AnyResult {
     let mut w = BufWriter::new(File::create(path)?);
@@ -1998,6 +2220,13 @@ fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usize, item: i
 ///   tem que vir em 1º, acima dos derivados.
 /// - `rel-corpo`: 2 termos de frequência média do corpo, fora do título: o
 ///   artigo no top-10. Segura o exagero do peso do título.
+/// - `rel-plural`: como o `rel-flexao`, mas com o plural ou o singular
+///   regular (`regular_inflections`), sem depender do Snowball: o artigo no
+///   top-10.
+/// - `rel-flexao`: as consultas do `rel-corpo` com cada palavra trocada pela
+///   flexão mais comum do mesmo radical (Snowball do português) que não está
+///   no artigo ("eleitos" → "eleito"): o artigo no top-10. Sem stemming não
+///   tem como achar; mede o que o stemming recupera.
 fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, seed: u64, per_set: usize) -> AnyResult<Vec<(&'static str, Vec<RelCase>)>> {
     let mut rng = Rng(seed);
     let mut titles: Vec<(DocId, String, Vec<String>)> = Vec::new();
@@ -2093,7 +2322,79 @@ fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, se
         }
         body_cases.push(RelCase { query: format!("{} {}", mid[a], mid[b]), expected: vec![*id], title: title.clone() });
     }
-    Ok(vec![("rel-titulo", by_title), ("rel-digitando", typing), ("rel-hub", hubs), ("rel-corpo", body_cases)])
+    // Flexões: radical -> palavras do corpo com ele, da mais comum para a menos.
+    let stemmer = fire_flower::Stemmer::new(Stemming::Snowball(Language::Portuguese));
+    let mut by_stem: HashMap<String, Vec<(&str, u32)>> = HashMap::default();
+    for (word, &n) in &df {
+        if n >= 3 {
+            by_stem.entry(stemmer.stem(word)).or_default().push((word.as_str(), n));
+        }
+    }
+    for words in by_stem.values_mut() {
+        words.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    }
+    let mut inflected: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if inflected.len() >= per_set {
+            break;
+        }
+        let title_terms = index_terms(title, stopwords);
+        let absent = |w: &str| terms.binary_search_by(|t| t.as_str().cmp(w)).is_err() && !title_terms.iter().any(|t| t == w);
+        // Termos de frequência média com uma flexão que o artigo não tem.
+        let pairs: Vec<&str> = terms
+            .iter()
+            .filter(|t| (20..=2000).contains(&df[*t]))
+            .filter_map(|t| by_stem.get(&stemmer.stem(t))?.iter().map(|(w, _)| *w).find(|w| absent(w)))
+            .collect();
+        if pairs.len() < 2 {
+            continue;
+        }
+        let a = rng.below(pairs.len());
+        let mut b = rng.below(pairs.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        if pairs[a] == pairs[b] {
+            continue;
+        }
+        inflected.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
+    }
+    // Plural/singular regular: a outra forma mais comum que o artigo não tem.
+    let mut plural: Vec<RelCase> = Vec::new();
+    for (id, title, terms) in &body_docs {
+        if plural.len() >= per_set {
+            break;
+        }
+        let title_terms = index_terms(title, stopwords);
+        let absent = |w: &str| terms.binary_search_by(|t| t.as_str().cmp(w)).is_err() && !title_terms.iter().any(|t| t == w);
+        let other = |t: &str| -> Option<String> {
+            regular_inflections(t)
+                .into_iter()
+                .filter(|v| df.get(v).is_some_and(|&n| n >= 3) && !stopwords.contains(v) && absent(v))
+                .max_by(|a, b| df[a].cmp(&df[b]).then(b.cmp(a)))
+        };
+        let pairs: Vec<String> = terms.iter().filter(|t| (20..=2000).contains(&df[*t])).filter_map(|t| other(t)).collect();
+        if pairs.len() < 2 {
+            continue;
+        }
+        let a = rng.below(pairs.len());
+        let mut b = rng.below(pairs.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        if pairs[a] == pairs[b] {
+            continue;
+        }
+        plural.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
+    }
+    Ok(vec![
+        ("rel-titulo", by_title),
+        ("rel-digitando", typing),
+        ("rel-hub", hubs),
+        ("rel-corpo", body_cases),
+        ("rel-flexao", inflected),
+        ("rel-plural", plural),
+    ])
 }
 
 /// Consultas à mão: `consulta \t títulos esperados (|) \t nota`. Os títulos
@@ -2161,7 +2462,10 @@ fn relevancia(
     if gerar || missing {
         eprintln!("gerando conjuntos em {}", sets_dir.display());
         for (name, cases) in generate_rel_sets(corpus, take, &stopwords, seed, per_set)? {
-            write_rel_set(&sets_dir.join(format!("{name}.tsv")), &cases)?;
+            let path = sets_dir.join(format!("{name}.tsv"));
+            if gerar || !path.exists() {
+                write_rel_set(&path, &cases)?;
+            }
         }
     }
     let mut sets: Vec<(String, usize, Vec<RelCase>)> = Vec::new();
@@ -2169,6 +2473,11 @@ fn relevancia(
         sets.push((name.to_string(), hit_at, read_rel_set(&sets_dir.join(format!("{name}.tsv")))?));
     }
     sets.push(("rel-manual".into(), 3, read_manual(manual, corpus, take)?));
+    // Flexões escritas à mão, ao lado do `manual.tsv`.
+    let flexao_manual = manual.with_file_name("flexao-manual.tsv");
+    if flexao_manual.exists() {
+        sets.push(("rel-flexao-manual".into(), 3, read_manual(&flexao_manual, corpus, take)?));
+    }
 
     let title_of = |doc: DocId| engine.label(doc).ok().flatten().unwrap_or_else(|| doc.to_string());
     let mut results = Vec::new();

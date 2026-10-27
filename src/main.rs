@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use fire_flower::{Config, Engine, Language, stopwords, text};
+use fire_flower::{Config, Engine, Language, Stemming, stopwords, text};
 
 /// Motor de busca full-text embutido: Trie persistida no RocksDB.
 #[derive(Parser)]
@@ -36,6 +36,8 @@ enum Command {
         idiomas: Idiomas,
         #[command(flatten)]
         posicoes: Posicoes,
+        #[command(flatten)]
+        radicais: Radicais,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
     IndexJsonl {
@@ -56,6 +58,8 @@ enum Command {
         idiomas: Idiomas,
         #[command(flatten)]
         posicoes: Posicoes,
+        #[command(flatten)]
+        radicais: Radicais,
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos
     Compact {
@@ -100,6 +104,26 @@ struct Posicoes {
     sem_posicoes: bool,
 }
 
+#[derive(clap::Args)]
+struct Radicais {
+    /// Flexões na consulta num banco novo (o recomendado para achar plurais):
+    /// "pt-plural" ("planetas" acha "Planeta", com a palavra exata valendo
+    /// mais), "pt" (Snowball) ou "nenhum" (o padrão). Não combina com
+    /// --stemming. Num banco existente, precisa combinar com a criação.
+    #[arg(long, value_parser = parse_stemming)]
+    flexoes: Option<Stemming>,
+    /// Stemming de um banco novo: "pt" (Snowball do português, "correndo"
+    /// acha "corrida"), "pt-plural" (só o plural: "casas" acha "casa"), "en",
+    /// "en-plural" ou "nenhum" (o padrão). Num banco existente, precisa
+    /// combinar com o que foi gravado na criação.
+    #[arg(long, value_parser = parse_stemming)]
+    stemming: Option<Stemming>,
+}
+
+fn parse_stemming(s: &str) -> Result<Stemming, String> {
+    Stemming::from_code(s).ok_or_else(|| format!("stemming desconhecido {s:?}; use pt, pt-plural, en, en-plural ou \"nenhum\""))
+}
+
 impl Posicoes {
     /// `None` (usa o que o banco tiver) quando a opção não foi dada.
     fn config(&self) -> Option<bool> {
@@ -129,23 +153,24 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { banco } => open(&banco, None, None).and_then(|engine| {
+        Command::Tui { banco } => open(&banco, None, None, None).and_then(|engine| {
             tui::run(&engine, &banco.display().to_string()).map_err(Into::into)
         }),
-        Command::Index { banco, caminhos, idiomas, posicoes } => {
-            index(&banco, &caminhos, idiomas.idiomas, posicoes.config())
+        Command::Index { banco, caminhos, idiomas, posicoes, radicais } => {
+            index(&banco, &caminhos, idiomas.idiomas, posicoes.config(), radicais)
         }
-        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas, posicoes } => {
+        Command::IndexJsonl { banco, arquivo, lote, pular, progresso_json, idiomas, posicoes, radicais } => {
             let opts = jsonl::Options { batch_size: lote.max(1), skip: pular, json: progresso_json };
-            open(&banco, idiomas.idiomas, posicoes.config()).and_then(|engine| {
+            open(&banco, idiomas.idiomas, posicoes.config(), Some(radicais)).and_then(|engine| {
                 if !progresso_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
+                    eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
                 }
                 jsonl::index(&engine, &arquivo, &opts)
             })
         }
-        Command::Compact { banco } => open(&banco, None, None).map(|engine| {
+        Command::Compact { banco } => open(&banco, None, None, None).map(|engine| {
             let started = Instant::now();
             engine.compact();
             println!("compactado em {:.2?}", started.elapsed());
@@ -162,16 +187,29 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `idiomas` e `posicoes` só importam na criação; `None` usa o
-/// que está gravado.
-fn open(db: &Path, idiomas: Option<ListaIdiomas>, posicoes: Option<bool>) -> Result<Engine, Box<dyn std::error::Error>> {
-    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, ..Config::default() };
+/// Abre o banco. `idiomas`, `posicoes` e `radicais` só importam na criação;
+/// `None` usa o que está gravado.
+fn open(
+    db: &Path,
+    idiomas: Option<ListaIdiomas>,
+    posicoes: Option<bool>,
+    radicais: Option<Radicais>,
+) -> Result<Engine, Box<dyn std::error::Error>> {
+    let (stemming, inflections) = radicais.map_or((None, None), |r| (r.stemming, r.flexoes));
+    let config = Config { languages: idiomas.map(|i| i.0), positions: posicoes, stemming, inflections, ..Config::default() };
     Ok(Engine::open(db, config)?)
 }
 
-fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>, posicoes: Option<bool>) -> AnyResult {
-    let engine = open(db, idiomas, posicoes)?;
+fn index(
+    db: &Path,
+    paths: &[PathBuf],
+    idiomas: Option<ListaIdiomas>,
+    posicoes: Option<bool>,
+    radicais: Radicais,
+) -> AnyResult {
+    let engine = open(db, idiomas, posicoes, Some(radicais))?;
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
+    eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
     let started = Instant::now();
     let mut files = Vec::new();
     for p in paths {
@@ -221,7 +259,7 @@ fn index(db: &Path, paths: &[PathBuf], idiomas: Option<ListaIdiomas>, posicoes: 
 }
 
 fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open(db, None, None)?;
+    let engine = open(db, None, None, None)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
     let (hits, total) = if by_id {
@@ -250,7 +288,7 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None, None)?;
+    let engine = open(db, None, None, None)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

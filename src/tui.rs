@@ -6,8 +6,8 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fire_flower::text::{Clause, QueryTerm, normalize_term, parse_query};
-use fire_flower::{DocId, Engine, Hit};
+use fire_flower::text::{Clause, QueryTerm, normalize_term};
+use fire_flower::{DocId, Engine, Hit, Stemmer};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -134,7 +134,7 @@ impl<'a> App<'a> {
             }
             _ => self.query.trim().to_string(),
         };
-        self.clauses = parse_query(&self.effective, self.engine.stopwords());
+        self.clauses = self.engine.parse_query(&self.effective);
         self.terms = self.clauses.iter().flat_map(Clause::terms).collect();
 
         self.error = None;
@@ -283,7 +283,7 @@ impl<'a> App<'a> {
             return;
         }
         let content = match self.label(doc) {
-            Some(label) => load_preview(Path::new(&label), &self.terms),
+            Some(label) => load_preview(Path::new(&label), &self.terms, (self.engine.stemmer(), self.engine.inflector())),
             None => PreviewContent::Unavailable("documento sem rótulo".into()),
         };
         self.preview = Some(Preview { doc, effective: self.effective.clone(), content });
@@ -556,12 +556,28 @@ fn panel(title: &str) -> Block<'_> {
         .title(Span::styled(title, Style::new().fg(Color::Gray).bold()))
 }
 
-fn matches_term(word: &str, terms: &[QueryTerm]) -> bool {
-    terms.iter().any(|t| if t.prefix { word.starts_with(&t.text) } else { word == t.text })
+/// Se a palavra do texto casa com algum termo da consulta. Com stemming, o
+/// termo exato é comparado com o radical da palavra; o prefixo, com a palavra
+/// ou o radical (e com o radical do prefixo, ver [`QueryTerm::stem`]).
+///
+/// Com flexões na consulta (`inflector`), a palavra também casa um termo
+/// exato do mesmo radical ("planetas" destaca "planeta").
+fn matches_word(word: &str, terms: &[QueryTerm], stemmer: &Stemmer, inflector: &Stemmer) -> bool {
+    let Some(folded) = normalize_term(word) else { return false };
+    let stem = stemmer.is_on().then(|| stemmer.stem(&folded));
+    let term = stem.as_deref().unwrap_or(&folded);
+    let root = inflector.is_on().then(|| inflector.stem(&folded));
+    terms.iter().any(|t| {
+        if t.prefix {
+            folded.starts_with(&t.text) || term.starts_with(&t.text) || t.stem.as_deref() == Some(term)
+        } else {
+            term == t.text || root.as_ref().is_some_and(|r| *r == inflector.stem(&t.text))
+        }
+    })
 }
 
 /// Lê o arquivo do rótulo e destaca as palavras que casam com a consulta.
-fn load_preview(path: &Path, terms: &[QueryTerm]) -> PreviewContent {
+fn load_preview(path: &Path, terms: &[QueryTerm], stemmers: (&Stemmer, &Stemmer)) -> PreviewContent {
     if !path.is_file() {
         return PreviewContent::Unavailable("sem prévia: o rótulo não é um arquivo legível".into());
     }
@@ -580,7 +596,7 @@ fn load_preview(path: &Path, terms: &[QueryTerm]) -> PreviewContent {
     let mut matches = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let raw: String = raw.chars().take(MAX_LINE_CHARS).map(|c| if c == '\t' { ' ' } else { c }).collect();
-        let (spans, hit) = highlight(&raw, terms);
+        let (spans, hit) = highlight(&raw, terms, stemmers);
         if hit {
             matches.push(i);
         }
@@ -592,7 +608,7 @@ fn load_preview(path: &Path, terms: &[QueryTerm]) -> PreviewContent {
 }
 
 /// Divide a linha em palavras (mesma fronteira do tokenizador) e destaca as que casam.
-fn highlight(line: &str, terms: &[QueryTerm]) -> (Vec<Span<'static>>, bool) {
+fn highlight(line: &str, terms: &[QueryTerm], (stemmer, inflector): (&Stemmer, &Stemmer)) -> (Vec<Span<'static>>, bool) {
     let is_word = |c: char| c.is_alphanumeric() || is_combining_mark(c);
     let hit_style = Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
@@ -612,7 +628,7 @@ fn highlight(line: &str, terms: &[QueryTerm]) -> (Vec<Span<'static>>, bool) {
             chars.next();
         }
         let word = &line[start..end];
-        if normalize_term(word).is_some_and(|w| matches_term(&w, terms)) {
+        if matches_word(word, terms, stemmer, inflector) {
             if plain_start < start {
                 spans.push(Span::raw(line[plain_start..start].to_string()));
             }
@@ -657,8 +673,9 @@ mod tests {
     #[test]
     fn highlight_marks_normalized_matches() {
         let terms: Vec<QueryTerm> =
-            parse_query("coracao do bras*", &fire_flower::Stopwords::default()).iter().flat_map(Clause::terms).collect();
-        let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms);
+            fire_flower::text::parse_query("coracao do bras*", &fire_flower::Stopwords::default()).iter().flat_map(Clause::terms).collect();
+        let off = Stemmer::default();
+        let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms, (&off, &off));
         assert!(hit);
         let marked: Vec<&str> =
             spans.iter().filter(|s| s.style.bg == Some(ACCENT)).map(|s| s.content.as_ref()).collect();
@@ -742,7 +759,7 @@ mod tests {
         assert_eq!(app.total, 2);
         assert_eq!(describe_phrase(&app.clauses[0]), "\"casa _ papel\"");
         // O destaque marca as palavras da frase.
-        let (_, hit) = highlight("Casa de Papel", &app.terms);
+        let (_, hit) = highlight("Casa de Papel", &app.terms, (app.engine.stemmer(), app.engine.inflector()));
         assert!(hit);
         // Fora das aspas, a última palavra continua sendo prefixo.
         app.query = "\"casa de papel\" fo".into();

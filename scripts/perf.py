@@ -13,6 +13,7 @@
     python3 scripts/perf.py relevancia        # ordenação: consultas de resposta conhecida (docs/plano-relevancia.md)
     python3 scripts/perf.py carga-longa       # carga inteira janela a janela; falha se a velocidade colapsar
                                               #   [--reproduzir: roda antes o cenário que colapsava]
+    python3 scripts/perf.py stemming          # stemming ligado vs. desligado (A/B no mesmo binário)
     python3 scripts/perf.py relatorio         # escreve RESULTADOS.md no repositório de resultados
     python3 scripts/perf.py comparar A.json B.json
 
@@ -383,7 +384,8 @@ def bench(path, scale, sets, label, threads=1, extra=()):
     qdir = queries_dir(scale)
     files = [os.path.join(qdir, f"{s}.txt") for s in sets] if sets else [qdir]
     # Conjuntos novos (frases, ranking) aparecem quando o `wiki queries` muda.
-    if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) or not os.path.exists(os.path.join(qdir, "rank-freq.txt")):
+    if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) \
+            or not all(os.path.exists(os.path.join(qdir, f)) for f in ("rank-freq.txt", "t-flexao.txt")):
         fase_consultas(scale)
     wiki("bench", "--db", path, "--queries", *files, "--threads", threads, "--label", label, *extra)
 
@@ -539,6 +541,139 @@ def fase_frases(scale):
     step("latência de todos os conjuntos (cache quente)")
     bench(path, scale, None, f"{scale}-t1")
     return ok
+
+
+# Conjuntos medidos antes da compactação (merge pendente), como na Fase 4.
+PRE_SETS = ["t-freq", "titulos", "and-freq", "rank-freq", "frase-2", "frase-freq", "t-flexao"]
+# Bancos comparados pelo `stemming` (docs/plano-stemming.md): o primeiro é a referência.
+STEM_MODES = {
+    "nenhum": ["--stemming", "nenhum"],
+    "pt": ["--stemming", "pt"],
+    "pt-plural": ["--stemming", "pt-plural"],
+    "flexoes": ["--flexoes", "pt-plural"],
+}
+STEM_TITLES = {"nenhum": "sem stemming", "pt": "Snowball na indexação", "pt-plural": "plural na indexação",
+               "flexoes": "flexões na consulta (pt-plural)"}
+# Acerto de cada conjunto de relevância: top-1, top-3 ou top-10.
+REL_HIT = {"rel-titulo": "top1", "rel-digitando": "top1", "rel-hub": "top1", "rel-corpo": "top10",
+           "rel-flexao": "top10", "rel-plural": "top10", "rel-manual": "top3", "rel-flexao-manual": "top3"}
+
+
+def fase_stemming(scale):
+    """Stemming e flexões, no mesmo binário: sem stemming, Snowball e plural na
+    indexação e flexões na consulta. Oráculo de cada modo, carga, tamanho,
+    latência antes e depois de compactar e relevância. As consultas são as
+    mesmas para todos (palavras sem stemming): com stemming, cada uma casa a
+    união das flexões, que é o custo real dele."""
+    small = smaller(scale, "10k")
+    ok = True
+    for mode, flags in STEM_MODES.items():
+        if mode == "nenhum":
+            continue
+        oracle_db = db(f"stemming-{small}-oraculo")
+        step(f"oráculo {small}, {STEM_TITLES[mode]}")
+        fresh(oracle_db)
+        wiki("load", "--db", oracle_db, "--corpus", corpus(small), "--batch", LOTE, *flags,
+             "--label", f"stemming-{small}-{mode}-oraculo")
+        ok &= wiki("oracle", "--db", oracle_db, "--corpus", corpus(small), "--label", f"{small}-stemming-{mode}",
+                   check=False) == 0
+        shutil.rmtree(oracle_db, ignore_errors=True)
+
+    paths = {mode: db(f"stemming-{scale}-{mode}") for mode in STEM_MODES}
+    for mode, path in paths.items():
+        step(f"carga {scale}, {STEM_TITLES[mode]}")
+        load_rounds(path, scale, f"stemming-{scale}-{mode}", "--batch", LOTE, *STEM_MODES[mode])
+    for mode, path in paths.items():
+        step(f"antes da compactação, {STEM_TITLES[mode]}")
+        bench(path, scale, PRE_SETS, f"stemming-{scale}-{mode}-pre-compactacao")
+    for mode, path in paths.items():
+        step(f"compactação, {STEM_TITLES[mode]}")
+        compact_and_save(path, f"stemming-{scale}-{mode}")
+        sizes_of(path, f"stemming-{scale}-{mode}-compactado")
+    for mode, path in paths.items():
+        step(f"latência de todos os conjuntos, {STEM_TITLES[mode]}")
+        bench(path, scale, None, f"stemming-{scale}-{mode}-t1")
+
+    rel = smaller(scale, "100k")
+    sets = os.path.join(PROJECT, "bench", "relevancia", rel)
+    for mode in STEM_MODES:
+        path = paths[mode] if rel == scale else db(f"stemming-{rel}-{mode}")
+        if rel != scale:
+            step(f"carga {rel} para a relevância, {STEM_TITLES[mode]}")
+            fresh(path)
+            wiki("load", "--db", path, "--corpus", corpus(rel), "--batch", LOTE, *STEM_MODES[mode],
+                 "--label", f"stemming-{rel}-{mode}-relevancia")
+        step(f"relevância {rel}, {STEM_TITLES[mode]}")
+        wiki("relevancia", "--db", path, "--corpus", corpus(rel), "--sets", sets, "--label", f"{rel}-stemming-{mode}")
+    return ok
+
+
+def stemming_section(R, scale):
+    modes = [m for m in STEM_MODES if median_load(R, f"stemming-{scale}-{m}")]
+    if "nenhum" not in modes or len(modes) < 2:
+        return []
+    base = "nenhum"
+    loads = {m: median_load(R, f"stemming-{scale}-{m}") for m in modes}
+    sizes = {m: latest(R, "sizes", f"stemming-{scale}-{m}-compactado") for m in modes}
+    comps = {m: latest(R, "compact", f"stemming-{scale}-{m}") for m in modes}
+    small = smaller(scale, "10k")
+    keys = lambda r, space: next((e["chaves"] for e in (r or {}).get("espacos", []) if e["espaco"] == space), None)
+    space_bytes = lambda r, space: next((e["bytes_chaves"] + e["bytes_valores"] for e in (r or {}).get("espacos", [])
+                                         if e["espaco"] == space), None)
+
+    def cells(values, f=fmt):
+        out = []
+        for m in modes:
+            v, b = values.get(m), values.get(base)
+            txt = f(v) if v is not None else "—"
+            if m != base and v is not None and b:
+                txt += f" ({pct(v, b):+.0f}%)"
+            out.append(txt)
+        return " | ".join(out)
+
+    head = "| | " + " | ".join(STEM_TITLES[m] for m in modes) + " |"
+    sep = "|---" * (len(modes) + 1) + "|"
+    L = [f"## Stemming e flexões ({scale})", "",
+         "Os mesmos dados e consultas em bancos criados de jeitos diferentes "
+         "([docs/plano-stemming.md](" + DOCS_URL + "/plano-stemming.md)). As consultas são palavras do vocabulário "
+         "sem stemming; com stemming, cada uma casa a união das flexões.", ""]
+    oracles = [(m, latest(R, "oracle", f"{small}-stemming-{m}")) for m in modes if m != base]
+    if any(o for _, o in oracles):
+        L += ["- Oráculo de " + small + ": " + ", ".join(
+            f"{STEM_TITLES[m]} **{o['divergencias']} divergências**" for m, o in oracles if o) + ".", ""]
+    L += [head, sep,
+          "| Carga (s) | " + cells({m: loads[m]["segundos"] for m in modes}, lambda v: fmt(v, 1)) + " |",
+          "| Pico de RSS (MB) | " + cells({m: loads[m]["pico_rss"] for m in modes}, mb) + " |",
+          "| Termos distintos | " + cells({m: keys(sizes[m], "post") for m in modes}) + " |",
+          "| Banco compactado (MB) | " + cells({m: (comps[m] or {}).get("banco_depois") for m in modes}, mb) + " |",
+          "| `pos:` (MB) | " + cells({m: space_bytes(sizes[m], "pos") for m in modes}, mb) + " |",
+          "| `stem:` (MB) | " + cells({m: space_bytes(sizes[m], "stem") for m in modes}, mb) + " |",
+          ""]
+    for title, suffix in (("Latência p50 (cache quente, compactado)", "t1"), ("Antes da compactação (p50)", "pre-compactacao")):
+        benches = {m: latest(R, "bench", f"stemming-{scale}-{m}-{suffix}") for m in modes}
+        if not all(benches.values()):
+            continue
+        by = {m: {x["conjunto"]: x for x in benches[m]["conjuntos"]} for m in modes}
+        L += [f"### {title}", "", "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+        for name in by[base]:
+            L.append(f"| `{name}` | " + cells({m: by[m].get(name, {}).get("p50_us") for m in modes}, us) + " |")
+        if suffix == "t1":
+            L += ["", "p99:", "", "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+            for name in by[base]:
+                L.append(f"| `{name}` | " + cells({m: by[m].get(name, {}).get("p99_us") for m in modes}, us) + " |")
+        L.append("")
+    rel = smaller(scale, "100k")
+    rels = {m: latest(R, "relevancia", f"{rel}-stemming-{m}") for m in modes}
+    if all(rels.values()):
+        by = {m: {c["conjunto"]: c for c in rels[m]["conjuntos"]} for m in modes}
+        L += [f"### Relevância ({rel})", "", "Acerto: top-1 em título, digitando e hub; top-3 nas consultas à mão; top-10 no resto.", "",
+              "| Conjunto | " + " | ".join(STEM_TITLES[m] for m in modes) + " |", sep]
+        for name in by[base]:
+            hit = REL_HIT.get(name, "top10")
+            row = " | ".join(f"{fmt(by[m][name][hit] * 100, 1)}%" if name in by[m] else "—" for m in modes)
+            L.append(f"| `{name}` ({hit.replace('top', 'top-')}) | {row} |")
+        L.append("")
+    return L
 
 
 def fase_relevancia(scale):
@@ -886,6 +1021,7 @@ def cmd_relatorio(scale):
     swap_growth = (load_scale or {}).get("swap_aumento")
     swap_txt = "—" if swap_growth is None else ("sim" if swap_growth < 64 << 20 else f"não (+{mb(swap_growth)} MB)")
     L += relevancia_section(R, scale)
+    L += stemming_section(R, scale)
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
           f"| Carga sem swap (aumento < 64 MB) | {swap_txt} | **sim** |",
@@ -998,6 +1134,7 @@ def main():
     for name, help_ in (("corretude", "Fase 1"), ("consultas", "Fase 3"), ("latencia", "Fase 4"),
                         ("concorrencia", "Fase 5"), ("frases", "frases e ranking (Fase E do plano)"),
                         ("relevancia", "ordenação: consultas de resposta conhecida"),
+                        ("stemming", "stemming ligado vs. desligado (A/B no mesmo binário)"),
                         ("relatorio", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
@@ -1040,7 +1177,7 @@ def main():
     else:
         result = {"corretude": fase_corretude, "consultas": fase_consultas, "latencia": fase_latencia,
                   "concorrencia": fase_concorrencia, "frases": fase_frases,
-                  "relevancia": fase_relevancia}[args.cmd](scale)
+                  "relevancia": fase_relevancia, "stemming": fase_stemming}[args.cmd](scale)
         ok = result is not False
     cmd_relatorio(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

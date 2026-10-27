@@ -166,6 +166,25 @@ pub struct CommitStats {
 }
 
 impl IndexBatch<'_> {
+    /// Tira o fim de palavra do nó `id` (a limpeza de palavras vazias) e
+    /// devolve o nó codificado, para quem chama gravar.
+    pub(super) fn clear_end_of_word(&mut self, id: u64) -> Result<Vec<u8>> {
+        // A profundidade só importa para o descarte do cache; um nó que ainda
+        // não está nele entra como fundo.
+        let cached = self.node_mut(id, u8::MAX)?;
+        cached.node.is_end_of_word = false;
+        Ok(cached.node.encode())
+    }
+
+    /// Encerra o lote sem commit, mas devolve o cache de nós ao escritor:
+    /// quem chama já gravou as mudanças que fez nos nós (a limpeza de
+    /// palavras vazias), então o cache continua igual ao banco.
+    pub(super) fn keep_cache(mut self) {
+        debug_assert!(self.dirty.is_empty() && self.ops.is_empty());
+        self.state.cache = NodeCache { nodes: std::mem::take(&mut self.nodes), generation: self.generation };
+        self.state.analyzer = std::mem::take(&mut self.analyzer);
+    }
+
     /// Indexa `text` sob um ID escolhido por você, sem título. Um ID que já
     /// existe é substituído (ver [`IndexBatch::add_titled`]).
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
@@ -344,7 +363,7 @@ impl IndexBatch<'_> {
         stats.dirty_nodes = self.dirty.len();
 
         let t = Instant::now();
-        self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats)?;
+        let maybe_empty = self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats)?;
         let (index, blocks) = self.write_lengths(&mut wb, &finals, &mut norms)?;
         self.write_labels(&mut wb, &finals, &norms);
         documents_secs += t.elapsed();
@@ -366,6 +385,9 @@ impl IndexBatch<'_> {
         let engine = self.engine;
         let next = engine.epoch.load(AtomicOrdering::Acquire) + 1;
         engine.norms.mark(blocks, next);
+        if !maybe_empty.is_empty() {
+            engine.maybe_empty.add(maybe_empty);
+        }
         if let Some(max) = engine.config.reader_cache_depth {
             let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
             engine.nodes.mark(shallow, next);

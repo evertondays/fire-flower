@@ -17,14 +17,15 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options};
 use rustc_hash::FxHashMap;
 
-use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
+use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits, codec};
 use crate::analysis::{Analyzer, normalize_term};
 use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::cache::EpochCache;
+use crate::engine::empty_words::MaybeEmpty;
 use crate::engine::keys::{
-    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
+    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_MAYBE_EMPTY, META_NEXT_DOC, META_NEXT_NODE,
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::meta::{
@@ -39,6 +40,7 @@ mod cache;
 mod config;
 mod conjunction;
 mod diagnostics;
+mod empty_words;
 mod groups;
 mod keys;
 mod meta;
@@ -78,6 +80,8 @@ pub struct Engine {
     norms: EpochCache<NormBlock>,
     /// Nós rasos da Trie (até `Config::reader_cache_depth`).
     nodes: EpochCache<TrieNode>,
+    /// Palavras que podem ter ficado sem documento.
+    maybe_empty: MaybeEmpty,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -153,6 +157,10 @@ impl Engine {
                 inflector.stemming()
             )));
         }
+        let maybe_empty = MaybeEmpty::default();
+        if let Some(v) = db.get_pinned(META_MAYBE_EMPTY)? {
+            maybe_empty.add(codec::decode_node_set(&v)?);
+        }
         let writer = Mutex::new(WriterState {
             next_node_id,
             next_doc_id,
@@ -172,6 +180,7 @@ impl Engine {
             epoch: AtomicU64::new(0),
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
+            maybe_empty,
             opts,
         })
     }

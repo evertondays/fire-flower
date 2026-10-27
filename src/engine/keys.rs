@@ -17,6 +17,9 @@ pub(super) const META_EDITS: &[u8] = b"meta:edits";
 
 pub(super) const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 
+/// Nós que receberam lápide desde a última limpeza (ver `MaybeEmpty`), unidos pelo merge.
+pub(super) const META_MAYBE_EMPTY: &[u8] = b"meta:maybe_empty";
+
 pub(super) const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
 
 pub(super) const META_DOC_COUNT: &[u8] = b"meta:doc_count";

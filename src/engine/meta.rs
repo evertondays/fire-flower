@@ -11,7 +11,8 @@ use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::engine::keys::{
-    META_EDITS, META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS, POST, STEM,
+    META_EDITS, META_FORMAT, META_LANGUAGES, META_MAYBE_EMPTY, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS,
+    POST, STEM,
 };
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
@@ -193,7 +194,7 @@ fn merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands, full: bo
         codec::merge_lists(inputs, ListKind::Postings, full)
     } else if key.starts_with(POS) {
         codec::merge_lists(inputs, ListKind::Positions, full)
-    } else if key.starts_with(STEM) {
+    } else if key.starts_with(STEM) || key == META_MAYBE_EMPTY {
         codec::merge_node_sets(inputs)
     } else {
         None

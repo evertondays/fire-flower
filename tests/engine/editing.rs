@@ -214,3 +214,40 @@ pub(crate) fn edits_match_a_fresh_load() {
         assert!(content(&engine) == content(&fresh), "seed {seed}: depois de compactar");
     }
 }
+
+/// Uma palavra cujo último documento saiu some do autocompletar e do prefixo
+/// na hora (sem ocupar vaga do limite de termos), continua fora depois de
+/// reabrir, e a limpeza tira o fim de palavra dela na Trie.
+#[test]
+pub(crate) fn words_without_documents_leave_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = || Config { max_prefix_terms: 2, ..Config::default() };
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let mut batch = engine.batch();
+        batch.add_document(1, "palco palha").unwrap();
+        batch.add_document(2, "palma palha").unwrap();
+        batch.add_document(3, "palito").unwrap();
+        batch.commit().unwrap();
+        assert_eq!(engine.suggest("pal", 10).unwrap(), ["palco", "palha", "palma", "palito"]);
+        engine.delete_document(1).unwrap();
+        engine.index_document(3, "outro").unwrap();
+        assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"], "palco e palito ficaram sem documento");
+        // As duas vagas do prefixo vão para palavras com documento.
+        assert_eq!(engine.search("pal*").unwrap(), [2]);
+    }
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"], "o conjunto sobrevive ao open");
+    assert!(engine.term_node("palco").unwrap().is_some(), "antes da limpeza o nó ainda é palavra");
+    assert_eq!(engine.collect_empty_words().unwrap(), 2);
+    assert_eq!(engine.collect_empty_words().unwrap(), 0, "nada mais a limpar");
+    assert_eq!(engine.term_node("palco").unwrap(), None);
+    assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"]);
+    // A palavra pode voltar.
+    engine.index_document(4, "palco").unwrap();
+    assert_eq!(engine.suggest("palc", 10).unwrap(), ["palco"]);
+    assert_eq!(engine.search("palco").unwrap(), [4]);
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.suggest("pal", 10).unwrap(), ["palco", "palha", "palma"]);
+}

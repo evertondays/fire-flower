@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{DocId, Error, IndexBatch, IndexStats, Result, codec};
 use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock};
-use crate::engine::keys::{DOC, FWD, Key, NORM, POS, POST};
+use crate::engine::keys::{DOC, FWD, Key, META_MAYBE_EMPTY, NORM, POS, POST};
 use crate::engine::view::Source;
 use crate::engine::writer::CommitStats;
 
@@ -84,7 +84,8 @@ impl IndexBatch<'_> {
     /// Grava os termos novos (`fwd:`) de cada documento e as lápides dos
     /// termos que saíram: de um documento substituído, os antigos que o texto
     /// novo não tem; de um removido, todos. Termos que continuam não precisam
-    /// de lápide, porque a entrada nova vence a antiga no merge.
+    /// de lápide, porque a entrada nova vence a antiga no merge. Devolve os
+    /// nós que receberam lápide, em ordem (podem ter ficado sem documento).
     pub(super) fn write_documents(
         &self,
         wb: &mut WriteBatch,
@@ -92,9 +93,9 @@ impl IndexBatch<'_> {
         old: &OldTerms,
         new_terms: &mut [Vec<u64>],
         stats: &mut CommitStats,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
         if !self.engine.edits {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Termo -> documentos que saíram dele.
         let mut gone: FxHashMap<u64, Vec<DocId>> = FxHashMap::default();
@@ -118,6 +119,8 @@ impl IndexBatch<'_> {
             }
         }
         let mut buf = Vec::new();
+        let mut nodes: Vec<u64> = gone.keys().copied().collect();
+        nodes.sort_unstable();
         for (node, mut docs) in gone {
             docs.sort_unstable();
             stats.tombstones += docs.len();
@@ -128,7 +131,10 @@ impl IndexBatch<'_> {
                 wb.merge(Key::new(POS, node), &buf);
             }
         }
-        Ok(())
+        if !nodes.is_empty() {
+            wb.merge(META_MAYBE_EMPTY, codec::encode_node_set(&nodes));
+        }
+        Ok(nodes)
     }
 
     /// Atualiza os blocos de `norm:` tocados pelo lote e as estatísticas. Um

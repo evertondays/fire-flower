@@ -192,7 +192,7 @@ def save_result(kind, label, data):
     os.makedirs(RESULTS, exist_ok=True)
     ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
     commit = git_commit()
-    data = dict(data, tipo=kind, rotulo=label, commit=commit, quando=ts)
+    data = dict(data, kind=kind, label=label, commit=commit, when=ts)
     path = os.path.join(RESULTS, f"{ts}-{commit}-{kind}-{label}.json")
     with open(path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -206,6 +206,12 @@ def load_results():
         try:
             with open(path) as f:
                 r = json.load(f)
+            # Até 27/10/2026 o perf.py gravava estas chaves em português (o
+            # `wiki` já gravava em inglês): sem isso, compactações e afins
+            # gravados pelo próprio perf.py sumiam do relatório.
+            for old, new in (("tipo", "kind"), ("rotulo", "label"), ("quando", "when")):
+                if old in r and new not in r:
+                    r[new] = r.pop(old)
             r["_file"] = os.path.basename(path)
             out.append(r)
         except (OSError, ValueError):

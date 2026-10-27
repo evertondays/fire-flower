@@ -1,13 +1,15 @@
 //! Testes dos formatos.
 
 use crate::{DocId, Posting};
+use std::collections::BTreeMap;
+
 use crate::codec::{
-    DocLens, NormBlock, PositionsCursor, PostingsCursor, SKIP_BLOCK, TrieNode, decode_docs,
+    DocLens, ListKind, NormBlock, PositionsCursor, PostingsCursor, SKIP_BLOCK, TrieNode, decode_docs,
     decode_node_set, decode_positions, decode_postings, encode_node_set, encode_positions_into,
-    encode_postings, get_varint, list_len, merge_node_sets, merge_positions, merge_postings,
+    encode_postings, encode_tombstones_into, get_varint, list_len, merge_lists, merge_node_sets, merge_positions,
+    merge_postings,
 };
 use crate::codec::list::ListHeader;
-use crate::codec::merge::merge_lists;
 use crate::codec::positions::encode_positions_with;
 
 #[test]
@@ -210,11 +212,11 @@ fn merge_is_associative() {
         assert_eq!(decode_positions(&all_pos).unwrap(), want_pos);
         // Agrupando em dois: primeiro os `split` mais antigos, depois o resto.
         let split = next(pieces.len() as u64 + 1) as usize;
-        for (lists, full, positions) in [(&post, &all_post, false), (&pos, &all_pos, true)] {
+        for (lists, full, kind) in [(&post, &all_post, ListKind::Postings), (&pos, &all_pos, ListKind::Positions)] {
             let slices: Vec<&[u8]> = lists.iter().map(Vec::as_slice).collect();
-            let left = merge_lists(slices[..split].iter().copied(), positions).unwrap();
-            let right = merge_lists(slices[split..].iter().copied(), positions).unwrap();
-            let again = merge_lists([left.as_slice(), right.as_slice()].into_iter(), positions).unwrap();
+            let left = merge_lists(slices[..split].iter().copied(), kind, false).unwrap();
+            let right = merge_lists(slices[split..].iter().copied(), kind, false).unwrap();
+            let again = merge_lists([left.as_slice(), right.as_slice()].into_iter(), kind, true).unwrap();
             assert_eq!(&again, full);
         }
     }
@@ -363,7 +365,13 @@ fn merging_large_lists_rebuilds_the_skip_table() {
     let mut want = full.clone();
     want[500..520].copy_from_slice(&newer);
     assert_eq!(decode_postings(&merged2).unwrap(), want);
-    assert_eq!(merged2, encode_postings(&want));
+    // Por remendo: os blocos que o pedaço novo não toca são copiados, e o
+    // tamanho fica praticamente o da lista original.
+    assert!(merged2.len() <= merged.len() + 16, "{} vs {}", merged2.len(), merged.len());
+    let mut cursor = PostingsCursor::new(&merged2).unwrap();
+    for p in want.iter().step_by(11) {
+        assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p));
+    }
     // Posições também.
     let entries: Vec<(DocId, Vec<u32>)> = full.iter().map(|p| (p.doc, vec![1, 5])).collect();
     let pieces: Vec<Vec<u8>> = [&entries[..300], &entries[300..]]
@@ -423,4 +431,173 @@ fn norm_block_roundtrip_and_updates() {
     assert_eq!(decoded.get(1023), None, "depois do último deslocamento");
     assert_eq!(decoded.len(), 3);
     assert!(NormBlock::decode(&NormBlock::default().encode()).unwrap().is_empty());
+}
+
+fn tombstones(docs: &[DocId]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_tombstones_into(&mut buf, docs);
+    buf
+}
+
+#[test]
+fn tombstones_are_dropped_by_the_full_merge_only() {
+    let t = tombstones(&[2, 9]);
+    assert!(ListHeader::parse(&t, true).unwrap().tombstones);
+    assert!(decode_postings(&t).is_err(), "uma busca nunca aceita lápide");
+    assert!(decode_docs(&t).is_err());
+    assert!(PostingsCursor::new(&t).is_err());
+    let base = encode_postings(&[p(1, 1), p(2, 3), p(5, 1)]);
+    assert_eq!(merged(&[vec![p(1, 1), p(2, 3), p(5, 1)]]), [p(1, 1), p(2, 3), p(5, 1)]);
+    let full = merge_postings([base.as_slice(), t.as_slice()].into_iter()).unwrap();
+    assert_eq!(decode_postings(&full).unwrap(), [p(1, 1), p(5, 1)]);
+    assert!(!ListHeader::parse(&full, true).unwrap().tombstones);
+    // Parcial: a lápide de 9 (que não está em nenhum pedaço) também fica,
+    // porque pode haver um valor mais antigo com o 9.
+    let partial = merge_lists([base.as_slice(), t.as_slice()].into_iter(), ListKind::Postings, false).unwrap();
+    assert!(ListHeader::parse(&partial, true).unwrap().tombstones);
+    assert_eq!(list_len(&partial).unwrap(), 4);
+    // Lápide e depois a entrada de novo: o mais novo vence.
+    let again = encode_postings(&[p(2, 7)]);
+    let back = merge_postings([base.as_slice(), t.as_slice(), again.as_slice()].into_iter()).unwrap();
+    assert_eq!(decode_postings(&back).unwrap(), [p(1, 1), p(2, 7), p(5, 1)]);
+    // Todos removidos: lista vazia (2 bytes), não ausente.
+    let gone = merge_postings([base.as_slice(), tombstones(&[1, 2, 5]).as_slice()].into_iter()).unwrap();
+    assert_eq!(gone, [0, 0]);
+    // As mesmas lápides servem para `pos:`.
+    let pos = pos_bytes(&[(2, &[4, 8]), (3, &[1])]);
+    let pos_full = merge_positions([pos.as_slice(), t.as_slice()].into_iter()).unwrap();
+    assert_eq!(decode_positions(&pos_full).unwrap(), [(3, vec![1])]);
+    // Uma lápide numa lista que não se diz com lápides é corrompida.
+    let mut fake = encode_postings(&[p(1, 1)]);
+    *fake.last_mut().unwrap() = 0;
+    assert!(merge_postings([base.as_slice(), fake.as_slice()].into_iter()).is_none());
+}
+
+/// O que cada documento tem no termo: tf, tf do título e posições.
+type Model = BTreeMap<DocId, (u32, u32, Vec<u32>)>;
+
+/// Um pedaço gravado por um lote: entradas novas ou lápides.
+enum Piece {
+    Add(Model),
+    Remove(Vec<DocId>),
+}
+
+impl Piece {
+    fn encode(&self, kind: ListKind) -> Vec<u8> {
+        match (self, kind) {
+            (Piece::Add(m), ListKind::Postings) => {
+                encode_postings(&m.iter().map(|(&d, &(tf, title, _))| pt(d, tf, title)).collect::<Vec<_>>())
+            }
+            (Piece::Add(m), ListKind::Positions) => {
+                pos_bytes(&m.iter().map(|(&d, (_, _, ps))| (d, ps.as_slice())).collect::<Vec<_>>())
+            }
+            (Piece::Remove(docs), _) => tombstones(docs),
+        }
+    }
+
+    fn apply(&self, model: &mut Model) {
+        match self {
+            Piece::Add(m) => model.extend(m.iter().map(|(&d, v)| (d, v.clone()))),
+            Piece::Remove(docs) => docs.iter().for_each(|d| drop(model.remove(d))),
+        }
+    }
+}
+
+/// Une `lists` com merges parciais em pontos aleatórios e um completo no fim,
+/// como o RocksDB pode fazer entre compactações e leituras.
+fn merge_in_random_groups(lists: &[Vec<u8>], kind: ListKind, next: &mut impl FnMut(u64) -> u64) -> Vec<u8> {
+    let mut level: Vec<Vec<u8>> = lists.to_vec();
+    while level.len() > 1 && next(3) > 0 {
+        let start = next(level.len() as u64) as usize;
+        let end = start + 1 + next((level.len() - start) as u64) as usize;
+        let group = merge_lists(level[start..end].iter().map(Vec::as_slice), kind, false).unwrap();
+        level.splice(start..end, [group]);
+    }
+    merge_lists(level.iter().map(Vec::as_slice), kind, true).unwrap()
+}
+
+/// Sequências aleatórias de entradas e lápides, com bases grandes (caminho do
+/// remendo) e pequenas: o merge completo direto, o merge depois de merges
+/// parciais aleatórios e um `BTreeMap` de referência dão o mesmo conteúdo.
+#[test]
+fn merges_with_tombstones_match_a_reference_model() {
+    let mut next = rng(0x9E37_79B9_7F4A_7C15);
+    for round in 0..250 {
+        let universe = [20, 300, 3000][round % 3];
+        let mut model = Model::new();
+        let mut pieces = Vec::new();
+        for i in 0..1 + next(6) {
+            // O primeiro pedaço costuma ser grande: a base de um termo frequente.
+            let size = if i == 0 { next(universe) + 1 } else { next(universe / 10 + 2) + 1 };
+            let docs: Vec<DocId> = {
+                let mut d: Vec<DocId> = (0..size).map(|_| next(universe)).collect();
+                d.sort_unstable();
+                d.dedup();
+                d
+            };
+            let piece = if i > 0 && next(2) == 0 {
+                Piece::Remove(docs)
+            } else {
+                let entries = docs.into_iter().map(|d| {
+                    let tf = 1 + next(3) as u32;
+                    let title = if next(4) == 0 { 1 } else { 0 };
+                    (d, (tf, title, (0..tf).map(|k| k * 7 + next(5) as u32).collect()))
+                });
+                Piece::Add(entries.collect())
+            };
+            piece.apply(&mut model);
+            pieces.push(piece);
+        }
+        let want_post: Vec<Posting> = model.iter().map(|(&d, &(tf, title, _))| pt(d, tf, title)).collect();
+        let want_pos: Vec<(DocId, Vec<u32>)> = model.iter().map(|(&d, (_, _, ps))| (d, ps.clone())).collect();
+        for kind in [ListKind::Postings, ListKind::Positions] {
+            let lists: Vec<Vec<u8>> = pieces.iter().map(|p| p.encode(kind)).collect();
+            let direct = merge_lists(lists.iter().map(Vec::as_slice), kind, true).unwrap();
+            let grouped = merge_in_random_groups(&lists, kind, &mut next);
+            for list in [&direct, &grouped] {
+                assert!(!ListHeader::parse(list, true).unwrap().tombstones, "rodada {round}");
+                match kind {
+                    ListKind::Postings => {
+                        assert_eq!(decode_postings(list).unwrap(), want_post, "rodada {round}");
+                        let mut cursor = PostingsCursor::new(list).unwrap();
+                        for p in want_post.iter().step_by(5) {
+                            assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p), "rodada {round}");
+                        }
+                    }
+                    ListKind::Positions => {
+                        assert_eq!(decode_positions(list).unwrap(), want_pos, "rodada {round}");
+                        let mut cursor = PositionsCursor::new(list).unwrap();
+                        let mut out = Vec::new();
+                        for (d, ps) in want_pos.iter().step_by(5) {
+                            assert!(cursor.seek(*d, &mut out).unwrap(), "rodada {round}");
+                            assert_eq!(&out, ps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// O remendo só regrava os blocos que o pedaço novo toca: remover um
+/// documento do meio de uma lista grande mantém os outros blocos iguais.
+#[test]
+fn patch_merge_copies_untouched_blocks() {
+    let full = sample_list(3000, 21);
+    let base = encode_postings(&full);
+    let gone = full[1500].doc;
+    let merged = merge_postings([base.as_slice(), tombstones(&[gone]).as_slice()].into_iter()).unwrap();
+    let want: Vec<Posting> = full.iter().copied().filter(|p| p.doc != gone).collect();
+    assert_eq!(decode_postings(&merged).unwrap(), want);
+    let before = ListHeader::parse(&base, true).unwrap();
+    let after = ListHeader::parse(&merged, true).unwrap();
+    let untouched = |h: &ListHeader| h.entries.iter().filter(|e| e.count == SKIP_BLOCK as u64).count();
+    assert_eq!(untouched(&after), untouched(&before) - 1, "só o bloco do documento removido muda");
+    assert!(merged.len() < base.len());
+    // Lista que cai para 256 entradas ou menos perde a tabela.
+    let small = encode_postings(&full[..300]);
+    let docs: Vec<DocId> = full[..60].iter().map(|p| p.doc).collect();
+    let shrunk = merge_postings([small.as_slice(), tombstones(&docs).as_slice()].into_iter()).unwrap();
+    assert!(ListHeader::parse(&shrunk, true).unwrap().blocks.is_empty());
+    assert_eq!(decode_postings(&shrunk).unwrap(), full[60..300]);
 }

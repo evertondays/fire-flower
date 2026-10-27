@@ -43,7 +43,8 @@ pub use analysis::stopwords::{Language, Stopwords};
 #[doc(hidden)]
 pub mod internals {
     pub use crate::codec::{
-        NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
+        NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, encode_tombstones_into, list_len, merge_positions,
+        merge_postings,
     };
     pub use crate::engine::{intersect, reads_on_this_thread};
 }

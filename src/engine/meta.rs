@@ -6,13 +6,14 @@ use std::path::Path;
 use rocksdb::{DB, MergeOperands, Options, WriteBatch};
 
 use crate::{Error, Result, codec};
+use crate::codec::ListKind;
 use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS, POST, STEM};
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 5;
+pub const FORMAT_VERSION: u64 = 6;
 
 /// Confere a versão do formato e se o banco tem posições. Num banco novo,
 /// grava as duas coisas.
@@ -153,16 +154,27 @@ pub(super) fn varint(v: u64) -> Vec<u8> {
     buf
 }
 
-/// Merge operator de `post:` e `pos:`: une as listas por documento, com a
-/// gravação mais nova vencendo (ver `codec::merge_postings`). É associativo,
-/// então o RocksDB pode combinar pedaços consecutivos em qualquer agrupamento.
-/// Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
-pub(super) fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+/// Merge operator completo de `post:` e `pos:`: une as listas por documento,
+/// com a gravação mais nova vencendo, e descarta as lápides (ver
+/// `codec::merge_lists`). O RocksDB o chama com o valor base, ou sem base
+/// quando sabe que não há valor mais antigo (leituras e compactação no último
+/// nível). Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
+pub(super) fn full_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+    merge(key, existing, operands, true)
+}
+
+/// Merge operator parcial: só operandos consecutivos, e pode haver valor mais
+/// antigo em outro nível. Une como o completo, mas guarda as lápides.
+pub(super) fn partial_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+    merge(key, existing, operands, false)
+}
+
+fn merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands, full: bool) -> Option<Vec<u8>> {
     let inputs = existing.into_iter().chain(operands.iter());
     if key.starts_with(POST) {
-        codec::merge_postings(inputs)
+        codec::merge_lists(inputs, ListKind::Postings, full)
     } else if key.starts_with(POS) {
-        codec::merge_positions(inputs)
+        codec::merge_lists(inputs, ListKind::Positions, full)
     } else if key.starts_with(STEM) {
         codec::merge_node_sets(inputs)
     } else {

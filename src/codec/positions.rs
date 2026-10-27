@@ -39,7 +39,7 @@ pub(super) fn encode_positions_with<'p>(buf: &mut Vec<u8>, n: usize, entries: im
             }
         }
     };
-    write_list(buf, n, write);
+    write_list(buf, n, false, write);
 }
 
 /// Lista completa de posições (diagnóstico e testes; a busca usa o cursor).
@@ -73,7 +73,7 @@ pub struct PositionsCursor<'a> {
 
 impl<'a> PositionsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let ListHeader { n, blocks, body, .. } = ListHeader::parse(bytes, true)?;
+        let ListHeader { n, blocks, body, .. } = ListHeader::parse_clean(bytes, true)?;
         Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None })
     }
 

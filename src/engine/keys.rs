@@ -5,7 +5,7 @@ pub const ROOT_ID: u64 = 0;
 /// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
 /// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
 /// ser aberto para escrita.
-pub(super) const MERGE_OPERATOR: &str = "fire_flower_v5";
+pub(super) const MERGE_OPERATOR: &str = "fire_flower_v6";
 
 pub(super) const META_FORMAT: &[u8] = b"meta:format";
 

@@ -1,6 +1,6 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v5; a codificação está em `src/codec/`):
+//! Espaços de chave (formato v6; a codificação está em `src/codec/`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
 //! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
 //! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
@@ -28,7 +28,7 @@ use crate::engine::keys::{
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::meta::{
-    merge_operator, previous_merge_operator, read_counter, resolve_format, resolve_languages,
+    full_merge, partial_merge, previous_merge_operator, read_counter, resolve_format, resolve_languages,
     resolve_stemming, stored_format_error,
 };
 use crate::engine::view::View;
@@ -106,7 +106,7 @@ impl Engine {
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_merge_operator_associative(MERGE_OPERATOR, merge_operator);
+        opts.set_merge_operator(MERGE_OPERATOR, full_merge, partial_merge);
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
         if config.statistics {

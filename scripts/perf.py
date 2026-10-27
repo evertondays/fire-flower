@@ -238,7 +238,7 @@ def median_load(results, label, fmt=None):
             and r.get("commit") == last.get("commit")][-MEDIAN_OF:]
     runs.sort(key=lambda r: r["docs_per_s"])
     mid = dict(runs[(len(runs) - 1) // 2])
-    mid.update(_rodadas=len(runs), _min=runs[0]["docs_per_s"], _max=runs[-1]["docs_per_s"])
+    mid.update(_rounds=len(runs), _min=runs[0]["docs_per_s"], _max=runs[-1]["docs_per_s"])
     return mid
 
 

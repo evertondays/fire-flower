@@ -28,10 +28,18 @@ pub(crate) fn digest(db: &Path) -> AnyResult {
     engine.for_each_term(|term, node| nodes.push((term.to_string(), node)))?;
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);
     let (mut postings, mut positions) = (0u64, 0u64);
+    let mut terms = 0u64;
     for (term, node) in &nodes {
+        // A Trie não encolhe: uma palavra que ficou sem documento (remoção)
+        // não faz parte do conteúdo, como num banco carregado sem ela.
+        let list = engine.term_postings_of_node(*node)?;
+        if list.is_empty() {
+            continue;
+        }
+        terms += 1;
         h.write(term.as_bytes());
         h.write(&[0]);
-        for p in engine.term_postings_of_node(*node)? {
+        for p in list {
             h.write(&p.doc.to_le_bytes());
             h.write(&p.tf.to_le_bytes());
             h.write(&p.title_tf.to_le_bytes());
@@ -62,7 +70,7 @@ pub(crate) fn digest(db: &Path) -> AnyResult {
     h.write(&stats.total_title_len.to_le_bytes());
     println!(
         "{}",
-        json!({ "db": db, "terms": nodes.len(), "postings": postings, "positions": positions,
+        json!({ "db": db, "terms": terms, "postings": postings, "positions": positions,
                 "documents": stats.doc_count, "total_size": stats.total_len, "digest": format!("{:016x}", h.0) })
     );
     Ok(())

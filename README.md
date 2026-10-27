@@ -221,6 +221,8 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 | Armazenamento | `src/engine/` + `src/codec/` | chaves no RocksDB e serialização binária (um arquivo por formato) |
 
 O mapa arquivo por arquivo está em [docs/como-funciona.md](docs/como-funciona.md#9-mapa-do-código).
+Como o código é escrito, testado e medido (idioma, organização, visibilidade,
+imports, erros, performance, git): [docs/diretrizes-de-codigo.md](docs/diretrizes-de-codigo.md).
 
 ### Chaves no RocksDB
 

@@ -19,7 +19,7 @@ use crate::engine::ranking::score::Scorer;
 use crate::Posting;
 use crate::engine::conjunction::Member;
 use crate::engine::ranking::bm25::Bm25;
-use crate::text::Clause;
+use crate::query::Clause;
 use crate::InflectionMode;
 use crate::TopHits;
 use crate::engine::view::View;

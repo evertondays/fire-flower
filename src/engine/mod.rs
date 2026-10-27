@@ -14,21 +14,21 @@
 
 
 use crate::Result;
-use crate::stopwords::Language;
+use crate::analysis::stopwords::Language;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use crate::engine::view::View;
 use crate::codec::NORM_BLOCK_DOCS;
 use crate::engine::keys::DOC;
 use crate::engine::keys::Key;
-use crate::text::parse_query_stemmed;
-use crate::text::Clause;
-use crate::text::normalize_term;
+use crate::query::parse_query_stemmed;
+use crate::query::Clause;
+use crate::analysis::normalize_term;
 use crate::Posting;
 use crate::TopHits;
 use crate::Hit;
 use crate::DocId;
 use rustc_hash::FxHashMap;
-use crate::text::Analyzer;
+use crate::analysis::Analyzer;
 use crate::engine::writer::NodeCache;
 use crate::engine::keys::META_INFLECTIONS;
 use crate::engine::keys::META_STEMMING;
@@ -58,8 +58,8 @@ use crate::codec::TrieNode;
 use crate::codec::NormBlock;
 use crate::engine::cache::EpochCache;
 use std::sync::atomic::AtomicU64;
-use crate::stem::Stemmer;
-use crate::stopwords::Stopwords;
+use crate::analysis::stem::Stemmer;
+use crate::analysis::stopwords::Stopwords;
 use crate::engine::writer::WriterState;
 use std::sync::Mutex;
 use rocksdb::DB;
@@ -282,7 +282,7 @@ impl Engine {
     }
 
     /// Separa a consulta em partes como a busca faz (stopwords e stemming do
-    /// banco); ver [`crate::text::parse_query`].
+    /// banco); ver [`crate::query::parse_query`].
     pub fn parse_query(&self, query: &str) -> Vec<Clause> {
         parse_query_stemmed(query, &self.stopwords, &self.stemmer)
     }

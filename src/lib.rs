@@ -27,15 +27,14 @@
 //! # Ok::<(), fire_flower::Error>(())
 //! ```
 
+pub mod analysis;
 mod codec;
 mod engine;
-pub mod stem;
-pub mod stopwords;
-pub mod text;
+pub mod query;
 
 pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode};
-pub use stem::{Stemmer, Stemming};
-pub use stopwords::{Language, Stopwords};
+pub use analysis::stem::{Stemmer, Stemming};
+pub use analysis::stopwords::{Language, Stopwords};
 
 /// Peças internas expostas só para os microbenchmarks (`benches/micro.rs`).
 /// Não fazem parte da API estável.

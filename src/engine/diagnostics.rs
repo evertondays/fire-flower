@@ -15,7 +15,7 @@ use crate::engine::keys::POS;
 use crate::engine::keys::Key;
 use crate::Posting;
 use crate::DocId;
-use crate::text::normalize_term;
+use crate::analysis::normalize_term;
 use crate::engine::keys::META_NEXT_NODE;
 use crate::engine::meta::read_counter;
 use crate::Config;

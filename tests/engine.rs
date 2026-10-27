@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use fire_flower::text::Clause;
+use fire_flower::query::Clause;
 use fire_flower::{Config, Engine, InflectionMode, Language, Stemming};
 
 fn open(dir: &tempfile::TempDir) -> Engine {
@@ -1003,7 +1003,7 @@ fn title_is_a_field() {
 /// frase não casa atravessando o fim do título e o começo do texto.
 #[test]
 fn phrase_does_not_cross_from_title_to_text() {
-    use fire_flower::text::TITLE_GAP;
+    use fire_flower::analysis::TITLE_GAP;
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
     let mut batch = engine.batch();

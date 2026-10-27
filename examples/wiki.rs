@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use fire_flower::text::{Clause, TITLE_GAP, index_terms, parse_query_stemmed, tokenize};
+use fire_flower::analysis::{TITLE_GAP, index_terms, tokenize};
+use fire_flower::query::{Clause, parse_query_stemmed};
 use fire_flower::{Language, Stemming, Stopwords};
 use fire_flower::{CommitStats, Config, DocId, Engine};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};

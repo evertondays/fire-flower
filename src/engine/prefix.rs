@@ -14,7 +14,7 @@ use crate::engine::view::View;
 
 impl View<'_> {
     /// Nós das completações de `prefix` e, com stemming, o do radical do
-    /// prefixo (ver [`crate::text::QueryTerm::stem`]), sem repetir.
+    /// prefixo (ver [`crate::query::QueryTerm::stem`]), sem repetir.
     pub(crate) fn prefix_nodes(&self, prefix: &str, stem: Option<&str>) -> Result<Vec<u64>> {
         let mut nodes: Vec<u64> =
             self.words_with_prefix(prefix, self.engine.config.max_prefix_terms)?.into_iter().map(|(_, n)| n).collect();

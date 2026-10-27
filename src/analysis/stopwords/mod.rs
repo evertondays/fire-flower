@@ -11,7 +11,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::text::tokenize;
+use crate::analysis::tokenize;
 
 /// Idioma das stopwords de um banco.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,8 +43,8 @@ impl Language {
     /// Conteúdo de `src/stopwords/<código>.txt`.
     fn list(self) -> &'static str {
         match self {
-            Language::Portuguese => include_str!("stopwords/pt.txt"),
-            Language::English => include_str!("stopwords/en.txt"),
+            Language::Portuguese => include_str!("pt.txt"),
+            Language::English => include_str!("en.txt"),
         }
     }
 

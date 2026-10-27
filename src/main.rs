@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use fire_flower::{Config, Engine, Language, Stemming, stopwords, text};
+use fire_flower::analysis::{self, stopwords};
+use fire_flower::{Config, Engine, Language, Stemming};
 
 /// Motor de busca full-text embutido: Trie persistida no RocksDB.
 #[derive(Parser)]
@@ -249,7 +250,7 @@ fn index(
         }
         let mut content = String::from_utf8_lossy(&bytes).into_owned();
         if is_html(path) {
-            content = text::strip_html(&content);
+            content = analysis::strip_html(&content);
         }
         // O nome do arquivo (sem extensão) é o título: pesa mais no ranking.
         let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();

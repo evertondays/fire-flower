@@ -2,8 +2,8 @@
 
 use crate::Result;
 use crate::Error;
-use crate::stem::Stemming;
-use crate::stopwords::Language;
+use crate::analysis::stem::Stemming;
+use crate::analysis::stopwords::Language;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,7 +54,7 @@ pub struct Config {
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
     /// Reduz as palavras ao radical (Snowball) na indexação e na busca:
-    /// "correndo" acha "corrida". Ver [`crate::stem`].
+    /// "correndo" acha "corrida". Ver [`crate::analysis::stem`].
     ///
     /// Como os idiomas, é decidido na criação do banco: `None` usa o que está
     /// gravado (ou [`Stemming::Off`], num banco novo; bancos de antes do

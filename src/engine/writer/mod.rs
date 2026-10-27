@@ -29,7 +29,7 @@ use std::sync::MutexGuard;
 use crate::Engine;
 use crate::engine::writer::trie::CachedNode;
 use rustc_hash::FxHashMap;
-use crate::text::Analyzer;
+use crate::analysis::Analyzer;
 use crate::IndexStats;
 use crate::DocId;
 

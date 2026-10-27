@@ -17,8 +17,8 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::stopwords::Language;
-use crate::text::for_each_token;
+use crate::analysis::stopwords::Language;
+use crate::analysis::for_each_token;
 
 /// Stemming de um banco.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -292,7 +292,7 @@ impl StemCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text::tokenize;
+    use crate::analysis::tokenize;
 
     fn stems(text: &str) -> Vec<String> {
         let stemmer = Stemmer::new(Stemming::Snowball(Language::Portuguese));

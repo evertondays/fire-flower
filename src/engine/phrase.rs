@@ -7,7 +7,7 @@ use crate::codec::PositionsCursor;
 use crate::engine::keys::POS;
 use crate::engine::keys::Key;
 use crate::Error;
-use crate::text::Clause;
+use crate::query::Clause;
 use crate::engine::view::View;
 
 impl View<'_> {

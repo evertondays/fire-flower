@@ -6,7 +6,8 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fire_flower::text::{Clause, QueryTerm, normalize_term};
+use fire_flower::analysis::normalize_term;
+use fire_flower::query::{Clause, QueryTerm};
 use fire_flower::{DocId, Engine, Hit, Stemmer};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -673,7 +674,7 @@ mod tests {
     #[test]
     fn highlight_marks_normalized_matches() {
         let terms: Vec<QueryTerm> =
-            fire_flower::text::parse_query("coracao do bras*", &fire_flower::Stopwords::default()).iter().flat_map(Clause::terms).collect();
+            fire_flower::query::parse_query("coracao do bras*", &fire_flower::Stopwords::default()).iter().flat_map(Clause::terms).collect();
         let off = Stemmer::default();
         let (spans, hit) = highlight("O Coração do Brasil, não do Chile.", &terms, (&off, &off));
         assert!(hit);

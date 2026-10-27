@@ -8,7 +8,7 @@ use crate::codec::PostingsCursor;
 use crate::engine::groups::decode_group_docs;
 use crate::codec;
 use crate::engine::conjunction::Member;
-use crate::text::Clause;
+use crate::query::Clause;
 use crate::InflectionMode;
 use crate::DocId;
 use crate::engine::view::View;

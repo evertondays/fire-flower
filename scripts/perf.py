@@ -693,7 +693,9 @@ EDIT_SETS = ["t-mid", "t-freq", "titles", "and-freq", "rank-freq", "rank-titles"
 EDIT_BATCHES = [(10000, None), (100, 3000), (1, 300)]
 # Latência: cada banco editado contra um carregado direto com o mesmo estado
 # final (mesmo conteúdo, sem edições), e a fatia com e sem `fwd:`.
-EDIT_STAGES = [("final-pre", "estado final carregado, antes de compactar"),
+EDIT_STAGES = [("clean-pre", "fatia carregada, antes de compactar"),
+               ("trickle-pre", "fatia + 1.000 edições de 1 documento, antes de compactar"),
+               ("final-pre", "estado final carregado, antes de compactar"),
                ("edited-pre", "editado, antes de compactar"),
                ("edited-collected", "editado + limpeza de palavras, antes de compactar"),
                ("final-compacted", "estado final carregado, compactado"),
@@ -701,7 +703,7 @@ EDIT_STAGES = [("final-pre", "estado final carregado, antes de compactar"),
                ("no-fwd-compacted", "fatia sem fwd:, compactada"),
                ("clean-compacted", "fatia com fwd:, compactada")]
 # Com o que cada etapa é comparada.
-EDIT_BASES = {"edited-pre": "final-pre", "edited-collected": "final-pre", "edited-compacted": "final-compacted",
+EDIT_BASES = {"trickle-pre": "clean-pre", "edited-pre": "final-pre", "edited-collected": "final-pre", "edited-compacted": "final-compacted",
               "clean-compacted": "no-fwd-compacted"}
 
 
@@ -752,6 +754,12 @@ def phase_edits(scale):
         extra = ["--max-ops", max_ops] if max_ops else []
         wiki("edit", "--db", tmp, "--corpus", src, "--take", n, "--batch", batch, *extra,
              "--label", f"edits-{scale}-b{batch}")
+    step("latência: edições contínuas (1.000 commits de 1 documento) contra a fatia sem edições")
+    copy_db(clean, tmp)
+    wiki("edit", "--db", tmp, "--corpus", src, "--take", n, "--batch", 1, "--max-ops", 1000,
+         "--label", f"edits-{scale}-trickle")
+    bench(clean, scale, EDIT_SETS, f"edits-{scale}-clean-pre")
+    bench(tmp, scale, EDIT_SETS, f"edits-{scale}-trickle-pre")
     shutil.rmtree(tmp, ignore_errors=True)
 
     edited, final = db(f"edits-{scale}-edited"), db(f"edits-{scale}-final")
@@ -837,11 +845,12 @@ def edits_section(R, scale):
     if all(benches.values()):
         by = {stage: {x["set"]: x for x in b["sets"]} for stage, b in benches.items()}
         L += ["### Latência p50", "",
-              "Entre parênteses, a diferença para a referência: o banco editado contra o estado final carregado "
-              "direto (mesmo conteúdo) no mesmo estado de compactação; a fatia com `fwd:` contra a sem.", "",
+              "Entre parênteses, a diferença para a referência: as edições contínuas contra a fatia sem edições; "
+              "o banco do plano inteiro contra o estado final carregado direto (mesmo conteúdo) no mesmo estado "
+              "de compactação; a fatia com `fwd:` contra a sem.", "",
               "| Conjunto | " + " | ".join(title for _, title in EDIT_STAGES) + " |",
               "|---" * (len(EDIT_STAGES) + 1) + "|"]
-        for name in by["final-pre"]:
+        for name in by["clean-pre"]:
             cells = []
             for stage, _ in EDIT_STAGES:
                 v = by[stage].get(name, {}).get("p50_us")

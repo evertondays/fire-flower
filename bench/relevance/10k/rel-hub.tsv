@@ -1,0 +1,540 @@
+# consulta	IDs esperados	título (gerado por `wiki relevance`)
+Afonso de Aragão	243	Afonso de Aragão
+Afeganistão	253	Afeganistão
+Argentina	255	Argentina
+Angola	265	Angola
+Afonso	283	Afonso
+Andrónico	284	Andrónico
+Albânia	304	Albânia
+Alemanha	305	Alemanha
+Austrália	309	Austrália
+Arte	310	Arte
+América	341	América
+Aveiro	365	Aveiro
+Açores	385	Açores
+Brasil	404	Brasil
+Biologia	434	Biologia
+Bahia	453	Bahia
+Bélgica	456	Bélgica
+Beja	473	Beja
+Computação	495	Computação
+Canadá	497	Canadá
+Calendário	504	Calendário
+China	522	China
+Cabo Verde	537	Cabo Verde
+Ciência	554	Ciência
+Ceará	558	Ceará
+Célula	596	Célula
+Coimbra	628	Coimbra
+Cabo	630	Cabo
+Condeixa-a-Nova	634	Condeixa-a-Nova
+Direito	672	Direito
+Deus	674	Deus
+Economia	742	Economia
+Engenharia	744	Engenharia
+Europa	772	Europa
+Espanha	785	Espanha
+Euro	792	Euro
+Física	826	Física
+França	827	França
+Figueira da Foz	879	Figueira da Foz
+Geografia	896	Geografia
+Gavião	905	Gavião
+Grécia	919	Grécia
+Guiné-Bissau	939	Guiné-Bissau
+Graciosa	942	Graciosa
+História	958	História
+Hertz	1002	Hertz
+Igreja	1007	Igreja
+Internet	1008	Internet
+Inglaterra	1023	Inglaterra
+Irlanda	1035	Irlanda
+Itália	1039	Itália
+Janeiro	1091	Janeiro
+Japão	1094	Japão
+Jesus	1099	Jesus
+Literatura	1124	Literatura
+Lógica	1169	Lógica
+Matemática	1210	Matemática
+Música	1211	Música
+Maranhão	1254	Maranhão
+Mato Grosso	1255	Mato Grosso
+Minas Gerais	1257	Minas Gerais
+Massa	1258	Massa
+Mitologia	1265	Mitologia
+México	1274	México
+Maria	1282	Maria
+Medicina	1287	Medicina
+Modelo	1290	Modelo
+Mogadouro	1303	Mogadouro
+Montemor-o-Velho	1304	Montemor-o-Velho
+Movimento	1310	Movimento
+Nova Zelândia	1332	Nova Zelândia
+Noruega	1354	Noruega
+OS/2	1376	OS/2
+Organização	1405	Organização
+Planeta	1410	Planeta
+Política	1428	Política
+Psicologia	1477	Psicologia
+Portugal	1480	Portugal
+Paraná	1483	Paraná
+Paraíba	1517	Paraíba
+Pernambuco	1518	Pernambuco
+Peru	1551	Peru
+Papa	1560	Papa
+Polónia	1583	Polónia
+Penela	1584	Penela
+Química	1594	Química
+Religião	1628	Religião
+Rede	1631	Rede
+Rio Grande do Norte	1657	Rio Grande do Norte
+Reino Unido	1661	Reino Unido
+República	1664	República
+Rússia	1669	Rússia
+Santa Catarina	1705	Santa Catarina
+Software	1709	Software
+São Tomé e Príncipe	1730	São Tomé e Príncipe
+Santo	1747	Santo
+Som	1759	Som
+Terra	1800	Terra
+Uruguai	1873	Uruguai
+Unix	1875	Unix
+União Europeia	1886	União Europeia
+Venezuela	1910	Venezuela
+Viena	1916	Viena
+Xadrez	1949	Xadrez
+Áustria	1979	Áustria
+Índia	1983	Índia
+Águeda	2008	Águeda
+Fafe	2608	Fafe
+Colômbia	2632	Colômbia
+Alfabeto	2658	Alfabeto
+Comunidade	3086	Comunidade
+Web	3153	Web
+Países Baixos	3374	Países Baixos
+Processo	3504	Processo
+Teoria	3508	Teoria
+Budismo	3528	Budismo
+Pinhel	3692	Pinhel
+Sabugal	3693	Sabugal
+Peso da Régua	3746	Peso da Régua
+Alentejo	3792	Alentejo
+Luxemburgo	3831	Luxemburgo
+Suíça	3832	Suíça
+Mónaco	3833	Mónaco
+Dinamarca	3843	Dinamarca
+Malta	3849	Malta
+Islândia	3852	Islândia
+Suécia	3853	Suécia
+Hungria	3859	Hungria
+Bósnia e Herzegovina	3860	Bósnia e Herzegovina
+Bulgária	3862	Bulgária
+Turquia	3864	Turquia
+Letónia	3874	Letónia
+Iraque	3878	Iraque
+Coreia do Norte	3899	Coreia do Norte
+Mongólia	3902	Mongólia
+Arábia Saudita	3916	Arábia Saudita
+Coreia do Sul	3928	Coreia do Sul
+Estónia	3951	Estónia
+Bahamas	3953	Bahamas
+Camboja	3955	Camboja
+Etiópia	3965	Etiópia
+Jamaica	4008	Jamaica
+Guatemala	4010	Guatemala
+Indonésia	4018	Indonésia
+República do Congo	4508	República do Congo
+Nigéria	4511	Nigéria
+El Salvador	4567	El Salvador
+Burquina Fasso	4659	Burquina Fasso
+Gabão	4667	Gabão
+Guiné	4707	Guiné
+Candomblé	4709	Candomblé
+África do Sul	4713	África do Sul
+Equador	4736	Equador
+Panamá	4737	Panamá
+Costa Rica	4739	Costa Rica
+Guiana	4767	Guiana
+Paraguai	4769	Paraguai
+Bolívia	4770	Bolívia
+Chile	4771	Chile
+Constituição	4821	Constituição
+Antígua e Barbuda	4822	Antígua e Barbuda
+Escócia	4842	Escócia
+Abrantes	4854	Abrantes
+Aguiar	4881	Aguiar
+Congo	4882	Congo
+Trofa	4946	Trofa
+Exu	4964	Exu
+Flores	4969	Flores
+Aguiar da Beira	4976	Aguiar da Beira
+São João	4993	São João
+Coruche	4997	Coruche
+Alandroal	5026	Alandroal
+África	5033	África
+Albergaria-a-Velha	5106	Albergaria-a-Velha
+Albufeira	5117	Albufeira
+Baião	5125	Baião
+Alcácer do Sal	5136	Alcácer do Sal
+Alcanena	5147	Alcanena
+Alcobaça	5165	Alcobaça
+Moita	5193	Moita
+São Francisco	5206	São Francisco
+Alcoutim	5208	Alcoutim
+Pereiro	5214	Pereiro
+Alenquer	5221	Alenquer
+Alfândega da Fé	5250	Alfândega da Fé
+Valverde	5251	Valverde
+Fé	5275	Fé
+Gouveia	5280	Gouveia
+Arquitetura	5310	Arquitetura
+São Julião	5312	São Julião
+Água	5313	Água
+Guerra	5327	Guerra
+Pombal	5333	Pombal
+Alijó	5356	Alijó
+Vila Chã	5357	Vila Chã
+Arcozelo	5383	Arcozelo
+Pico	5384	Pico
+Gondomar	5493	Gondomar
+Oleiros	5510	Oleiros
+Madeirã	5518	Madeirã
+Sobral	5525	Sobral
+Rio de Moinhos	5538	Rio de Moinhos
+Almada	5551	Almada
+Almeida	5566	Almeida
+Parada	5567	Parada
+Almodôvar	5626	Almodôvar
+Santa Cruz	5635	Santa Cruz
+Alter do Chão	5642	Alter do Chão
+Alvito	5687	Alvito
+Ferro	5699	Ferro
+Ouro	5752	Ouro
+Amadora	5756	Amadora
+Lomba	5777	Lomba
+Ansiães	5780	Ansiães
+Madalena	5808	Madalena
+Real	5809	Real
+Lousada	5851	Lousada
+Amares	5854	Amares
+Dornelas	5855	Dornelas
+Rendufe	5878	Rendufe
+Santa Luzia	5949	Santa Luzia
+Estrela	5958	Estrela
+Arcos de Valdevez	5994	Arcos de Valdevez
+Portela	5996	Portela
+São Paio	5999	São Paio
+Souto	6000	Souto
+Vilela	6001	Vilela
+Miranda	6024	Miranda
+Paçô	6027	Paçô
+Arganil	6059	Arganil
+Teixeira	6079	Teixeira
+Vênus	6082	Vênus
+Armamar	6110	Armamar
+Arouca	6142	Arouca
+Arraiolos	6167	Arraiolos
+Vimieiro	6168	Vimieiro
+Santiago	6180	Santiago
+Arronches	6194	Arronches
+Avis	6222	Avis
+Azambuja	6223	Azambuja
+Glória	6247	Glória
+Mafra	6313	Mafra
+Rosário	6363	Rosário
+Valongo	6474	Valongo
+Bombarral	6477	Bombarral
+Carvalhal	6478	Carvalhal
+Boticas	6479	Boticas
+Covelas	6481	Covelas
+Barcelos	6487	Barcelos
+Moure	6488	Moure
+Vila Seca	6490	Vila Seca
+João	6491	João
+Arcos	6492	Arcos
+Figueiredo	6494	Figueiredo
+Belmonte	6497	Belmonte
+Barreiro	6502	Barreiro
+Mós	6507	Mós
+Campo	6518	Campo
+Areias	6552	Areias
+Igreja Nova	6593	Igreja Nova
+Vila Boa	6635	Vila Boa
+Niterói	6638	Niterói
+Trindade	6682	Trindade
+Alá	6700	Alá
+Oba	6727	Oba
+Matriz	6745	Matriz
+Aveleda	6776	Aveleda
+Nogueira	6797	Nogueira
+São Mamede de Este	6814	São Mamede de Este
+Sé (Bragança)	6889	Sé (Bragança)
+Barro	6914	Barro
+Louredo	6997	Louredo
+Travanca	6998	Travanca
+Espinho	7000	Espinho
+Não-metal	7070	Não-metal
+Santos	7266	Santos
+Informação	7324	Informação
+Análise	7346	Análise
+Reguengos de Monsaraz	7396	Reguengos de Monsaraz
+Tronco	7417	Tronco
+Outeiro	7487	Outeiro
+Passos	7488	Passos
+Celorico de Basto	7489	Celorico de Basto
+Castelo de Paiva	7492	Castelo de Paiva
+Eiras	7496	Eiras
+Caldas da Rainha	7520	Caldas da Rainha
+Cadaval	7525	Cadaval
+Lamas	7526	Lamas
+Vilar	7527	Vilar
+Calheta	7533	Calheta
+Castro Daire	7539	Castro Daire
+Cinfães	7540	Cinfães
+Bustelo	7541	Bustelo
+Fornelos	7542	Fornelos
+Bobadela	7546	Bobadela
+Paradela	7549	Paradela
+Sanfins	7551	Sanfins
+Santa Leocádia	7552	Santa Leocádia
+Soutelo	7553	Soutelo
+Caminha	7559	Caminha
+Cristelo	7560	Cristelo
+Gondar	7561	Gondar
+Celorico da Beira	7562	Celorico da Beira
+Mesquitela	7563	Mesquitela
+Castelo Branco	7565	Castelo Branco
+Covilhã	7566	Covilhã
+Sarzedo	7567	Sarzedo
+Cartaxo	7569	Cartaxo
+Carrazeda de Ansiães	7584	Carrazeda de Ansiães
+Castro Verde	7591	Castro Verde
+Castro Marim	7595	Castro Marim
+2004	7634	2004
+Guimarães	7682	Guimarães
+Universidade de São Paulo	7687	Universidade de São Paulo
+Museu de Arte Contemporânea	7704	Museu de Arte Contemporânea
+População	7706	População
+Azevedo	7772	Azevedo
+Moledo	7787	Moledo
+São Paulo	7847	São Paulo
+Alva	7921	Alva
+Coreia	7922	Coreia
+Linhares	7993	Linhares
+Templo	8053	Templo
+Sistema	8088	Sistema
+Sé Nova	8132	Sé Nova
+Bispo	8164	Bispo
+Freguesia	8230	Freguesia
+Lapa	8267	Lapa
+Mata	8336	Mata
+A Portuguesa	8371	A Portuguesa
+Conceição	8651	Conceição
+Peso	8853	Peso
+Bretanha	8969	Bretanha
+Cidade	8997	Cidade
+Miranda do Douro	9027	Miranda do Douro
+Flor	9057	Flor
+Vi	9355	Vi
+Fortaleza	9393	Fortaleza
+Paredes	9421	Paredes
+Duas Igrejas	9423	Duas Igrejas
+Lordelo	9424	Lordelo
+Constelação	9501	Constelação
+Oceano	9539	Oceano
+Dados	9572	Dados
+Cultura	9924	Cultura
+Universidade	9927	Universidade
+Espírito Santo	9944	Espírito Santo
+Elvas	9980	Elvas
+Santa Eulália	9982	Santa Eulália
+Canelas	9986	Canelas
+Esposende	9988	Esposende
+Gandra	9989	Gandra
+Estremoz	9990	Estremoz
+Évora	9991	Évora
+Antas	10033	Antas
+Mar	10153	Mar
+Estado Novo	10323	Estado Novo
+Jurema	10395	Jurema
+Culinária	10433	Culinária
+Aboim	10459	Aboim
+Vila Cova	10461	Vila Cova
+Felgueiras	10470	Felgueiras
+Ferreira do Zêzere	10474	Ferreira do Zêzere
+Figueira de Castelo Rodrigo	10478	Figueira de Castelo Rodrigo
+Século	10481	Século
+Freixo de Espada à Cinta	10498	Freixo de Espada à Cinta
+Santa Maria Maior	10505	Santa Maria Maior
+Silvares	10512	Silvares
+Monte	10539	Monte
+Lagares	10611	Lagares
+Penacova	10629	Penacova
+Sousa	10647	Sousa
+Santana	10753	Santana
+Castelo Rodrigo	10759	Castelo Rodrigo
+Algodres	10767	Algodres
+Montalegre	11116	Montalegre
+Seridó	11237	Seridó
+Década	11347	Década
+Fevereiro	11353	Fevereiro
+Ministro	11542	Ministro
+Governo	11550	Governo
+Zêzere	11822	Zêzere
+Agosto	11915	Agosto
+Março	11917	Março
+Abril	11918	Abril
+Maio	11919	Maio
+Junho	11920	Junho
+Julho	11921	Julho
+Setembro	11922	Setembro
+Outubro	11923	Outubro
+Novembro	11924	Novembro
+Dezembro	11925	Dezembro
+Loures	12107	Loures
+Santa Sé	12141	Santa Sé
+Demografia	12280	Demografia
+Colmeal	12413	Colmeal
+Góis	12414	Góis
+Atalaia	12809	Atalaia
+Alvares	12811	Alvares
+Castanheira	12852	Castanheira
+Trinta	12887	Trinta
+Ribeira de Pena	12923	Ribeira de Pena
+Ribeirinha	12950	Ribeirinha
+Horta	12953	Horta
+Idanha-a-Nova	12979	Idanha-a-Nova
+Gás	13043	Gás
+País	13182	País
+Thomas More	13245	Thomas More
+Rock	13261	Rock
+Lajes das Flores	13276	Lajes das Flores
+Lajes do Pico	13277	Lajes do Pico
+Sande	13278	Sande
+Oliveira do Hospital	13292	Oliveira do Hospital
+Maceira	13294	Maceira
+Leiria	13297	Leiria
+Escola	13306	Escola
+Linguagem de programação	13352	Linguagem de programação
+Memória	13360	Memória
+Livro	13432	Livro
+Organismo	13447	Organismo
+Alimentação	13448	Alimentação
+Imagem	13484	Imagem
+Póvoa de Varzim	13602	Póvoa de Varzim
+Lajes	13722	Lajes
+Partido Socialista	13845	Partido Socialista
+Tobago	14029	Tobago
+Fundão	14055	Fundão
+Nevogilde	14135	Nevogilde
+Vitória	14137	Vitória
+B	14188	B
+C	14191	C
+D	14192	D
+I	14195	I
+J	14199	J
+V	14212	V
+Tratado	14219	Tratado
+Tempo	14228	Tempo
+Quatro	14321	Quatro
+Cinco	14323	Cinco
+Vinte	14356	Vinte
+Loulé	14492	Loulé
+Lourinhã	14504	Lourinhã
+Vilarinho	14507	Vilarinho
+Covas	14510	Covas
+Pias	14511	Pias
+Ribeiras	14567	Ribeiras
+Branco	14634	Branco
+Rio	14668	Rio
+Casa	14731	Casa
+Província	14810	Província
+Cortes	15284	Cortes
+Graça	15409	Graça
+Lago	15469	Lago
+Azul	15511	Azul
+Macedo de Cavaleiros	15513	Macedo de Cavaleiros
+Museu	15537	Museu
+Leão	15749	Leão
+São Nicolau	15819	São Nicolau
+São Clemente	15953	São Clemente
+Ovar	16003	Ovar
+Mação	16141	Mação
+Vilar do Monte	16163	Vilar do Monte
+Penamacor	16304	Penamacor
+Oliveira de Azeméis	16305	Oliveira de Azeméis
+Chave	16328	Chave
+Maia	16342	Maia
+Ácido	16367	Ácido
+Mangualde	16370	Mangualde
+Manteigas	16396	Manteigas
+Torrão	16401	Torrão
+Marco de Canaveses	16402	Marco de Canaveses
+Beirã	16439	Beirã
+Pampilhosa	16464	Pampilhosa
+Fiães	16496	Fiães
+Mesão Frio	16534	Mesão Frio
+Miranda do Corvo	16550	Miranda do Corvo
+Sendim	16559	Sendim
+Silva	16560	Silva
+Pereira	16614	Pereira
+Mirandela	16615	Mirandela
+São Salvador	16656	São Salvador
+Bemposta	16670	Bemposta
+Moimenta da Beira	16712	Moimenta da Beira
+Cambeses	16743	Cambeses
+Moreira	16744	Moreira
+Sá	16745	Sá
+Cabril	16813	Cabril
+Mortágua	17005	Mortágua
+Póvoa	17018	Póvoa
+Moura	17019	Moura
+Mourão	17028	Mourão
+Nelas	17067	Nelas
+Nisa	17078	Nisa
+São Simão	17089	São Simão
+Óbidos	17126	Óbidos
+Odivelas	17238	Odivelas
+Caxias	17248	Caxias
+César	17270	César
+Oliveira de Frades	17304	Oliveira de Frades
+Panóias	17485	Panóias
+Ourique	17486	Ourique
+Ferreira	17516	Ferreira
+Pampilhosa da Serra	17573	Pampilhosa da Serra
+Coura	17617	Coura
+Infesta	17618	Infesta
+Resende	17648	Resende
+Castelões	17697	Castelões
+Penafiel	17702	Penafiel
+Museu de Arte de São Paulo	17765	Museu de Arte de São Paulo
+Aldeia do Bispo	17776	Aldeia do Bispo
+Penedono	17795	Penedono
+Peniche	17815	Peniche
+Poiares	17856	Poiares
+Vinhós	17857	Vinhós
+Valbom	17903	Valbom
+Ponta Delgada	17906	Ponta Delgada
+Roque	17959	Roque
+Santo António	17960	Santo António
+Ponte da Barca	18003	Ponte da Barca
+Vila	18053	Vila
+Meda	18066	Meda
+Sé (Portalegre)	18244	Sé (Portalegre)
+Amieira	18251	Amieira
+Bonfim	18273	Bonfim
+Porto de Mós	18290	Porto de Mós
+Póvoa de Lanhoso	18374	Póvoa de Lanhoso
+Lanhoso	18391	Lanhoso
+Vila Nova	18539	Vila Nova
+Praia da Vitória	18541	Praia da Vitória
+Redondo	18577	Redondo
+Monsaraz	18789	Monsaraz
+Canedo	18820	Canedo
+Rio Maior	18851	Rio Maior
+Sabrosa	18909	Sabrosa
+Jogo	18915	Jogo
+Lajeosa	19007	Lajeosa
+Santa Comba Dão	19066	Santa Comba Dão
+Santa Cruz da Graciosa	19096	Santa Cruz da Graciosa
+Santa Cruz das Flores	19104	Santa Cruz das Flores

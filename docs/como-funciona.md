@@ -37,8 +37,8 @@ disco.
 
 ```mermaid
 flowchart LR
-    T["Texto<br/>'O Coração do Brasil'"] --> P["1. Processamento<br/>text.rs<br/>tokenizar e normalizar"]
-    P -->|"coracao@1, brasil@3"| I["2. Índice<br/>engine.rs<br/>Trie + listas"]
+    T["Texto<br/>'O Coração do Brasil'"] --> P["1. Processamento<br/>analysis/<br/>tokenizar e normalizar"]
+    P -->|"coracao@1, brasil@3"| I["2. Índice<br/>engine/<br/>Trie + listas"]
     I -->|"node:*, post:*, pos:*, norm:*"| R[("3. RocksDB<br/>pasta no disco")]
     Q["Consulta<br/>'coração bras*'"] --> P2["mesma normalização"]
     P2 --> I
@@ -50,9 +50,9 @@ Três camadas, cada uma com uma responsabilidade:
 
 | Camada | Onde | Faz |
 |---|---|---|
-| Processamento de texto | `src/text.rs` | transforma texto livre em termos padronizados |
-| Índice | `src/engine.rs` | Trie, listas de documentos, busca, frases, ranking, autocompletar |
-| Armazenamento | RocksDB + `src/codec.rs` | grava tudo em disco de forma durável e compacta |
+| Processamento de texto | `src/analysis/` e `src/query/` | transforma texto livre em termos padronizados |
+| Índice | `src/engine/` | Trie, listas de documentos, busca, frases, ranking, autocompletar |
+| Armazenamento | RocksDB + `src/codec/` | grava tudo em disco de forma durável e compacta |
 
 ---
 
@@ -151,7 +151,7 @@ por ele relê e redecodifica os 6 MB do filtro. Foi o que derrubava a carga de
 quando a compactação gera o arquivo). Por isso o `Engine::open` usa filtros e
 índices **particionados**: blocos de 4 KB, mais um índice de topo pequeno
 fixado no cache. O teste `bloom_filters_larger_than_a_cache_shard_...`
-reproduz o problema em escala pequena, e `perf.py carga-longa` o vigia na
+reproduz o problema em escala pequena, e `perf.py long-load` o vigia na
 carga inteira.
 
 ### Três recursos que o projeto usa de forma especial
@@ -414,9 +414,9 @@ Visão geral do que acontece em `fire-flower index <banco> <pasta>`:
 
 ```mermaid
 sequenceDiagram
-    participant CLI as main.rs (index)
+    participant CLI as fire-flower (index)
     participant B as IndexBatch
-    participant T as text.rs
+    participant T as analysis
     participant DB as RocksDB
 
     CLI->>CLI: coleta arquivos, ignora ocultos e binários
@@ -480,16 +480,16 @@ A **mesma** função é usada na busca. Se as duas normalizações divergissem, 
 termos buscados nunca bateriam com os indexados.
 
 **Stopwords.** Depois de normalizar, a indexação descarta as palavras
-comuns dos idiomas do banco. As listas ficam em `src/stopwords/pt.txt` e
+comuns dos idiomas do banco. As listas ficam em `src/analysis/stopwords/pt.txt` e
 `en.txt` (baseadas no Snowball/NLTK), uma palavra por linha e embutidas no
-binário; `src/stopwords.rs` as normaliza num `FxHashSet`, consultado uma vez
+binário; `src/analysis/stopwords/mod.rs` as normaliza num `FxHashSet`, consultado uma vez
 por token.
 
-Os idiomas são escolhidos na criação (`Config::languages`, ou `--idiomas` na
+Os idiomas são escolhidos na criação (`Config::languages`, ou `--languages` na
 CLI; o padrão é português e inglês) e gravados em `meta:languages`. Abrir o
 banco depois usa o que está gravado; pedir outros idiomas é erro, porque
 índice e consulta precisam descartar as mesmas palavras. Para um idioma
-novo: um arquivo em `src/stopwords/` e uma variante em `Language`. Elas aparecem em quase todo documento, então só inchariam o
+novo: um arquivo em `src/analysis/stopwords/` e uma variante em `Language`. Elas aparecem em quase todo documento, então só inchariam o
 índice: na Wikipédia, "de" está em 99% dos artigos. Na busca, `parse_query`
 descarta as mesmas palavras quando exatas, senão `casa de papel` exigiria um
 termo que não existe e voltaria vazia. Como prefixo (`de*`) elas continuam
@@ -498,11 +498,11 @@ valendo. "são" e "era" ficam fora da lista de propósito: são também nomes
 
 **Stemming e flexões (opcionais).** Há dois jeitos de achar outras formas
 da palavra (`docs/plano-stemming.md`), e os dois usam os stemmers de
-`src/stem.rs`: o Snowball (`pt`: "correndo", "correu" e "corrida" viram
+`src/analysis/stem.rs`: o Snowball (`pt`: "correndo", "correu" e "corrida" viram
 `corr`) ou o de plural (`pt-plural`: "eleicoes" → "eleicao", "casas" →
 "casa", "mercadores" → "mercador", e nada mais).
 
-- **Flexões na consulta** (`Config::inflections`, `--flexoes`): o índice
+- **Flexões na consulta** (`Config::inflections`, `--inflections`): o índice
   guarda as palavras como estão. Quando uma palavra aparece pela primeira vez
   na Trie, o commit grava o nó dela em `stem:<radical>` (um conjunto de nós,
   unido pelo merge operator). Na busca, cada palavra exata vira um grupo
@@ -622,7 +622,7 @@ O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
 falhar, nada muda: nem o banco, nem os contadores.
 
-O `index-jsonl` faz commit a cada 10 mil documentos (`--lote`), e o `index`
+O `index-jsonl` faz commit a cada 10 mil documentos (`--batch`), e o `index`
 de arquivos, a cada 1.000: o lote guarda os termos de todos os documentos até
 o commit. Lotes maiores dividem o custo de percorrer a Trie por mais
 documentos: na Wikipédia inteira, a carga cai de 242 s (lote de 1.000) para
@@ -761,7 +761,7 @@ fica: `"azul e a casa"` vira `azul@0, casa@3`. Uma frase de um termo só
    documento 2, `azul` está em 2 e `casa` em 5: casa. No documento 1, `azul`
    está em 2 e `casa` em 1: não.
 
-Num banco criado sem posições (`--sem-posicoes`), uma frase dá erro de
+Num banco criado sem posições (`--no-positions`), uma frase dá erro de
 configuração em vez de um resultado errado.
 
 **Limitações:** a stopword só conta a distância (`"casa de papel"` também casa
@@ -891,7 +891,7 @@ flowchart LR
 
 ## 8. A CLI interativa
 
-`fire-flower tui <banco>` (código em `src/tui.rs`, interface feita com
+`fire-flower tui <banco>` (código em `src/bin/fire-flower/tui/`, interface feita com
 [ratatui](https://ratatui.rs)).
 
 ```text
@@ -955,16 +955,52 @@ Detalhes que mantêm a interface rápida:
 
 ## 9. Mapa do código
 
-| Arquivo | Peças principais |
-|---|---|
-| `src/lib.rs` | API pública: `Engine`, `Config`, `IndexBatch`, `Error`, `DocId` |
-| `src/text.rs` | `for_each_token` (tokens com posição), `tokenize`, `Analyzer` (termos com posições e tamanho), `parse_query` (termos, prefixos e frases), `normalize_term`, `strip_html` |
-| `src/stopwords.rs`, `src/stopwords/*.txt` | idiomas (`Language`) e listas de stopwords |
-| `src/codec.rs` | `TrieNode`, listas `post:` (`decode_postings`, `decode_docs`), posições `pos:` (`PositionsCursor`), blocos `norm:` (`NormBlock`), merge por documento (`merge_postings`, `merge_positions`), varint |
-| `src/engine.rs` | `Engine::open` (opções do RocksDB, formato), `batch`, `search`, `search_top`/`search_ranked`, `suggest`, `label`; `View` (leituras sobre snapshot, frases, BM25 e top-k); `NormCache` (tamanhos compartilhados); `IndexBatch` (`add_document`, `insert_term`, `node_mut`, `commit`); `merge_operator`, `intersect` |
-| `src/main.rs` | subcomandos `tui`, `index`, `search`, `suggest` |
-| `src/tui.rs` | a CLI interativa |
-| `tests/engine.rs` | testes de ponta a ponta: persistência, lotes descartados, concorrência… |
+Uma pasta por parte da busca, um arquivo por responsabilidade. Os testes
+unitários de cada módulo ficam no `tests.rs` da pasta.
+
+```text
+src/
+├── lib.rs              API pública: Engine, Config, IndexBatch, Error, DocId, Hit
+├── error.rs            Error e Result
+├── analysis/           texto → termos
+│   ├── tokenizer.rs    for_each_token (tokens com posição), tokenize, normalize_term
+│   ├── analyzer.rs     Analyzer: termos com posições, tamanho e tf no título
+│   ├── html.rs         strip_html
+│   ├── stem.rs         Stemmer (Snowball pt/en e pt-plural)
+│   └── stopwords/      Language, Stopwords e as listas pt.txt e en.txt
+├── query/              consulta → partes: parse_query, Clause, QueryTerm
+├── codec/              formatos gravados no RocksDB (v5)
+│   ├── trie_node.rs    node:  TrieNode
+│   ├── list.rs         cabeçalho e tabela de saltos comuns a post: e pos:
+│   ├── postings.rs     post:  decode_postings, decode_docs, PostingsCursor
+│   ├── positions.rs    pos:   PositionsCursor
+│   ├── norms.rs        norm:  NormBlock
+│   ├── node_set.rs     stem:  conjuntos de nós
+│   ├── merge.rs        merge por documento (merge_postings, merge_positions)
+│   └── varint.rs       varint e leitor de bytes
+├── engine/             índice e armazenamento
+│   ├── mod.rs          Engine: open, batch, search, search_top/search_ranked, suggest, label
+│   ├── config.rs       Config
+│   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, stem:, meta:)
+│   ├── meta.rs         formato, idiomas e stemming gravados; merge_operator
+│   ├── cache.rs        EpochCache: nós e blocos de tamanhos compartilhados entre buscas
+│   ├── view.rs         View: leituras sobre um snapshot
+│   ├── search.rs       busca sem ranking (documentos em ordem de ID)
+│   ├── conjunction.rs  o E entre listas: cursores que saltam blocos, intersect
+│   ├── prefix.rs       prefixos e autocompletar
+│   ├── phrase.rs       frases: conferência das posições
+│   ├── groups.rs       grupos de flexões na consulta
+│   ├── diagnostics.rs  medições para o harness de performance
+│   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
+│   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs)
+└── bin/fire-flower/    a CLI
+    ├── main.rs         subcomandos tui, index, index-jsonl, compact, search, suggest
+    ├── jsonl.rs        index-jsonl
+    └── tui/            busca interativa: estado (mod.rs), desenho, prévia
+tests/engine/           testes de ponta a ponta, um arquivo por tema
+examples/wiki/          harness de performance, um arquivo por subcomando
+benches/micro.rs        microbenchmarks (criterion)
+```
 
 API mínima:
 

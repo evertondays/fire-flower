@@ -15,11 +15,11 @@ use crate::engine::keys::{
     stem_key,
 };
 use crate::engine::meta::varint;
+use crate::engine::writer::documents::NewTerms;
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
 mod documents;
 pub(super) mod trie;
-
 
 pub(crate) struct WriterState {
     pub(super) next_node_id: u64,
@@ -79,6 +79,8 @@ pub(super) struct DocOp {
     pub(super) doc: DocId,
     /// Tamanhos (documento inteiro, título, extensão do título); `None` é remoção.
     pub(super) lens: Option<(u32, u32, u32)>,
+    /// Termos distintos do documento (0 numa remoção).
+    pub(super) terms: u32,
 }
 
 /// O que o lote juntou de um termo.
@@ -211,14 +213,16 @@ impl IndexBatch<'_> {
                 acc.positions.extend_from_slice(found);
             }
         };
+        let mut terms = 0u32;
         for (term, found) in analyzer.terms() {
             // Só aloca a `String` do termo na primeira vez que ele aparece no lote.
             match self.pending.get_mut(term) {
                 Some(acc) => record(acc, found),
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
+            terms += 1;
         }
-        self.ops.push(DocOp { doc: doc_id, lens: Some((len, title_len, analyzer.title_span())) });
+        self.ops.push(DocOp { doc: doc_id, lens: Some((len, title_len, analyzer.title_span())), terms });
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
@@ -234,7 +238,7 @@ impl IndexBatch<'_> {
             ));
         }
         self.push_op(doc_id)?;
-        self.ops.push(DocOp { doc: doc_id, lens: None });
+        self.ops.push(DocOp { doc: doc_id, lens: None, terms: 0 });
         Ok(())
     }
 
@@ -319,8 +323,7 @@ impl IndexBatch<'_> {
         let mut path = TriePath::default();
         let encode_started = Instant::now();
         // Termos novos de cada operação (só com `fwd:`): nós terminais.
-        let mut new_terms: Vec<Vec<u64>> =
-            if self.engine.edits { vec![Vec::new(); self.ops.len()] } else { Vec::new() };
+        let mut new_terms = NewTerms::new(&self.ops, self.engine.edits);
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
@@ -338,9 +341,9 @@ impl IndexBatch<'_> {
             if new_word && inflector.is_on() {
                 new_by_stem.entry(inflector.stem(&term)).or_default().push(id);
             }
-            if !new_terms.is_empty() {
+            if new_terms.is_on() {
                 for &op in &acc.ops {
-                    new_terms[op as usize].push(id);
+                    new_terms.push(op, id);
                 }
             }
             buf.clear();

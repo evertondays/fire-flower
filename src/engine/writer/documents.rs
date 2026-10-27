@@ -10,7 +10,7 @@ use crate::{DocId, Error, IndexBatch, IndexStats, Result, codec};
 use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock};
 use crate::engine::keys::{DOC, FWD, Key, META_MAYBE_EMPTY, NORM, POS, POST};
 use crate::engine::view::Source;
-use crate::engine::writer::CommitStats;
+use crate::engine::writer::{CommitStats, DocOp};
 
 /// Os blocos de `norm:` que o lote toca, como estavam no banco.
 pub(super) type Norms = BTreeMap<u64, NormBlock>;
@@ -19,6 +19,51 @@ pub(super) type Norms = BTreeMap<u64, NormBlock>;
 pub(super) struct OldTerms {
     terms: FxHashMap<DocId, Vec<u64>>,
     pub(super) reads: u64,
+}
+
+/// Os nós dos termos novos de cada operação do lote, num buffer só: a
+/// operação `i` ocupa `nodes[start[i]..end[i]]`. Um `Vec` por documento
+/// custava uma alocação por documento e realocações a cada termo, no laço
+/// mais quente do commit.
+pub(super) struct NewTerms {
+    nodes: Vec<u64>,
+    start: Vec<usize>,
+    end: Vec<usize>,
+}
+
+impl NewTerms {
+    /// `on`: o banco grava `fwd:` (senão nada é guardado).
+    pub(super) fn new(ops: &[DocOp], on: bool) -> Self {
+        if !on {
+            return Self { nodes: Vec::new(), start: Vec::new(), end: Vec::new() };
+        }
+        let mut start = Vec::with_capacity(ops.len());
+        let mut total = 0usize;
+        for op in ops {
+            start.push(total);
+            total += op.terms as usize;
+        }
+        Self { nodes: vec![0; total], end: start.clone(), start }
+    }
+
+    pub(super) fn is_on(&self) -> bool {
+        !self.start.is_empty()
+    }
+
+    /// Mais um termo da operação `op` (cada termo do documento entra uma vez).
+    #[inline]
+    pub(super) fn push(&mut self, op: u32, node: u64) {
+        let at = &mut self.end[op as usize];
+        self.nodes[*at] = node;
+        *at += 1;
+    }
+
+    /// Os nós da operação `op`, em ordem.
+    fn sorted(&mut self, op: usize) -> &[u64] {
+        let terms = &mut self.nodes[self.start[op]..self.end[op]];
+        terms.sort_unstable();
+        terms
+    }
 }
 
 /// O documento está no bloco de `norm:` (já foi indexado e não removido).
@@ -91,7 +136,7 @@ impl IndexBatch<'_> {
         wb: &mut WriteBatch,
         finals: &[usize],
         old: &OldTerms,
-        new_terms: &mut [Vec<u64>],
+        new_terms: &mut NewTerms,
         stats: &mut CommitStats,
     ) -> Result<Vec<u64>> {
         if !self.engine.edits {
@@ -101,8 +146,7 @@ impl IndexBatch<'_> {
         let mut gone: FxHashMap<u64, Vec<DocId>> = FxHashMap::default();
         for &i in finals {
             let op = self.ops[i];
-            let terms = &mut new_terms[i];
-            terms.sort_unstable();
+            let terms = new_terms.sorted(i);
             if op.lens.is_some() {
                 wb.put(Key::new(FWD, op.doc), codec::encode_node_set(terms));
             }

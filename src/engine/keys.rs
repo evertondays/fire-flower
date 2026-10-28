@@ -5,14 +5,20 @@ pub const ROOT_ID: u64 = 0;
 /// Nome do merge operator, gravado pelo RocksDB no `OPTIONS` de cada abertura.
 /// Muda com o formato: é por ele que um banco antigo é reconhecido antes de
 /// ser aberto para escrita.
-pub(super) const MERGE_OPERATOR: &str = "fire_flower_v5";
+pub(super) const MERGE_OPERATOR: &str = "fire_flower_v6";
 
 pub(super) const META_FORMAT: &[u8] = b"meta:format";
 
 /// `1` se o banco grava posições (`pos:`), `0` se não.
 pub(super) const META_POSITIONS: &[u8] = b"meta:positions";
 
+/// `1` se o banco grava os termos de cada documento (`fwd:`), `0` se não.
+pub(super) const META_EDITS: &[u8] = b"meta:edits";
+
 pub(super) const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
+
+/// Nós que receberam lápide desde a última limpeza (ver `MaybeEmpty`), unidos pelo merge.
+pub(super) const META_MAYBE_EMPTY: &[u8] = b"meta:maybe_empty";
 
 pub(super) const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
 
@@ -42,6 +48,9 @@ pub(super) const POS: &[u8] = b"pos:";
 pub(super) const NORM: &[u8] = b"norm:";
 
 pub(super) const DOC: &[u8] = b"doc:";
+
+/// `fwd:<doc>`: os nós terminais dos termos do documento, para editar e remover.
+pub(super) const FWD: &[u8] = b"fwd:";
 
 /// Chave `<prefixo><número>` montada na pilha: o laço do commit monta uma
 /// por termo, e `format!` alocaria uma `String` a cada vez.

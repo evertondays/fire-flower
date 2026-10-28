@@ -81,7 +81,7 @@ impl IndexBatch<'_> {
     }
 
     /// Nó do cache, lendo do banco na primeira vez.
-    fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
+    pub(super) fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
         let generation = self.generation;
         match self.nodes.entry(id) {
             Entry::Occupied(e) => {

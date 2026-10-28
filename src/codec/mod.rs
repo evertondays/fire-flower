@@ -1,4 +1,4 @@
-//! Serialização compacta dos valores gravados no RocksDB (formato v5).
+//! Serialização compacta dos valores gravados no RocksDB (formato v6).
 //!
 //! Inteiros usam varint (LEB128): números pequenos ocupam 1–2 bytes em vez de
 //! 8. Listas são ordenadas por documento e gravam a diferença (delta) entre IDs
@@ -24,6 +24,11 @@
 //! tinham tamanho fixo e o merge recalculava a tabela a cada leitura de uma
 //! lista com pedaços pendentes (termo frequente antes de compactar: +43%).
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
+//!
+//! **Lápides (v6):** o segundo número de `post:` e `pos:` é `s << 1 | tem
+//! lápide`. Uma lápide é uma entrada com `tf << 1 | tem título = 0` (`post:`)
+//! ou `k = 0` (`pos:`): "este documento saiu deste termo". Só operandos de
+//! merge têm lápides; o merge completo as descarta (ver `merge.rs`).
 
 mod list;
 mod merge;
@@ -37,10 +42,12 @@ mod varint;
 mod tests;
 
 pub use self::list::{SKIP_BLOCK, list_len};
-pub use self::merge::{merge_positions, merge_postings};
+pub use self::merge::{ListKind, encode_tombstones_into, merge_lists, merge_positions, merge_postings};
 pub use self::node_set::{decode_node_set, encode_node_set, merge_node_sets};
 pub use self::norms::{DocLens, NORM_BLOCK_DOCS, NormBlock};
 pub use self::positions::{PositionsCursor, decode_positions, encode_positions_into};
-pub use self::postings::{PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into};
+pub use self::postings::{
+    PostingEntry, PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into,
+};
 pub use self::trie_node::TrieNode;
 pub use self::varint::{get_varint, put_varint};

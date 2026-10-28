@@ -109,7 +109,7 @@ pub(crate) fn database_from_before_stemming_is_off() {
     // Um banco com dados e sem `meta:stemming` é de antes do stemming.
     {
         let mut opts = rocksdb::Options::default();
-        opts.set_merge_operator_associative("fire_flower_v5", |_, _, _| None);
+        opts.set_merge_operator_associative("fire_flower_v6", |_, _, _| None);
         let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
         assert_eq!(db.get(b"meta:stemming").unwrap().as_deref(), Some(&b"none"[..]));
         db.delete(b"meta:stemming").unwrap();

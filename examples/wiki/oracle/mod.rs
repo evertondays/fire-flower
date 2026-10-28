@@ -11,7 +11,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::json;
 
 use crate::AnyResult;
-use crate::corpus::{Corpus, stem};
+use crate::corpus::{Corpus, Doc, stem};
+use crate::edits::{EditPlanArgs, final_docs};
 use crate::env::save_result;
 use crate::rng::Rng;
 use self::check::Check;
@@ -33,7 +34,21 @@ pub(crate) struct OracleArgs {
     pub(crate) phrases: usize,
     pub(crate) rank_queries: usize,
     pub(crate) seed: u64,
+    /// Compara com o estado depois do plano de edições (o banco já passou por `wiki edit`).
+    pub(crate) edits: Option<EditPlanArgs>,
     pub(crate) label: Option<String>,
+}
+
+/// Os documentos que o oráculo indexa: a fatia do corpus ou, com `--edits`,
+/// o estado final dela depois do plano.
+fn documents(args: &OracleArgs) -> AnyResult<Box<dyn Iterator<Item = AnyResult<Doc>>>> {
+    Ok(match &args.edits {
+        Some(plan) => {
+            let take = args.take.ok_or("--edits precisa de --take (o tamanho da fatia carregada)")?;
+            Box::new(final_docs(&args.corpus, take, plan)?.into_iter().map(Ok))
+        }
+        None => Box::new(Corpus::open(&args.corpus, 0, args.take, args.remap_ids)?),
+    })
 }
 
 
@@ -88,7 +103,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     let mut phrase_docs: Vec<Vec<String>> = Vec::new();
     let mut titles: Vec<(DocId, String)> = Vec::new();
     let (mut docs, mut repeated) = (0usize, 0usize);
-    for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
+    for doc in documents(&args)? {
         let doc = doc?;
         docs += 1;
         let (positioned, n_title) = doc_tokens(&doc.title, &doc.text);
@@ -267,7 +282,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
                 }
             }
         }
-        for doc in Corpus::open(&args.corpus, 0, args.take, args.remap_ids)? {
+        for doc in documents(&args)? {
             let doc = doc?;
             let mut found: HashMap<String, Vec<u32>> = HashMap::default();
             let (tokens, _) = doc_tokens(&doc.title, &doc.text);
@@ -549,6 +564,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
         "oracle",
         &label,
         json!({ "db": args.db, "corpus": args.corpus, "take": args.take, "remap_ids": args.remap_ids,
+                "edits": args.edits.map(|e| format!("{e:?}")),
                 "docs": docs, "oracle_terms": vocab.len(), "divergences": total, "positions": has_positions,
                 "stemming": stemmer.stemming().code(),
                 "inflections": engine.inflector().stemming().code(),

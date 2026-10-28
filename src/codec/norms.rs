@@ -124,6 +124,20 @@ impl NormBlock {
         old
     }
 
+    /// Tira o documento do bloco e devolve os tamanhos dele, se estava lá.
+    /// O bloco denso perde as posições vazias do fim, para continuar igual ao
+    /// que a decodificação monta.
+    pub fn remove(&mut self, offset: u16) -> Option<DocLens> {
+        let old = self.get_lens(offset)?;
+        self.lens[usize::from(offset)] = ABSENT;
+        self.count -= 1;
+        while self.lens.last() == Some(&ABSENT) {
+            self.lens.pop();
+            self.titles.pop();
+        }
+        Some(old)
+    }
+
     pub fn len(&self) -> usize {
         self.count
     }

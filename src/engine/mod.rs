@@ -1,6 +1,6 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v5; a codificação está em `src/codec/`):
+//! Espaços de chave (formato v6; a codificação está em `src/codec/`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
 //! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
 //! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
@@ -17,18 +17,19 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options};
 use rustc_hash::FxHashMap;
 
-use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
+use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits, codec};
 use crate::analysis::{Analyzer, normalize_term};
 use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::cache::EpochCache;
+use crate::engine::empty_words::MaybeEmpty;
 use crate::engine::keys::{
-    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
+    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_MAYBE_EMPTY, META_NEXT_DOC, META_NEXT_NODE,
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::meta::{
-    merge_operator, previous_merge_operator, read_counter, resolve_format, resolve_languages,
+    Features, full_merge, partial_merge, previous_merge_operator, read_counter, resolve_format, resolve_languages,
     resolve_stemming, stored_format_error,
 };
 use crate::engine::view::View;
@@ -39,6 +40,8 @@ mod cache;
 mod config;
 mod conjunction;
 mod diagnostics;
+mod empty_words;
+mod maintenance;
 mod groups;
 mod keys;
 mod meta;
@@ -53,6 +56,7 @@ mod tests;
 
 
 pub use self::config::{Config, InflectionMode};
+pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
 pub use self::view::reads_on_this_thread;
@@ -71,11 +75,17 @@ pub struct Engine {
     inflector: Stemmer,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
+    /// O banco grava os termos de cada documento (`meta:edits`, `fwd:`).
+    edits: bool,
     /// Número do último commit gravado (ver [`EpochCache`]).
     epoch: AtomicU64,
     norms: EpochCache<NormBlock>,
     /// Nós rasos da Trie (até `Config::reader_cache_depth`).
     nodes: EpochCache<TrieNode>,
+    /// Palavras que podem ter ficado sem documento.
+    maybe_empty: MaybeEmpty,
+    /// Documentos substituídos ou removidos desde a última compactação.
+    pending_edits: AtomicU64,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -106,7 +116,7 @@ impl Engine {
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_merge_operator_associative(MERGE_OPERATOR, merge_operator);
+        opts.set_merge_operator(MERGE_OPERATOR, full_merge, partial_merge);
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
         if config.statistics {
@@ -133,7 +143,7 @@ impl Engine {
             // recuperação, porque o merge operator não entende o formato antigo.
             Err(e) => return Err(stored_format_error(path).unwrap_or(Error::Db(e))),
         };
-        let positions = resolve_format(&db, config.positions)?;
+        let Features { positions, edits } = resolve_format(&db, config.positions, config.edits)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
         let stats = IndexStats {
@@ -151,6 +161,10 @@ impl Engine {
                 inflector.stemming()
             )));
         }
+        let maybe_empty = MaybeEmpty::default();
+        if let Some(v) = db.get_pinned(META_MAYBE_EMPTY)? {
+            maybe_empty.add(codec::decode_node_set(&v)?);
+        }
         let writer = Mutex::new(WriterState {
             next_node_id,
             next_doc_id,
@@ -166,9 +180,12 @@ impl Engine {
             stemmer,
             inflector,
             positions,
+            edits,
             epoch: AtomicU64::new(0),
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
+            maybe_empty,
+            pending_edits: AtomicU64::new(0),
             opts,
         })
     }
@@ -191,7 +208,9 @@ impl Engine {
             cache_limit: self.config.writer_cache_nodes,
             dirty: Vec::new(),
             pending: FxHashMap::default(),
-            lengths: Vec::new(),
+            ops: Vec::new(),
+            last_op: FxHashMap::default(),
+            repeated: false,
             labels: Vec::new(),
             analyzer,
         }
@@ -202,6 +221,18 @@ impl Engine {
         let mut batch = self.batch();
         batch.add_document(doc_id, text)?;
         batch.commit()
+    }
+
+    /// Atalho para remover um único documento ([`IndexBatch::delete_document`]).
+    pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
+        let mut batch = self.batch();
+        batch.delete_document(doc_id)?;
+        batch.commit()
+    }
+
+    /// O documento está indexado (adicionado e não removido).
+    pub fn contains(&self, doc_id: DocId) -> Result<bool> {
+        Ok(self.doc_len(doc_id)?.is_some())
     }
 
     /// Busca full-text. Termos separados por espaço são combinados com E
@@ -270,7 +301,17 @@ impl Engine {
     /// Compacta o banco inteiro: une os pedaços pendentes das listas de
     /// postagem e descarta versões antigas. Num índice grande leva minutos.
     pub fn compact(&self) {
+        // As edições que chegarem durante a compactação podem ficar fora dela.
+        let before = self.pending_edits.load(AtomicOrdering::Acquire);
         self.db.compact_range::<&[u8], &[u8]>(None, None);
+        self.pending_edits.fetch_sub(before, AtomicOrdering::AcqRel);
+    }
+
+    /// Documentos substituídos ou removidos desde a última compactação (ou
+    /// desde o `open`): até a compactação, as listas deles têm pedaços que
+    /// toda leitura une de novo. Ver [`Maintenance`].
+    pub fn pending_edits(&self) -> u64 {
+        self.pending_edits.load(AtomicOrdering::Acquire)
     }
 
     /// Rótulo gravado com [`IndexBatch::add_labeled`] ou [`IndexBatch::set_label`].
@@ -279,6 +320,26 @@ impl Engine {
             .db
             .get_pinned(Key::new(DOC, doc_id))?
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    /// Percorre os rótulos de todos os documentos (`f(documento, rótulo)`),
+    /// em ordem de chave. Lê só as chaves `doc:`: serve para achar um
+    /// documento pelo rótulo (o `index --sync` da CLI acha assim os arquivos
+    /// já indexados).
+    pub fn for_each_label(&self, mut f: impl FnMut(DocId, &str)) -> Result<()> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_upper_bound(b"doc;".to_vec()); // ';' vem logo depois de ':'
+        let mode = rocksdb::IteratorMode::From(DOC, rocksdb::Direction::Forward);
+        for item in self.db.iterator_opt(mode, opts) {
+            let (key, value) = item?;
+            let doc = key
+                .strip_prefix(DOC)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .and_then(|d| d.parse().ok())
+                .ok_or_else(|| Error::Corrupt(format!("chave de rótulo inválida: {}", String::from_utf8_lossy(&key))))?;
+            f(doc, &String::from_utf8_lossy(&value));
+        }
+        Ok(())
     }
 
     /// Tamanho do documento (tokens indexados, sem stopwords), se ele existe.
@@ -296,6 +357,12 @@ impl Engine {
     /// O banco grava posições (busca por frase disponível).
     pub fn has_positions(&self) -> bool {
         self.positions
+    }
+
+    /// O banco grava os termos de cada documento: dá para substituir e
+    /// remover documentos ([`Config::edits`]).
+    pub fn has_edits(&self) -> bool {
+        self.edits
     }
 
     /// Uma busca faz várias leituras (um `Get` por caractere, mais as listas).

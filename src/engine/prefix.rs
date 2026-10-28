@@ -104,7 +104,7 @@ impl View<'_> {
                         w.push(ch);
                         next.push((w, child));
                     }
-                    if node.is_end_of_word {
+                    if node.is_end_of_word && !self.is_empty_word(*id)? {
                         out.push((word.clone(), *id));
                     }
                 }

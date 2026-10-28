@@ -7,20 +7,19 @@ use std::time::Instant;
 use rocksdb::WriteBatch;
 use rustc_hash::FxHashMap;
 
-use crate::{DocId, Engine, IndexStats, Result, codec};
+use crate::{DocId, Engine, Error, IndexStats, Result, codec};
 use crate::analysis::Analyzer;
-use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock};
 use crate::engine::reads_on_this_thread;
 use crate::engine::keys::{
-    DOC, Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_TOTAL_LEN, META_TOTAL_TITLE_LEN,
-    NODE, NORM, POS, POST, stem_key,
+    Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, POS, POST,
+    stem_key,
 };
 use crate::engine::meta::varint;
-use crate::engine::view::Source;
+use crate::engine::writer::documents::NewTerms;
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
+mod documents;
 pub(super) mod trie;
-
 
 pub(crate) struct WriterState {
     pub(super) next_node_id: u64,
@@ -64,62 +63,112 @@ pub struct IndexBatch<'a> {
     pub(super) dirty: Vec<u64>,
     /// Termo -> documentos deste lote que o contêm.
     pub(super) pending: FxHashMap<String, TermAcc>,
-    /// (documento, tamanho inteiro, tamanho do título, extensão do título),
-    /// na ordem em que foram adicionados.
-    pub(super) lengths: Vec<(DocId, u32, u32, u32)>,
+    /// Cada `add_*` e `delete_document`, na ordem em que foram chamados.
+    pub(super) ops: Vec<DocOp>,
+    /// Documento -> a última operação dele no lote (índice em `ops`): é a que vale.
+    pub(super) last_op: FxHashMap<DocId, u32>,
+    /// Algum documento apareceu em mais de uma operação do lote.
+    pub(super) repeated: bool,
     pub(super) labels: Vec<(DocId, String)>,
     pub(super) analyzer: Analyzer,
+}
+
+/// Uma operação do lote sobre um documento.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DocOp {
+    pub(super) doc: DocId,
+    /// Tamanhos (documento inteiro, título, extensão do título); `None` é remoção.
+    pub(super) lens: Option<(u32, u32, u32)>,
+    /// Termos distintos do documento (0 numa remoção).
+    pub(super) terms: u32,
 }
 
 /// O que o lote juntou de um termo.
 #[derive(Default)]
 pub(super) struct TermAcc {
-    /// (documento, tf, tf no título), na ordem em que os documentos foram adicionados.
-    docs: Vec<(DocId, u32, u32)>,
+    /// As entradas, na ordem em que os documentos foram adicionados.
+    docs: Vec<BatchEntry>,
     /// `tf` posições por entrada de `docs`, em sequência (vazio sem posições).
     positions: Vec<u32>,
 }
 
+/// Um documento na lista de um termo do lote. A operação vai junto na mesma
+/// entrada: num `Vec` à parte, era uma alocação a mais por termo distinto do
+/// lote, e a carga da Wikipédia ficava ~5% mais lenta.
+#[derive(Debug, Clone, Copy)]
+struct BatchEntry {
+    doc: DocId,
+    tf: u32,
+    title_tf: u32,
+    /// Índice em `IndexBatch::ops`.
+    op: u32,
+}
+
+impl codec::PostingEntry for BatchEntry {
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    #[inline]
+    fn tf(&self) -> u32 {
+        self.tf
+    }
+
+    #[inline]
+    fn title_tf(&self) -> u32 {
+        self.title_tf
+    }
+}
+
 impl TermAcc {
-    /// Ordena por documento. Para o mesmo documento adicionado duas vezes no
-    /// lote, a última vence (como entre lotes, no merge operator).
-    fn normalize(&mut self, positions: bool) {
-        if self.docs.windows(2).all(|w| w[0].0 < w[1].0) {
+    /// Ordena por documento. Se algum documento apareceu em mais de uma
+    /// operação do lote (`repeated`), fica só com as entradas da última
+    /// (`is_final`): reindexar duas vezes no mesmo lote vale o segundo texto
+    /// inteiro, e adicionar e remover não grava nada.
+    fn normalize(&mut self, positions: bool, repeated: bool, is_final: impl Fn(DocId, u32) -> bool) {
+        if !repeated && self.docs.windows(2).all(|w| w[0].doc < w[1].doc) {
             return; // o caso comum: IDs crescentes
         }
-        let mut entries: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(self.docs.len());
+        // (entrada, onde começam as posições dela)
+        let mut entries: Vec<(BatchEntry, usize)> = Vec::with_capacity(self.docs.len());
         let mut start = 0usize;
-        for &(doc, tf, title_tf) in &self.docs {
-            entries.push((doc, tf, title_tf, start));
-            start += tf as usize;
-        }
-        entries.sort_by_key(|e| e.0); // estável: a ordem de adição se mantém
-        let mut kept: Vec<(DocId, u32, u32, usize)> = Vec::with_capacity(entries.len());
-        for e in entries {
-            match kept.last_mut() {
-                Some(last) if last.0 == e.0 => *last = e,
-                _ => kept.push(e),
+        for &e in &self.docs {
+            if !repeated || is_final(e.doc, e.op) {
+                entries.push((e, start));
             }
+            start += e.tf as usize;
         }
+        // Sobra no máximo uma entrada por documento: a da operação que vale.
+        entries.sort_unstable_by_key(|e| e.0.doc);
         if positions {
             let mut sorted = Vec::with_capacity(self.positions.len());
-            for &(_, tf, _, start) in &kept {
-                sorted.extend_from_slice(&self.positions[start..start + tf as usize]);
+            for &(e, start) in &entries {
+                sorted.extend_from_slice(&self.positions[start..start + e.tf as usize]);
             }
             self.positions = sorted;
         }
-        self.docs = kept.into_iter().map(|(doc, tf, title_tf, _)| (doc, tf, title_tf)).collect();
+        self.docs = entries.into_iter().map(|(e, _)| e).collect();
     }
 }
 
 /// Onde um commit gastou o tempo ([`IndexBatch::commit_with_stats`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitStats {
+    /// Documentos adicionados ou substituídos.
     pub docs: usize,
+    /// Documentos que já existiam e foram substituídos.
+    pub replaced: usize,
+    /// Documentos removidos (os que existiam).
+    pub deleted: usize,
+    /// Pares (termo, documento) que saíram do índice: lápides gravadas.
+    pub tombstones: usize,
     /// Termos distintos do lote.
     pub terms: usize,
     /// Leituras no RocksDB durante a travessia (nós fora do cache do escritor).
     pub node_reads: u64,
+    /// Leituras de `fwd:` (os termos antigos dos documentos que já existiam).
+    pub fwd_reads: u64,
     /// Nós criados e nós regravados neste lote.
     pub new_nodes: usize,
     pub dirty_nodes: usize,
@@ -135,6 +184,8 @@ pub struct CommitStats {
     pub encode_secs: f64,
     /// Codificar os nós alterados, os blocos de `norm:` e os contadores.
     pub nodes_secs: f64,
+    /// Ler os blocos de `norm:` e os `fwd:` antigos, gravar os novos e as lápides.
+    pub documents_secs: f64,
     /// `db.write` do lote inteiro.
     pub write_secs: f64,
     /// Descarte do cache de nós.
@@ -143,9 +194,27 @@ pub struct CommitStats {
 }
 
 impl IndexBatch<'_> {
-    /// Indexa `text` sob um ID escolhido por você, sem título. Reindexar um
-    /// ID troca o tf, as posições e o tamanho dele (termos que saíram do
-    /// texto ficam).
+    /// Tira o fim de palavra do nó `id` (a limpeza de palavras vazias) e
+    /// devolve o nó codificado, para quem chama gravar.
+    pub(super) fn clear_end_of_word(&mut self, id: u64) -> Result<Vec<u8>> {
+        // A profundidade só importa para o descarte do cache; um nó que ainda
+        // não está nele entra como fundo.
+        let cached = self.node_mut(id, u8::MAX)?;
+        cached.node.is_end_of_word = false;
+        Ok(cached.node.encode())
+    }
+
+    /// Encerra o lote sem commit, mas devolve o cache de nós ao escritor:
+    /// quem chama já gravou as mudanças que fez nos nós (a limpeza de
+    /// palavras vazias), então o cache continua igual ao banco.
+    pub(super) fn keep_cache(mut self) {
+        debug_assert!(self.dirty.is_empty() && self.ops.is_empty());
+        self.state.cache = NodeCache { nodes: std::mem::take(&mut self.nodes), generation: self.generation };
+        self.state.analyzer = std::mem::take(&mut self.analyzer);
+    }
+
+    /// Indexa `text` sob um ID escolhido por você, sem título. Um ID que já
+    /// existe é substituído (ver [`IndexBatch::add_titled`]).
     pub fn add_document(&mut self, doc_id: DocId, text: &str) -> Result<()> {
         self.add_titled(doc_id, "", text)
     }
@@ -153,27 +222,59 @@ impl IndexBatch<'_> {
     /// Indexa um documento com título. As palavras do título são buscáveis
     /// como as do texto, e o ranking as conta à parte (`Posting::title_tf`),
     /// para pesar o título mais que o resto.
+    ///
+    /// Um ID que já existe é **substituído**: os termos que saíram do texto
+    /// deixam de achar o documento no mesmo commit. Num banco sem
+    /// [`crate::Config::edits`], só o tf, as posições e o tamanho são trocados.
+    /// No mesmo lote, a última operação de cada documento vence.
     pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
+        let op = self.push_op(doc_id)?;
         let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords, &self.engine.stemmer);
         let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
-            acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
+            acc.docs.push(BatchEntry { doc: doc_id, tf: found.len() as u32, title_tf: analyzer.title_tf(found), op });
             if positions {
                 acc.positions.extend_from_slice(found);
             }
         };
+        let mut terms = 0u32;
         for (term, found) in analyzer.terms() {
             // Só aloca a `String` do termo na primeira vez que ele aparece no lote.
             match self.pending.get_mut(term) {
                 Some(acc) => record(acc, found),
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
+            terms += 1;
         }
-        self.lengths.push((doc_id, len, title_len, analyzer.title_span()));
+        self.ops.push(DocOp { doc: doc_id, lens: Some((len, title_len, analyzer.title_span())), terms });
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
+    }
+
+    /// Remove o documento no commit: ele some de todos os termos, dos tamanhos,
+    /// das estatísticas e do rótulo. Um ID que não existe não faz nada.
+    /// Precisa de um banco com [`crate::Config::edits`].
+    pub fn delete_document(&mut self, doc_id: DocId) -> Result<()> {
+        if !self.engine.edits {
+            return Err(Error::Config(
+                "o banco foi criado sem edição de documentos (--no-edits); recarregue sem a opção para remover".into(),
+            ));
+        }
+        self.push_op(doc_id)?;
+        self.ops.push(DocOp { doc: doc_id, lens: None, terms: 0 });
+        Ok(())
+    }
+
+    /// Anota que `doc_id` tem mais uma operação no lote e devolve o índice dela.
+    fn push_op(&mut self, doc_id: DocId) -> Result<u32> {
+        let op = u32::try_from(self.ops.len())
+            .map_err(|_| Error::Config("lote com mais de 4 bilhões de operações: faça commit antes".into()))?;
+        if self.last_op.insert(doc_id, op).is_some() {
+            self.repeated = true;
+        }
+        Ok(op)
     }
 
     /// Indexa `text` com um ID novo e grava `label` (ex.: caminho do arquivo).
@@ -190,18 +291,21 @@ impl IndexBatch<'_> {
     }
 
     /// Grava (ou troca) o rótulo de um documento junto com o commit do lote.
+    /// Se a última operação do documento no lote for uma remoção, o rótulo
+    /// sai junto com ele.
     pub fn set_label(&mut self, doc_id: DocId, label: &str) {
         self.labels.push((doc_id, label.to_string()));
     }
 
-    /// Documentos adicionados desde o início do lote. Use para decidir quando
-    /// fazer commit: o lote guarda em memória os termos de todos eles.
+    /// Operações (documentos adicionados e removidos) desde o início do lote.
+    /// Use para decidir quando fazer commit: o lote guarda em memória os
+    /// termos de todos eles.
     pub fn len(&self) -> usize {
-        self.lengths.len()
+        self.ops.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lengths.is_empty()
+        self.ops.is_empty()
     }
 
     /// Grava o lote num único `WriteBatch` atômico.
@@ -213,34 +317,60 @@ impl IndexBatch<'_> {
     /// Usado pelo harness de performance para achar o gargalo da carga.
     pub fn commit_with_stats(mut self) -> Result<CommitStats> {
         let started = Instant::now();
-        let reads_before = reads_on_this_thread();
-        let mut stats = CommitStats { docs: self.lengths.len(), ..CommitStats::default() };
+        let mut stats = CommitStats::default();
         let positions = self.engine.positions;
+        // A última operação de cada documento é a que vale.
+        let finals: Vec<usize> = if self.repeated {
+            (0..self.ops.len()).filter(|&i| self.last_op[&self.ops[i].doc] as usize == i).collect()
+        } else {
+            (0..self.ops.len()).collect()
+        };
+        stats.docs = finals.iter().filter(|&&i| self.ops[i].lens.is_some()).count();
+        // Antes da Trie: quem já existia (pelos blocos de `norm:`) e, desses, os termos antigos.
+        let t = Instant::now();
+        let mut norms = self.read_norms(&finals)?;
+        let old_terms = self.read_old_terms(&finals, &norms)?;
+        stats.fwd_reads = old_terms.reads;
+        let mut documents_secs = t.elapsed();
+        let reads_before = reads_on_this_thread();
+
         // Termos em ordem: a criação de nós fica determinística (o mesmo
         // corpus com o mesmo tamanho de lote gera sempre os mesmos IDs).
+        let sort_started = Instant::now();
         let mut terms: Vec<(String, TermAcc)> = std::mem::take(&mut self.pending).into_iter().collect();
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         stats.terms = terms.len();
-        stats.sort_secs = started.elapsed().as_secs_f64();
+        stats.sort_secs = sort_started.elapsed().as_secs_f64();
 
         let mut wb = WriteBatch::default();
         let mut buf = Vec::new();
         let mut trie = std::time::Duration::ZERO;
         let mut path = TriePath::default();
         let encode_started = Instant::now();
+        // Termos novos de cada operação (só com `fwd:`): nós terminais.
+        let mut new_terms = NewTerms::new(&self.ops, self.engine.edits);
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
         let inflector = &self.engine.inflector;
         let mut new_by_stem: FxHashMap<String, Vec<u64>> = FxHashMap::default();
         for (term, mut acc) in terms {
+            let last_op = &self.last_op;
+            acc.normalize(positions, self.repeated, |doc, op| last_op[&doc] == op);
+            if acc.docs.is_empty() {
+                continue; // todos os documentos deste termo foram removidos ou reindexados no lote
+            }
             let t = Instant::now();
             let (id, new_word) = self.insert_term(&term, &mut path)?;
             trie += t.elapsed();
             if new_word && inflector.is_on() {
                 new_by_stem.entry(inflector.stem(&term)).or_default().push(id);
             }
-            acc.normalize(positions);
+            if new_terms.is_on() {
+                for e in &acc.docs {
+                    new_terms.push(e.op, id);
+                }
+            }
             buf.clear();
             codec::encode_postings_into(&mut buf, &acc.docs);
             wb.merge(Key::new(POST, id), &buf);
@@ -259,20 +389,23 @@ impl IndexBatch<'_> {
         stats.node_reads = reads_on_this_thread() - reads_before;
         stats.new_nodes = (self.next_node_id - self.state.next_node_id) as usize;
         stats.dirty_nodes = self.dirty.len();
+
+        let t = Instant::now();
+        let maybe_empty = self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats)?;
+        let (index, blocks) = self.write_lengths(&mut wb, &finals, &mut norms)?;
+        self.write_labels(&mut wb, &finals, &norms);
+        documents_secs += t.elapsed();
+        stats.documents_secs = documents_secs.as_secs_f64();
+
         let t = Instant::now();
         for id in &self.dirty {
             wb.put(Key::new(NODE, *id), self.nodes[id].node.encode());
         }
-        let (index, blocks) = self.write_lengths(&mut wb)?;
-        let stats_index = index;
-        for (doc_id, label) in &self.labels {
-            wb.put(Key::new(DOC, *doc_id), label.as_bytes());
-        }
         wb.put(META_NEXT_NODE, varint(self.next_node_id));
         wb.put(META_NEXT_DOC, varint(self.next_doc_id));
-        wb.put(META_DOC_COUNT, varint(stats_index.doc_count));
-        wb.put(META_TOTAL_LEN, varint(stats_index.total_len));
-        wb.put(META_TOTAL_TITLE_LEN, varint(stats_index.total_title_len));
+        wb.put(META_DOC_COUNT, varint(index.doc_count));
+        wb.put(META_TOTAL_LEN, varint(index.total_len));
+        wb.put(META_TOTAL_TITLE_LEN, varint(index.total_title_len));
         stats.nodes_secs = t.elapsed().as_secs_f64();
         stats.batch_bytes = wb.size_in_bytes();
 
@@ -280,6 +413,9 @@ impl IndexBatch<'_> {
         let engine = self.engine;
         let next = engine.epoch.load(AtomicOrdering::Acquire) + 1;
         engine.norms.mark(blocks, next);
+        if !maybe_empty.is_empty() {
+            engine.maybe_empty.add(maybe_empty);
+        }
         if let Some(max) = engine.config.reader_cache_depth {
             let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
             engine.nodes.mark(shallow, next);
@@ -288,6 +424,7 @@ impl IndexBatch<'_> {
         engine.db.write(wb)?;
         stats.write_secs = t.elapsed().as_secs_f64();
         engine.epoch.store(next, AtomicOrdering::Release);
+        engine.pending_edits.fetch_add((stats.replaced + stats.deleted) as u64, AtomicOrdering::AcqRel);
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
         for id in std::mem::take(&mut self.dirty) {
@@ -304,52 +441,8 @@ impl IndexBatch<'_> {
         self.state.analyzer = std::mem::take(&mut self.analyzer);
         self.state.next_node_id = self.next_node_id;
         self.state.next_doc_id = self.next_doc_id;
-        self.state.stats = stats_index;
+        self.state.stats = index;
         stats.total_secs = started.elapsed().as_secs_f64();
         Ok(stats)
-    }
-
-    /// Atualiza os blocos de `norm:` tocados pelo lote e as estatísticas.
-    /// Um documento que já existia troca de tamanho e não conta de novo.
-    /// Devolve as estatísticas novas e os blocos gravados.
-    fn write_lengths(&self, wb: &mut WriteBatch) -> Result<(IndexStats, Vec<u64>)> {
-        let mut stats = self.state.stats;
-        let mut order: Vec<(u64, usize)> =
-            self.lengths.iter().enumerate().map(|(i, &(doc, ..))| (doc / NORM_BLOCK_DOCS, i)).collect();
-        // Estável por bloco: dentro do bloco, a ordem de adição (a última vence).
-        if !order.windows(2).all(|w| w[0].0 <= w[1].0) {
-            order.sort_by_key(|e| e.0);
-        }
-        let mut blocks = Vec::new();
-        let mut i = 0;
-        while i < order.len() {
-            let block_id = order[i].0;
-            let mut block = match self.engine.db.get_bytes(Key::new(NORM, block_id).as_ref())? {
-                Some(v) => NormBlock::decode(&v)?,
-                None => NormBlock::default(),
-            };
-            while i < order.len() && order[i].0 == block_id {
-                let (doc, len, title_len, title_span) = self.lengths[order[i].1];
-                // Título com mais de 65.535 tokens: a contagem para no máximo.
-                let small = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
-                let (title_len, title_span) = (small(title_len), small(title_span));
-                match block.set((doc % NORM_BLOCK_DOCS) as u16, DocLens { len, title_len, title_span }) {
-                    Some(old) => {
-                        stats.total_len = (stats.total_len + u64::from(len)).saturating_sub(u64::from(old.len));
-                        stats.total_title_len =
-                            (stats.total_title_len + u64::from(title_len)).saturating_sub(u64::from(old.title_len));
-                    }
-                    None => {
-                        stats.doc_count += 1;
-                        stats.total_len += u64::from(len);
-                        stats.total_title_len += u64::from(title_len);
-                    }
-                }
-                i += 1;
-            }
-            wb.put(Key::new(NORM, block_id), block.encode());
-            blocks.push(block_id);
-        }
-        Ok((stats, blocks))
     }
 }

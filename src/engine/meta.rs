@@ -6,43 +6,63 @@ use std::path::Path;
 use rocksdb::{DB, MergeOperands, Options, WriteBatch};
 
 use crate::{Error, Result, codec};
+use crate::codec::ListKind;
 use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
-use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS, POST, STEM};
+use crate::engine::keys::{
+    META_EDITS, META_FORMAT, META_LANGUAGES, META_MAYBE_EMPTY, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS,
+    POST, STEM,
+};
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 5;
+pub const FORMAT_VERSION: u64 = 6;
 
-/// Confere a versão do formato e se o banco tem posições. Num banco novo,
-/// grava as duas coisas.
-pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<bool> {
+/// O que o banco grava, decidido na criação ([`resolve_format`]).
+pub(super) struct Features {
+    /// Posições de cada termo (`pos:`), para frases.
+    pub(super) positions: bool,
+    /// Termos de cada documento (`fwd:`), para editar e remover.
+    pub(super) edits: bool,
+}
+
+/// Confere a versão do formato e o que o banco grava (posições, `fwd:`).
+/// Num banco novo, grava as três coisas.
+pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>, wanted_edits: Option<bool>) -> Result<Features> {
     match read_counter(db, META_FORMAT)? {
-        Some(FORMAT_VERSION) => {
-            let stored = read_counter(db, META_POSITIONS)?
-                .ok_or_else(|| Error::Corrupt("meta:positions ausente".into()))?
-                != 0;
-            match wanted_positions {
-                Some(wanted) if wanted != stored => Err(Error::Config(format!(
-                    "o banco foi criado {} posições, mas a config pede {}",
-                    if stored { "com" } else { "sem" },
-                    if wanted { "com" } else { "sem" }
-                ))),
-                _ => Ok(stored),
-            }
-        }
+        Some(FORMAT_VERSION) => Ok(Features {
+            positions: stored_flag(db, META_POSITIONS, wanted_positions, "posições")?,
+            edits: stored_flag(db, META_EDITS, wanted_edits, "edição de documentos (fwd:)")?,
+        }),
         Some(v) => Err(Error::Config(format!(
             "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
         ))),
         None if read_counter(db, META_NEXT_NODE)?.is_some() => Err(old_format()),
         None => {
-            let positions = wanted_positions.unwrap_or(true);
+            let features =
+                Features { positions: wanted_positions.unwrap_or(true), edits: wanted_edits.unwrap_or(true) };
             let mut wb = WriteBatch::default();
             wb.put(META_FORMAT, varint(FORMAT_VERSION));
-            wb.put(META_POSITIONS, varint(u64::from(positions)));
+            wb.put(META_POSITIONS, varint(u64::from(features.positions)));
+            wb.put(META_EDITS, varint(u64::from(features.edits)));
             db.write(wb)?;
-            Ok(positions)
+            Ok(features)
         }
+    }
+}
+
+/// Uma opção ligada ou desligada na criação: a config pode repetir o que está
+/// gravado, mas não pedir o contrário.
+fn stored_flag(db: &DB, key: &[u8], wanted: Option<bool>, what: &str) -> Result<bool> {
+    let name = String::from_utf8_lossy(key);
+    let stored = read_counter(db, key)?.ok_or_else(|| Error::Corrupt(format!("{name} ausente")))? != 0;
+    match wanted {
+        Some(wanted) if wanted != stored => Err(Error::Config(format!(
+            "o banco foi criado {} {what}, mas a config pede {}",
+            if stored { "com" } else { "sem" },
+            if wanted { "com" } else { "sem" }
+        ))),
+        _ => Ok(stored),
     }
 }
 
@@ -153,17 +173,28 @@ pub(super) fn varint(v: u64) -> Vec<u8> {
     buf
 }
 
-/// Merge operator de `post:` e `pos:`: une as listas por documento, com a
-/// gravação mais nova vencendo (ver `codec::merge_postings`). É associativo,
-/// então o RocksDB pode combinar pedaços consecutivos em qualquer agrupamento.
-/// Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
-pub(super) fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+/// Merge operator completo de `post:` e `pos:`: une as listas por documento,
+/// com a gravação mais nova vencendo, e descarta as lápides (ver
+/// `codec::merge_lists`). O RocksDB o chama com o valor base, ou sem base
+/// quando sabe que não há valor mais antigo (leituras e compactação no último
+/// nível). Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
+pub(super) fn full_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+    merge(key, existing, operands, true)
+}
+
+/// Merge operator parcial: só operandos consecutivos, e pode haver valor mais
+/// antigo em outro nível. Une como o completo, mas guarda as lápides.
+pub(super) fn partial_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+    merge(key, existing, operands, false)
+}
+
+fn merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands, full: bool) -> Option<Vec<u8>> {
     let inputs = existing.into_iter().chain(operands.iter());
     if key.starts_with(POST) {
-        codec::merge_postings(inputs)
+        codec::merge_lists(inputs, ListKind::Postings, full)
     } else if key.starts_with(POS) {
-        codec::merge_positions(inputs)
-    } else if key.starts_with(STEM) {
+        codec::merge_lists(inputs, ListKind::Positions, full)
+    } else if key.starts_with(STEM) || key == META_MAYBE_EMPTY {
         codec::merge_node_sets(inputs)
     } else {
         None

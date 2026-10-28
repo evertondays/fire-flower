@@ -14,7 +14,7 @@ cada passo.
 | 3.3 Topo da Trie decodificado | ✅ feito como cache de nós rasos das buscas (`Config::reader_cache_depth`, `3e1b2fe`), com consistência por snapshot (`EpochCache`) |
 | 1.2 Preparo em paralelo com N workers | **adiado:** na carga inteira o commit (um escritor só) é 74–80% do tempo, então o ganho máximo seria ~1,25× (Amdahl), menos que usar lote de 10 mil (+63%). Volta a valer se o commit ficar barato (plano de performance, P1) |
 | 3.1 Block cache `HyperClock` | continua relevante: a leitura escala só 4,3× com 12 threads (plano de performance, P4) |
-| Parte 2 (`update`/`delete`, `fwd:`) | continua em aberto; não é performance, é funcionalidade |
+| Parte 2 (`update`/`delete`, `fwd:`) | ✅ feito de outro jeito (formato v6): lápides nas listas e merge por remendo, em vez das tags BASE/DELTA; ver [plano-edicao.md](plano-edicao.md) |
 
 O resto deste documento é a proposta original.
 

@@ -6,19 +6,46 @@ use crate::codec::{SKIP_BLOCK, put_varint};
 use crate::codec::list::{Block, ListHeader, write_list};
 use crate::codec::varint::{Reader, corrupt};
 
+/// Uma entrada a gravar numa lista: documento, tf e tf no título. O lote
+/// guarda mais coisas por entrada (a operação de onde ela veio); os
+/// codificadores só leem isto.
+pub trait PostingEntry {
+    fn doc(&self) -> DocId;
+    fn tf(&self) -> u32;
+    fn title_tf(&self) -> u32;
+}
+
+impl PostingEntry for (DocId, u32, u32) {
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.0
+    }
+
+    #[inline]
+    fn tf(&self) -> u32 {
+        self.1
+    }
+
+    #[inline]
+    fn title_tf(&self) -> u32 {
+        self.2
+    }
+}
+
 /// Grava em `buf` a lista `(doc, tf, tf no título)`, **ordenada por doc e
 /// sem repetições**.
 ///
 /// Cada entrada: `Δdoc`, `tf << 1 | tem título` e, só se tiver, o tf do
 /// título. A maioria das entradas não tem o termo no título e não paga nada
 /// a mais que no formato v2.
-pub fn encode_postings_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)]) {
-    debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
-    debug_assert!(entries.iter().all(|e| e.1 > 0 && e.2 <= e.1));
+pub fn encode_postings_into<E: PostingEntry>(buf: &mut Vec<u8>, entries: &[E]) {
+    debug_assert!(entries.windows(2).all(|w| w[0].doc() < w[1].doc()));
+    debug_assert!(entries.iter().all(|e| e.tf() > 0 && e.title_tf() <= e.tf()));
     let write = |out: &mut Vec<u8>, blocks: &mut Vec<(DocId, usize)>| {
         let start = out.len();
         let mut prev = 0;
-        for (i, &(doc, tf, title_tf)) in entries.iter().enumerate() {
+        for (i, e) in entries.iter().enumerate() {
+            let (doc, tf, title_tf) = (e.doc(), e.tf(), e.title_tf());
             put_varint(out, doc - prev);
             put_varint(out, (u64::from(tf) << 1) | u64::from(title_tf > 0));
             if title_tf > 0 {

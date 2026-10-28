@@ -46,6 +46,8 @@ pub use self::merge::{ListKind, encode_tombstones_into, merge_lists, merge_posit
 pub use self::node_set::{decode_node_set, encode_node_set, merge_node_sets};
 pub use self::norms::{DocLens, NORM_BLOCK_DOCS, NormBlock};
 pub use self::positions::{PositionsCursor, decode_positions, encode_positions_into};
-pub use self::postings::{PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into};
+pub use self::postings::{
+    PostingEntry, PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into,
+};
 pub use self::trie_node::TrieNode;
 pub use self::varint::{get_varint, put_varint};

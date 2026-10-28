@@ -86,12 +86,39 @@ pub(super) struct DocOp {
 /// O que o lote juntou de um termo.
 #[derive(Default)]
 pub(super) struct TermAcc {
-    /// (documento, tf, tf no título), na ordem em que os documentos foram adicionados.
-    docs: Vec<(DocId, u32, u32)>,
-    /// A operação (índice em `IndexBatch::ops`) de cada entrada de `docs`.
-    ops: Vec<u32>,
+    /// As entradas, na ordem em que os documentos foram adicionados.
+    docs: Vec<BatchEntry>,
     /// `tf` posições por entrada de `docs`, em sequência (vazio sem posições).
     positions: Vec<u32>,
+}
+
+/// Um documento na lista de um termo do lote. A operação vai junto na mesma
+/// entrada: num `Vec` à parte, era uma alocação a mais por termo distinto do
+/// lote, e a carga da Wikipédia ficava ~5% mais lenta.
+#[derive(Debug, Clone, Copy)]
+struct BatchEntry {
+    doc: DocId,
+    tf: u32,
+    title_tf: u32,
+    /// Índice em `IndexBatch::ops`.
+    op: u32,
+}
+
+impl codec::PostingEntry for BatchEntry {
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    #[inline]
+    fn tf(&self) -> u32 {
+        self.tf
+    }
+
+    #[inline]
+    fn title_tf(&self) -> u32 {
+        self.title_tf
+    }
 }
 
 impl TermAcc {
@@ -100,29 +127,28 @@ impl TermAcc {
     /// (`is_final`): reindexar duas vezes no mesmo lote vale o segundo texto
     /// inteiro, e adicionar e remover não grava nada.
     fn normalize(&mut self, positions: bool, repeated: bool, is_final: impl Fn(DocId, u32) -> bool) {
-        if !repeated && self.docs.windows(2).all(|w| w[0].0 < w[1].0) {
+        if !repeated && self.docs.windows(2).all(|w| w[0].doc < w[1].doc) {
             return; // o caso comum: IDs crescentes
         }
-        // (documento, tf, tf no título, operação, onde começam as posições)
-        let mut entries: Vec<(DocId, u32, u32, u32, usize)> = Vec::with_capacity(self.docs.len());
+        // (entrada, onde começam as posições dela)
+        let mut entries: Vec<(BatchEntry, usize)> = Vec::with_capacity(self.docs.len());
         let mut start = 0usize;
-        for (&(doc, tf, title_tf), &op) in self.docs.iter().zip(&self.ops) {
-            if !repeated || is_final(doc, op) {
-                entries.push((doc, tf, title_tf, op, start));
+        for &e in &self.docs {
+            if !repeated || is_final(e.doc, e.op) {
+                entries.push((e, start));
             }
-            start += tf as usize;
+            start += e.tf as usize;
         }
         // Sobra no máximo uma entrada por documento: a da operação que vale.
-        entries.sort_unstable_by_key(|e| e.0);
+        entries.sort_unstable_by_key(|e| e.0.doc);
         if positions {
             let mut sorted = Vec::with_capacity(self.positions.len());
-            for &(_, tf, _, _, start) in &entries {
-                sorted.extend_from_slice(&self.positions[start..start + tf as usize]);
+            for &(e, start) in &entries {
+                sorted.extend_from_slice(&self.positions[start..start + e.tf as usize]);
             }
             self.positions = sorted;
         }
-        self.ops = entries.iter().map(|e| e.3).collect();
-        self.docs = entries.into_iter().map(|(doc, tf, title_tf, _, _)| (doc, tf, title_tf)).collect();
+        self.docs = entries.into_iter().map(|(e, _)| e).collect();
     }
 }
 
@@ -207,8 +233,7 @@ impl IndexBatch<'_> {
         let (len, title_len) = self.analyzer.run_fields(title, text, &self.engine.stopwords, &self.engine.stemmer);
         let analyzer = &self.analyzer;
         let record = |acc: &mut TermAcc, found: &[u32]| {
-            acc.docs.push((doc_id, found.len() as u32, analyzer.title_tf(found)));
-            acc.ops.push(op);
+            acc.docs.push(BatchEntry { doc: doc_id, tf: found.len() as u32, title_tf: analyzer.title_tf(found), op });
             if positions {
                 acc.positions.extend_from_slice(found);
             }
@@ -342,8 +367,8 @@ impl IndexBatch<'_> {
                 new_by_stem.entry(inflector.stem(&term)).or_default().push(id);
             }
             if new_terms.is_on() {
-                for &op in &acc.ops {
-                    new_terms.push(op, id);
+                for e in &acc.docs {
+                    new_terms.push(e.op, id);
                 }
             }
             buf.clear();

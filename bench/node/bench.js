@@ -12,6 +12,9 @@ const opt = args();
 const { Engine } = binding();
 const engine = Engine.openSync(opt.db);
 const passes = Number(opt.passes ?? 1);
+// --mode: mede todo conjunto com a mesma operação, como o wiki bench --mode.
+const forced = typeof opt.mode === "string" ? opt.mode : null;
+const querySets = () => readSets(list(opt.queries)).map((s) => (forced ? { ...s, mode: forced } : s));
 
 function run(set) {
   const samples = [];
@@ -47,7 +50,7 @@ function summarize(set, samples, results, wall) {
 const sets = [];
 console.log("| conjunto | p50 µs | p95 µs | p99 µs | qps |");
 console.log("|---|---|---|---|---|");
-for (const set of readSets(list(opt.queries))) {
+for (const set of querySets()) {
   run(set); // aquecimento
   let samples = [];
   let results = 0;
@@ -92,7 +95,7 @@ async function asyncCost(set) {
 }
 
 (async () => {
-  const mid = readSets(list(opt.queries)).find((s) => s.name === "t-mid");
+  const mid = querySets().find((s) => s.name === "t-mid");
   const async_ = mid ? await asyncCost(mid) : null;
   console.log(`chamada vazia: ${noopNs.toFixed(1)} ns · rótulos de ${top.length}: ${labelsUs.toFixed(2)} µs`);
   if (async_) console.log(`t-mid síncrono ${async_.sync_p50_us.toFixed(1)} µs · assíncrono ${async_.async_p50_us.toFixed(1)} µs`);
@@ -101,6 +104,7 @@ async function asyncCost(set) {
     db: opt.db,
     threads: 1,
     passes,
+    mode: forced,
     sets,
     noop_ns: noopNs,
     labels_10_us: labelsUs,

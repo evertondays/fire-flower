@@ -17,7 +17,7 @@
 //! cargo run --release --example wiki -- concurrent --db D --corpus F --skip K --queries Q [--threads T]
 //! ```
 
-use crate::bench::bench;
+use crate::bench::{Mode, bench};
 use crate::concurrent::concurrent;
 use crate::corpus::parse_languages;
 use crate::digest::digest;
@@ -267,6 +267,9 @@ enum Cmd {
         /// bindings
         #[arg(long)]
         plain: bool,
+        /// Mede todo conjunto com a mesma operação: search, suggest ou top10
+        #[arg(long)]
+        mode: Option<String>,
         /// Profundidade do cache de nós das buscas ("none" desliga)
         #[arg(long)]
         reader_cache: Option<String>,
@@ -366,8 +369,10 @@ fn main() -> AnyResult {
             run_relevance(&db, &corpus, &sets, &manual, take, seed, per_set, generate, config, brief, label)
         }
         Cmd::Bench {
-            db, queries, threads, passes, cold, perf_time, plain, reader_cache, cache_mb, inflections, label,
+            db, queries, threads, passes, cold, perf_time, plain, mode, reader_cache, cache_mb, inflections, label,
         } => {
+            let mode = mode.map(|m| Mode::parse(&m).ok_or(format!("modo desconhecido {m:?}: search, suggest ou top10")))
+                .transpose()?;
             let mut config = inflections.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = reader_cache {
                 config.reader_cache_depth = if depth == "none" { None } else { Some(depth.parse()?) };
@@ -379,7 +384,7 @@ fn main() -> AnyResult {
             } else {
                 PerfStatsLevel::EnableCount
             };
-            bench(&db, &queries, threads.max(1), passes.max(1), cold, level, config, label)
+            bench(&db, &queries, threads.max(1), passes.max(1), cold, level, mode, config, label)
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),

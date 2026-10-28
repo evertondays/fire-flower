@@ -31,11 +31,17 @@ const { Engine } = binding();
   let bytes = 0;
   let indexSecs = 0;
   const started = process.hrtime.bigint();
+  // Um lote gravando no pool de threads enquanto o próximo é montado aqui:
+  // o JSON.parse e a conversão das strings não esperam o commit.
+  let inFlight = null;
   const flush = async () => {
-    const t = process.hrtime.bigint();
-    await engine.index(batch);
-    indexSecs += Number(process.hrtime.bigint() - t) / 1e9;
+    if (inFlight) await inFlight;
+    const docs = batch;
     batch = [];
+    const t = process.hrtime.bigint();
+    inFlight = engine.index(docs).then(() => {
+      indexSecs += Number(process.hrtime.bigint() - t) / 1e9;
+    });
   };
   for await (const line of lines(opt.corpus)) {
     if (docs >= take) break;
@@ -47,6 +53,7 @@ const { Engine } = binding();
     if (batch.length >= batchSize) await flush();
   }
   if (batch.length) await flush();
+  await inFlight;
   const seconds = Number(process.hrtime.bigint() - started) / 1e9;
   engine.close();
   const result = { binding: "node", db: opt.db, corpus: opt.corpus, batch: batchSize, docs, bytes,

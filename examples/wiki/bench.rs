@@ -34,6 +34,17 @@ impl Mode {
         }
     }
 
+    /// `--mode`: mede todo conjunto do mesmo jeito (`top10` é a medida dos
+    /// bindings: o caminho de uma aplicação).
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "search" => Some(Mode::Search),
+            "suggest" => Some(Mode::Suggest),
+            "top10" => Some(Mode::Top(10)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Mode::Search => "search",
@@ -196,10 +207,16 @@ pub(crate) fn bench(
     passes: usize,
     cold: bool,
     level: PerfStatsLevel,
+    mode: Option<Mode>,
     config: Config,
     label: Option<String>,
 ) -> AnyResult {
-    let sets = read_query_sets(paths)?;
+    let mut sets = read_query_sets(paths)?;
+    if let Some(mode) = mode {
+        for set in &mut sets {
+            set.mode = mode;
+        }
+    }
     let perf_time = level == PerfStatsLevel::EnableTime;
     let mut engine = if cold { None } else { Some(Engine::open(db, crate::env::with_metrics(config.clone()))?) };
     let mut results = Vec::new();

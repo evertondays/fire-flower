@@ -915,8 +915,11 @@ def phase_bindings(scale):
         phase_queries(scale)
     for r in range(BINDING_ROUNDS):
         step(f"latência, rodada {r + 1} de {BINDING_ROUNDS}: nativo e Node")
-        wiki("bench", "--db", path, "--queries", qdir, "--plain", "--label", f"bindings-{scale}-native")
-        node("bench.js", "--db", path, "--queries", qdir, "--label", f"bindings-{scale}-node")
+        # Os 10 melhores em todo conjunto (a medida do plano) e a operação de
+        # cada conjunto (search devolve todos os IDs: mostra o custo de listas grandes).
+        for suffix, mode in (("-top10", ["--mode", "top10"]), ("", [])):
+            wiki("bench", "--db", path, "--queries", qdir, "--plain", *mode, "--label", f"bindings-{scale}-native{suffix}")
+            node("bench.js", "--db", path, "--queries", qdir, *mode, "--label", f"bindings-{scale}-node{suffix}")
     step("leitores em paralelo: threads do Rust e worker_threads")
     mixed = os.path.join(qdir, "mixed.txt")
     for t in BINDING_THREADS:
@@ -1055,23 +1058,34 @@ def bindings_section(R, scale):
     """O binding Node contra o nativo: mediana das rodadas alternadas."""
     def runs(kind, label):
         return [r for r in R if r.get("kind") == kind and r.get("label") == label]
-    native, node_ = runs("bench", f"bindings-{scale}-native"), runs("bench", f"bindings-{scale}-node")
-    if not native or not node_:
-        return []
     def med(rs, name, field):
         vals = [x[field] for r in rs for x in r["sets"] if x["set"] == name]
         return statistics.median(vals) if vals else None
+    def table(suffix, sets=None):
+        native, node_ = runs("bench", f"bindings-{scale}-native{suffix}"), runs("bench", f"bindings-{scale}-node{suffix}")
+        if not native or not node_:
+            return [], None, None
+        out = ["| Conjunto | p50 nativo | p50 Node | Δ | p99 nativo | p99 Node |", "|---|---|---|---|---|---|"]
+        for s in native[-1]["sets"]:
+            if sets and s["mode"] not in sets:
+                continue
+            n50, b50 = med(native, s["set"], "p50_us"), med(node_, s["set"], "p50_us")
+            n99, b99 = med(native, s["set"], "p99_us"), med(node_, s["set"], "p99_us")
+            if b50 is None:
+                continue
+            out.append(f"| {s['set']} | {us(n50)} | {us(b50)} | {fmt(b50 - n50, 2)} µs ({pct(b50, n50):+.1f}%) "
+                       f"| {us(n99)} | {us(b99)} |")
+        return out, native, node_
+    top, native, node_ = table("-top10")
+    if not top:
+        return []
     L = [f"## Binding Node ({scale})", "",
          f"Mediana de {len(node_)} rodadas alternando o `wiki bench --plain` e o `bench/node/bench.js` no mesmo "
          "banco ([docs/plano-bindings.md](" + DOCS_URL + "/plano-bindings.md)).", "",
-         "| Conjunto | p50 nativo | p50 Node | Δ | p99 nativo | p99 Node |", "|---|---|---|---|---|---|"]
-    for s in native[-1]["sets"]:
-        n50, b50 = med(native, s["set"], "p50_us"), med(node_, s["set"], "p50_us")
-        n99, b99 = med(native, s["set"], "p99_us"), med(node_, s["set"], "p99_us")
-        if b50 is None:
-            continue
-        L.append(f"| {s['set']} | {us(n50)} | {us(b50)} | {fmt(b50 - n50, 2)} µs ({pct(b50, n50):+.1f}%) "
-                 f"| {us(n99)} | {us(b99)} |")
+         "### Os 10 melhores (`searchTopSync`, a medida do plano)", ""] + top
+    every, _, _ = table("", sets={"search", "suggest"})
+    if every:
+        L += ["", "### A operação de cada conjunto (`searchSync` devolve todos os IDs; `suggestSync`)", ""] + every
     last = node_[-1]
     noop = statistics.median([r["noop_ns"] for r in node_ if "noop_ns" in r] or [0])
     labels_node = statistics.median([r["labels_10_us"] for r in node_ if "labels_10_us" in r] or [0])

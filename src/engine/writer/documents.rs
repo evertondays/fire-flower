@@ -8,9 +8,9 @@ use rustc_hash::FxHashMap;
 
 use crate::{DocId, Error, IndexBatch, IndexStats, Result, codec};
 use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock};
-use crate::engine::keys::{DOC, FWD, Key, META_MAYBE_EMPTY, NORM, POS, POST};
+use crate::engine::keys::{DOC, FWD, Key, META_MAYBE_EMPTY, NORM};
 use crate::engine::view::Source;
-use crate::engine::writer::{CommitStats, DocOp};
+use crate::engine::writer::{CommitStats, DocOp, OverlayBatch};
 
 /// Os blocos de `norm:` que o lote toca, como estavam no banco.
 pub(super) type Norms = BTreeMap<u64, NormBlock>;
@@ -19,6 +19,13 @@ pub(super) type Norms = BTreeMap<u64, NormBlock>;
 pub(super) struct OldTerms {
     terms: FxHashMap<DocId, Vec<u64>>,
     pub(super) reads: u64,
+}
+
+impl OldTerms {
+    /// O documento já tinha este termo antes do lote.
+    pub(super) fn had(&self, doc: DocId, node: u64) -> bool {
+        self.terms.get(&doc).is_some_and(|nodes| nodes.binary_search(&node).is_ok())
+    }
 }
 
 /// Os nós dos termos novos de cada operação do lote, num buffer só: a
@@ -67,7 +74,7 @@ impl NewTerms {
 }
 
 /// O documento está no bloco de `norm:` (já foi indexado e não removido).
-fn exists(norms: &Norms, doc: DocId) -> bool {
+pub(super) fn exists(norms: &Norms, doc: DocId) -> bool {
     norms.get(&(doc / NORM_BLOCK_DOCS)).is_some_and(|b| b.get_lens((doc % NORM_BLOCK_DOCS) as u16).is_some())
 }
 
@@ -138,6 +145,7 @@ impl IndexBatch<'_> {
         old: &OldTerms,
         new_terms: &mut NewTerms,
         stats: &mut CommitStats,
+        overlays: &mut FxHashMap<u64, OverlayBatch>,
     ) -> Result<Vec<u64>> {
         if !self.engine.edits {
             return Ok(Vec::new());
@@ -170,9 +178,12 @@ impl IndexBatch<'_> {
             stats.tombstones += docs.len();
             buf.clear();
             codec::encode_tombstones_into(&mut buf, &docs);
-            wb.merge(Key::new(POST, node), &buf);
+            // Lápide no remendo, não na lista: a leitura da base continua
+            // sendo a cópia crua, e o df cai `docs.len()`.
+            let slot = overlays.entry(node).or_default();
+            slot.post.push(codec::wrap_delta(-(docs.len() as i64), &buf));
             if self.engine.positions {
-                wb.merge(Key::new(POS, node), &buf);
+                slot.pos.push(codec::wrap_delta(0, &buf));
             }
         }
         if !nodes.is_empty() {

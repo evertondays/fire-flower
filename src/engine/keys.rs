@@ -20,6 +20,9 @@ pub(super) const META_NEXT_NODE: &[u8] = b"meta:next_node_id";
 /// Nós que receberam lápide desde a última limpeza (ver `MaybeEmpty`), unidos pelo merge.
 pub(super) const META_MAYBE_EMPTY: &[u8] = b"meta:maybe_empty";
 
+/// Nós com remendo de edição ainda não incorporado (`pov:` / `psv:`).
+pub(super) const META_OVERLAYS: &[u8] = b"meta:overlays";
+
 pub(super) const META_NEXT_DOC: &[u8] = b"meta:next_doc_id";
 
 pub(super) const META_DOC_COUNT: &[u8] = b"meta:doc_count";
@@ -44,6 +47,12 @@ pub(super) const NODE: &[u8] = b"node:";
 pub(super) const POST: &[u8] = b"post:";
 
 pub(super) const POS: &[u8] = b"pos:";
+
+/// `pov:<nó>`: remendo de `post:` das edições ainda não incorporadas na lista.
+pub(super) const POV: &[u8] = b"pov:";
+
+/// `psv:<nó>`: remendo de `pos:`, no mesmo papel de [`POV`].
+pub(super) const PSV: &[u8] = b"psv:";
 
 pub(super) const NORM: &[u8] = b"norm:";
 

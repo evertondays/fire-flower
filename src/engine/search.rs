@@ -1,11 +1,11 @@
 //! Busca sem ranking: os documentos que casam com todas as partes, em ordem de ID.
 
-use crate::{DocId, InflectionMode, Result, codec};
+use crate::{DocId, InflectionMode, Result};
 use crate::codec::PostingsCursor;
 use crate::engine::conjunction::{Member, seek_docs, use_cursor};
 use crate::engine::groups::decode_group_docs;
 use crate::engine::phrase::PhraseMatcher;
-use crate::engine::view::View;
+use crate::engine::view::{PostSource, View};
 use crate::query::Clause;
 
 impl View<'_> {
@@ -25,7 +25,7 @@ impl View<'_> {
     /// `expand`: palavras exatas casam também as flexões (frases e prefixos não).
     fn search_with(&self, clauses: &[Clause], expand: bool) -> Result<Vec<DocId>> {
         // Listas exatas ficam como bytes até se saber quem conduz o E.
-        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut bytes: Vec<PostSource<'_>> = Vec::new();
         let mut members: Vec<Member<DocId>> = Vec::new();
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         for clause in clauses {
@@ -74,7 +74,7 @@ impl View<'_> {
         members.sort_by_key(Member::len);
         let mut members = members.into_iter();
         let mut result = match members.next().expect("há pelo menos uma lista") {
-            Member::Bytes { idx, .. } => codec::decode_docs(&bytes[idx])?,
+            Member::Bytes { idx, .. } => bytes[idx].docs()?,
             Member::Decoded(list) => list,
             Member::Group { parts, .. } => decode_group_docs(&bytes, &parts)?,
         };
@@ -84,13 +84,14 @@ impl View<'_> {
         let mut decoded: Vec<(Vec<DocId>, usize)> = Vec::new();
         for m in members {
             match m {
-                Member::Bytes { idx, len } if use_cursor(len, result.len()) => {
-                    cursors.push(PostingsCursor::new(&bytes[idx])?)
+                Member::Bytes { idx, len } if bytes[idx].edits.is_empty() && use_cursor(len, result.len()) => {
+                    cursors.push(PostingsCursor::new(bytes[idx].base())?)
                 }
-                Member::Bytes { idx, .. } => decoded.push((codec::decode_docs(&bytes[idx])?, 0)),
+                Member::Bytes { idx, .. } => decoded.push((bytes[idx].docs()?, 0)),
                 Member::Decoded(list) => decoded.push((list, 0)),
-                Member::Group { parts, len } if use_cursor(len, result.len()) => group_cursors
-                    .push(parts.iter().map(|&(_, idx)| PostingsCursor::new(&bytes[idx])).collect::<Result<_>>()?),
+                Member::Group { parts, len } if parts.iter().all(|&(_, idx)| bytes[idx].edits.is_empty()) && use_cursor(len, result.len()) => {
+                    group_cursors.push(parts.iter().map(|&(_, idx)| PostingsCursor::new(bytes[idx].base())).collect::<Result<_>>()?)
+                }
                 Member::Group { parts, .. } => decoded.push((decode_group_docs(&bytes, &parts)?, 0)),
             }
         }
@@ -145,14 +146,17 @@ impl View<'_> {
     pub(super) fn add_exact<'s, T>(
         &'s self,
         node: Option<u64>,
-        bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+        bytes: &mut Vec<PostSource<'s>>,
         members: &mut Vec<Member<T>>,
     ) -> Result<usize> {
         let Some(node) = node else { return Ok(0) };
-        let Some(value) = self.post_bytes(node)? else { return Ok(0) };
-        let len = codec::list_len(&value)? as usize;
+        let Some(src) = self.post_source(node)? else { return Ok(0) };
+        let len = src.len()?;
+        if len == 0 {
+            return Ok(0);
+        }
         members.push(Member::Bytes { idx: bytes.len(), len });
-        bytes.push(value);
+        bytes.push(src);
         Ok(len)
     }
 }

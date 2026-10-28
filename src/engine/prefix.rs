@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::{DocId, Posting, Result, codec};
+use crate::{DocId, Posting, Result};
 use crate::codec::TrieNode;
-use crate::engine::keys::{NODE, POST};
+use crate::engine::keys::NODE;
 use crate::engine::view::{View, missing_node};
 
 impl View<'_> {
@@ -31,8 +31,8 @@ impl View<'_> {
     /// Listas de vários nós unidas por documento, com o tf somado.
     fn union_postings(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<Posting>> {
         let mut all: Vec<Posting> = Vec::new();
-        for value in self.get_many(POST, nodes)?.into_iter().flatten() {
-            all.extend(codec::decode_postings(&value)?);
+        for value in self.post_sources(nodes)?.into_iter().flatten() {
+            all.extend(value.postings()?);
         }
         // `all` é a concatenação de listas já ordenadas: a ordenação estável
         // detecta os trechos ordenados e só os intercala (o `sort_unstable`
@@ -58,8 +58,8 @@ impl View<'_> {
     /// Documentos de vários nós, unidos.
     fn union_docs(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<DocId>> {
         let mut all = Vec::new();
-        for value in self.get_many(POST, nodes)?.into_iter().flatten() {
-            all.extend(codec::decode_docs(&value)?);
+        for value in self.post_sources(nodes)?.into_iter().flatten() {
+            all.extend(value.docs()?);
         }
         all.sort(); // trechos já ordenados: ver `prefix_postings`
         all.dedup();

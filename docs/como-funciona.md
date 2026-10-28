@@ -243,13 +243,19 @@ prefixo na chave:
 | `pos:<id>` | as posições do termo em cada documento (só em bancos com posições); o título vem primeiro e o texto começa 100 posições depois do fim dele | `pos:11` = onde `casa` aparece |
 | `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco, e o do título | `norm:0` = documentos 0 a 1023 |
 | `doc:<id>` | rótulo do documento (a CLI grava o caminho do arquivo) | `doc:42` → `/home/.../notas.txt` |
-| `fwd:<id>` | os nós terminais dos termos do documento (o índice "direto"), para editar e remover | `fwd:2` = nós de `azul`, `carro`, `casa` |
+| `ver:<id>` | o ID interno da última versão do documento, só para os que já foram substituídos ou removidos (seção 5.6) | `ver:2` → 2^63 + 2 |
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
 | `stem:<radical>` | nós das palavras com esse radical (só com flexões na consulta) | |
-| `meta:maybe_empty` | nós que receberam lápide desde a última limpeza (seção 5.6) | |
-| `meta:format`, `meta:positions`, `meta:edits`, `meta:languages`, `meta:stemming`, `meta:inflections` | versão do formato, se grava posições e `fwd:`, idiomas das stopwords, stemming e flexões | |
+| `meta:dead` | as versões mortas que ainda estão nas listas (seção 5.6) | |
+| `meta:epoch` | número do último commit (seção 5.6) | |
+| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | versão do formato, se grava posições, idiomas das stopwords, stemming e flexões | |
+
+Em `post:`, `pos:` e `norm:` o "documento" é o **ID interno** da versão dele:
+na primeira versão, o próprio ID do documento (numa carga, nada muda); numa
+substituição, um ID da faixa alta, a partir de 2^63 (seção 5.6). A busca
+devolve sempre o ID do usuário.
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -270,11 +276,9 @@ O banco resultante tem exatamente estas chaves (valores em hexadecimal, na
 ordem em que o RocksDB as guarda):
 
 ```text
-fwd:1                  04 07
-fwd:2                  04 05 02
 meta:doc_count         02
-meta:edits             01
-meta:format            06
+meta:epoch             01
+meta:format            07
 meta:inflections       none
 meta:languages         pt,en
 meta:next_doc_id       03
@@ -350,14 +354,12 @@ maioria dos nós tem um filho só.
 
 ```text
 02          2 documentos
-00          tabela de saltos vazia (lista pequena), sem lápides
+00          tabela de saltos vazia (lista pequena)
 01 02       documento 0 + 1 = 1; 02 = tf 1 << 1, sem título
 01 02       documento 1 + 1 = 2; tf 1, sem título
 ```
 
-O segundo número é `s << 1 | tem lápide`: `s` é a quantidade de blocos da
-tabela de saltos (abaixo), e o bit de baixo diz se alguma entrada é uma
-lápide (seção 5.6). Uma lista que a busca lê nunca tem lápide.
+O segundo número é a quantidade de blocos da tabela de saltos (abaixo).
 
 O segundo número é `tf << 1 | tem título`. Quando o bit de baixo é 1, vem
 mais um número: quantas das ocorrências estão no título. Um documento com
@@ -410,17 +412,26 @@ uma ocorrência está no título). `meta:total_len = 5` é a soma dos tamanhos e
 `meta:doc_count = 2`; o ranking usa o tamanho médio (5 ÷ 2) para comparar
 documentos.
 
-### Lendo os termos de um documento: `fwd:2`
+### Depois de substituir um documento
+
+Indexando de novo o documento 2, agora com "O carro verde", o commit muda
+estas chaves (as listas já unidas pelo merge):
 
 ```text
-04          nó 4 (azul)
-05          nó 4 + 5 = 9 (carro)
-02          nó 9 + 2 = 11 (casa)
+meta:dead              02
+norm:0                 01 01 02 00 00                     (só o documento 1)
+norm:9007199254740992  01 02 02 00 00                     (2^63 + 2)
+post:16                01 00 82 80 80 80 80 80 80 80 80 01 02
+post:9                 02 00 02 02 80 80 80 80 80 80 80 80 80 01 02
+ver:2                  82 80 80 80 80 80 80 80 80 01      (2^63 + 2)
 ```
 
-Os nós terminais dos termos do documento, em ordem e em delta. É o que a
-edição e a remoção leem para saber de quais listas tirar o documento (seção
-5.6).
+A versão nova do documento 2 tem o ID interno 2^63 + 2 (versão 0 da faixa
+alta), e a antiga (2) morreu: saiu de `norm:0` e entrou em `meta:dead`. A
+lista de `carro` (`post:9`) ganhou a entrada nova **depois do fim** (delta
+`80 … 01` = 2^63) e ainda tem a antiga; `verde` é o nó 16. As listas de `azul`
+e `casa` não mudaram: ainda têm o 2, que a busca pula por estar morto. A
+compactação seguinte tira o 2 das três listas e de `meta:dead` (seção 5.6).
 
 Duas técnicas deixam tudo isso pequeno:
 
@@ -638,16 +649,16 @@ Um único `WriteBatch` com:
 | cada lista nova | `merge post:<id>` | só os documentos novos, com tf, ordenados e em deltas |
 | cada lista de posições | `merge pos:<id>` | só com posições ligadas |
 | cada bloco de tamanhos tocado | `put norm:<bloco>` | o bloco inteiro: lido, atualizado e regravado (`delete` se ficou vazio) |
-| cada documento | `put fwd:<id>` | os nós dos termos dele; `delete` numa remoção |
-| cada termo que perdeu documentos | `merge post:<id>`, `merge pos:<id>` | lápides (seção 5.6) |
+| cada documento que mudou de versão | `put ver:<id>` | só substituições e remoções (seção 5.6) |
+| versões que morreram | `merge meta:dead` | idem |
 | cada rótulo | `put doc:<id>` | `delete` numa remoção |
-| contadores e estatísticas | `put meta:*` | `doc_count` e `total_len` incluídos |
+| contadores e estatísticas | `put meta:*` | `doc_count`, `total_len` e o número do commit incluídos |
 
 Os blocos de `norm:` são lidos no começo do commit (com IDs crescentes, um ou
-dois por lote) para saber se o documento já existia: se sim, troca o tamanho
-e ajusta `total_len` (e lê o `fwd:` dele, seção 5.6); se não, conta mais um em
-`doc_count`. Tudo vai no mesmo `WriteBatch`, então lista, posições, tamanhos,
-estatísticas e `fwd:` nunca discordam.
+dois por lote) para saber se o documento já existia: se sim, ele ganha uma
+versão nova (seção 5.6), o tamanho troca e `total_len` é ajustado; se não,
+conta mais um em `doc_count`. Tudo vai no mesmo `WriteBatch`, então lista,
+posições, tamanhos, estatísticas e versões nunca discordam.
 
 O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
@@ -670,7 +681,8 @@ O `WriteBatch` vai para o WAL e para a memtable. Mais tarde, em segundo plano:
   (`[1, 2]` + `[5]` + `[9]` → `[1, 2, 5, 9]`) e grava a lista já consolidada.
 
 O merge une **por documento**: se dois pedaços trazem o mesmo documento, o
-mais novo vence (é assim que reindexar troca o tf e as posições). Essa regra é
+mais novo vence (só acontece dentro de uma carga com IDs fora de ordem: uma
+edição ganha um ID interno novo, seção 5.6). Essa regra é
 associativa, então o RocksDB pode juntar pedaços consecutivos em qualquer
 agrupamento; um teste confere isso com pedaços aleatórios. O caso comum, uma
 carga com IDs crescentes, tem um atalho: cada pedaço começa depois do fim do
@@ -685,61 +697,83 @@ Enquanto a compactação não roda, uma leitura de `post:<id>` une os pedaços n
 hora. Por isso listas muito disputadas podem ficar mais lentas logo depois de
 uma carga grande; o plano de performance mede isso.
 
-Pedaços que se sobrepõem (reindexar ou remover um documento antigo) não
-decodificam a lista inteira: os pedaços mais novos são unidos num **remendo**,
-e os blocos da lista que o remendo não toca são copiados com um `memcpy`; só
-os tocados são relidos e regravados. Unir uma lista de 25 mil documentos com
-um remendo de um documento leva ~10 µs (decodificar e regravar tudo levava
-~330 µs). Nenhum caminho decodifica o conteúdo das entradas (tf, posições): os
-bytes de cada uma são copiados como estão.
+Pedaços que se sobrepõem (IDs fora de ordem) não decodificam a lista
+inteira: os pedaços mais novos são unidos num **remendo**, e os blocos da
+lista que o remendo não toca são copiados com um `memcpy`; só os tocados são
+relidos e regravados. A limpeza das versões mortas (seção 5.6) usa o mesmo
+caminho: só os blocos com um morto são regravados. Nenhum caminho decodifica
+o conteúdo das entradas (tf, posições): os bytes de cada uma são copiados
+como estão.
 
-### 5.6 Edição e remoção
+### 5.6 Edição e remoção: versões
 
 `add_*` com um ID que já existe **substitui** o documento, e
-`delete_document` o **remove**. Para saber de quais listas tirar o documento,
-cada um guarda os seus termos em `fwd:<id>` (os nós terminais, em ordem e em
-delta). Num commit, para cada documento que já existia (os blocos de `norm:`
-dizem quem), o escritor lê o `fwd:` antigo (um `MultiGet` para o lote
-inteiro) e compara com os termos novos:
+`delete_document` o **remove**. Nenhum dos dois mexe nas listas antigas: cada
+versão de um documento tem um **ID interno**, e editar só acrescenta (o modelo
+do Lucene, com os IDs do usuário e o merge do RocksDB;
+[docs/analise-edicao.md](analise-edicao.md), plano A).
 
-- termo que continua: nada a fazer, a entrada nova vence a antiga no merge;
-- termo que saiu (ou todos, numa remoção): uma **lápide** na lista dele, uma
-  entrada com `tf << 1 | título = 0` em `post:` e `k = 0` em `pos:`.
+- **Primeira versão:** o ID interno é o próprio ID do documento. A carga não
+  grava nada a mais.
+- **Substituir** (ou readicionar depois de remover): a versão nova ganha um ID
+  da faixa alta, `2^63 + (versão << 40) + documento`, com a versão começando
+  em 0 e só crescendo. As entradas dela caem **depois de todos os documentos
+  sem edição** nas listas. `ver:<id>` guarda o ID interno da última versão.
+  Por isso IDs de documento vão até 2^40 − 1 (~1,1 trilhão), e cada documento
+  pode ter até 8,4 milhões de versões.
+- **A faixa alta fica em ordem de documento** dentro de cada versão: as
+  primeiras edições de todos os documentos, depois as segundas, e assim por
+  diante. Os deltas ficam tão pequenos quanto os da carga, e uma edição só
+  remenda (até a compactação) os blocos da faixa alta onde cai.
+- **A versão anterior morre:** sai do bloco de `norm:` no mesmo commit e entra
+  em `meta:dead`. Ela continua nas listas, mas a busca a pula.
+- **Remover** só mata a versão viva. Um ID interno nunca volta, então um morto
+  é morto para sempre.
 
-As lápides vão no mesmo `WriteBatch` que o resto, então nenhuma busca vê o
-documento editado pela metade. O merge **parcial** guarda as lápides (pode
-haver, num nível mais fundo, um valor antigo com aquele documento); o
-**completo** as descarta. Como toda leitura usa o merge completo, o código de
-busca não sabe que lápides existem. Uma carga de documentos novos não lê nada
-a mais: só quem já existia tem `fwd:` lido.
+**A busca filtra os mortos.** Quem conduz o E é decodificada inteira; ao
+decodificar, as versões mortas são puladas (um teste de bit por entrada, num
+mapa de bits montado uma vez por conjunto de mortos). As outras listas só são
+consultadas nos documentos da que conduz, então não precisam filtrar. Sem
+mortos (banco sem edições, ou depois da compactação), a busca não pega trava
+nem filtra nada. Os resultados voltam com o ID do usuário: só os da faixa alta
+são traduzidos (tirar a versão do ID), e a ordem por ID é a junção de poucos
+trechos já ordenados (os documentos sem edição e um por versão presente). No
+ranking, o empate continua indo para o menor ID do usuário.
+
+**Cada busca vê os mortos do seu snapshot.** Uma busca que começou antes de um
+commit ainda vê a versão antiga viva (e a nova não existe para ela). Por isso
+cada morto guarda o número do commit que o matou, e o commit publica os mortos
+**antes** de gravar. A busca lê o número do último commit antes do snapshot e
+depois dele: se não mudou e nenhum commit estava sendo gravado, o snapshot é
+desse commit; senão, lê `meta:epoch` (que todo commit grava) do próprio
+snapshot.
+
+**A compactação limpa.** `Engine::compact` tira os mortos das listas: o merge
+operator (para listas com pedaços pendentes) e um filtro de compactação (para
+as já unidas) regravam só os blocos com um morto. Tirar um morto de uma lista
+mudaria o que um snapshot mais antigo que a morte vê, então só saem os que
+todo snapshot aberto já vê como mortos (pelo número de sequência do RocksDB
+gravado no commit). Uma busca longa só adia a limpeza de alguns, para a
+compactação seguinte. Depois disso, `meta:dead` fica só com os que sobraram, e
+as palavras cujas listas a limpeza esvaziou saem da Trie.
+
+**Até a compactação, três coisas ficam aproximadas:**
+
+- as versões mortas ocupam espaço nas listas;
+- o df vem do cabeçalho da lista e conta os mortos, então o idf de um termo
+  editado fica um pouco menor (limitado ao número de documentos, para não
+  ficar negativo). O Lucene faz o mesmo até o merge dos segmentos;
+- uma palavra cujos documentos foram todos substituídos ou removidos continua
+  no autocompletar e numa expansão de prefixo. Conferir a lista de cada
+  palavra custaria uma leitura por palavra; a busca por ela já não acha nada.
+
+A `Maintenance` é uma thread opcional que chama `compact` quando as edições
+acumuladas (`Engine::pending_edits`) passam de um limite (1% dos documentos,
+no mínimo 1.000). Com versões, a latência quase não depende dela: a
+compactação serve para recuperar espaço e acertar o df e o autocompletar.
 
 No mesmo lote, a última operação de cada documento vence: adicionar e remover
 não grava nada, e reindexar duas vezes vale o segundo texto inteiro.
-
-**Palavras sem documento.** A Trie não encolhe: uma palavra cujo último
-documento saiu continua com o fim de palavra marcado. Todo nó que recebe
-lápide entra num conjunto de suspeitos (em memória e em `meta:maybe_empty`), e
-o autocompletar e a expansão de prefixo conferem a lista de um suspeito antes
-de usá-lo. `Engine::collect_empty_words` (o `compact` da CLI chama) confere
-todos e tira o fim de palavra dos vazios; depois disso as buscas não conferem
-mais nada. Sem remoções o conjunto fica vazio, e a busca nem pega a trava
-dele.
-
-**Até a compactação, edições pesam nas leituras.** Uma lista que perdeu ou
-trocou documentos fica com pedaços pendentes, e toda leitura dela faz o merge
-de novo. Com edições espalhadas, quase todo bloco de uma lista frequente é
-tocado, e o remendo vira percorrer e regravar a lista inteira. Na fatia de
-100k da Wikipédia, 1.000 edições de um documento deixam a busca de um termo
-frequente ~7× mais lenta e o autocompletar ~17× (até a limpeza das palavras);
-a compactação (4 s) devolve tudo ao tempo de antes. Por isso existe a
-`Maintenance`: uma thread opcional que compacta quando as edições acumuladas
-(`Engine::pending_edits`) passam de um limite (1% dos documentos, no mínimo
-1.000) e depois limpa as palavras sem documento. As edições continuam
-síncronas e baratas (~1 ms por commit de um documento); a parte cara fica em
-segundo plano.
-
-Num banco criado com `--no-edits` (`Config::edits`), não há `fwd:`: remover dá
-erro, e reindexar um ID só troca tf, posições e tamanho.
 
 ---
 
@@ -965,10 +999,11 @@ flowchart LR
 - **Por que um nó nunca aponta para o vazio:** nós só ganham filhos, nunca os
   perdem, e um nó novo é gravado no mesmo `WriteBatch` que o pai que aponta
   para ele.
-- **Edições também são atômicas:** as lápides dos termos que saíram e as
-  entradas dos que entraram vão no mesmo `WriteBatch`. Um teste troca o texto
-  de todos os documentos entre uma versão e outra enquanto leitores buscam, e
-  nenhum documento aparece com as duas.
+- **Edições também são atômicas:** a versão nova entra nas listas e a antiga
+  sai de `norm:` no mesmo `WriteBatch`, e cada busca filtra os mortos que o
+  snapshot dela vê (seção 5.6). Um teste troca o texto de todos os documentos
+  entre uma versão e outra enquanto leitores buscam, e nenhum documento
+  aparece com as duas; outro faz o mesmo com compactações em paralelo.
 - **Os caches das buscas respeitam o snapshot.** Os blocos `norm:` e os nós
   rasos da Trie ficam num cache compartilhado (`EpochCache`), mas uma busca
   não pode usar um valor gravado depois do snapshot dela. Cada commit tem um número (*epoch*). Antes de gravar, o
@@ -1061,23 +1096,25 @@ src/
 │   ├── stem.rs         Stemmer (Snowball pt/en e pt-plural)
 │   └── stopwords/      Language, Stopwords e as listas pt.txt e en.txt
 ├── query/              consulta → partes: parse_query, Clause, QueryTerm
-├── codec/              formatos gravados no RocksDB (v6)
+├── codec/              formatos gravados no RocksDB (v7)
 │   ├── trie_node.rs    node:  TrieNode
 │   ├── list.rs         cabeçalho e tabela de saltos comuns a post: e pos:
 │   ├── postings.rs     post:  decode_postings, decode_docs, PostingsCursor
 │   ├── positions.rs    pos:   PositionsCursor
 │   ├── norms.rs        norm:  NormBlock
 │   ├── node_set.rs     stem:  conjuntos de nós
-│   ├── merge.rs        merge por documento, com lápides e remendo (merge_lists)
+│   ├── merge.rs        merge por documento com remendo, e a limpeza dos mortos (merge_lists, purge_list)
 │   └── varint.rs       varint e leitor de bytes
 ├── engine/             índice e armazenamento
 │   ├── mod.rs          Engine: open, batch, search, search_top/search_ranked, suggest, label
 │   ├── config.rs       Config
-│   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, stem:, meta:)
-│   ├── meta.rs         formato, idiomas e stemming gravados; merge_operator
+│   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, ver:, stem:, meta:)
+│   ├── meta.rs         formato, idiomas e stemming gravados
 │   ├── cache.rs        EpochCache: nós e blocos de tamanhos compartilhados entre buscas
-│   ├── empty_words.rs  palavras que podem ter ficado sem documento e a limpeza delas
-│   ├── maintenance.rs  Maintenance: compacta e limpa em segundo plano depois de edições
+│   ├── versions.rs     IDs internos de versão: mortos (Deaths) e tradução para o ID do usuário
+│   ├── purge.rs        merge operator e filtro de compactação que tiram os mortos das listas
+│   ├── empty_words.rs  começo e fim da limpeza de uma compactação; palavras sem documento
+│   ├── maintenance.rs  Maintenance: compacta em segundo plano depois de edições
 │   ├── view.rs         View: leituras sobre um snapshot
 │   ├── search.rs       busca sem ranking (documentos em ordem de ID)
 │   ├── conjunction.rs  o E entre listas: cursores que saltam blocos, intersect
@@ -1086,8 +1123,8 @@ src/
 │   ├── groups.rs       grupos de flexões na consulta
 │   ├── diagnostics.rs  medições para o harness de performance
 │   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
-│   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); tamanhos,
-│                       fwd:, lápides e rótulos (documents.rs)
+│   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); versões,
+│                       tamanhos e rótulos (documents.rs)
 └── bin/fire-flower/    a CLI
     ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest
     ├── jsonl.rs        index-jsonl
@@ -1127,7 +1164,7 @@ engine.suggest("cor", 10)?;        // Vec<String>
 | Frase de *n* termos | as *n* listas `post:` + *n* listas `pos:` | posições só conferidas nos documentos que passaram no E |
 | Top *k* (BM25) | o E + 2 `get`s (estatísticas) + tamanho dos documentos que podem entrar no top | blocos de `norm:` em cache |
 | Indexar um lote | tokenizar + 1 caminho na Trie por termo distinto do lote + os blocos de `norm:` tocados | nós no cache do escritor não são relidos |
-| Substituir ou remover | 1 `fwd:` lido por documento que já existia + 1 lápide por termo que saiu | as lápides pesam nas leituras até a compactação |
+| Substituir ou remover | o mesmo que indexar (as entradas novas entram no fim das listas) + 1 `put ver:` | a versão antiga fica nas listas até a compactação; a busca a pula com um teste por entrada |
 | Commit | 1 `WriteBatch` | escrita sequencial no WAL |
 
 **Espaço:** as posições são a maior parte do banco. Na fatia de 10k da

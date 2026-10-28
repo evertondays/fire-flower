@@ -11,8 +11,8 @@ use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::engine::keys::{
-    META_EDITS, META_FORMAT, META_LANGUAGES, META_MAYBE_EMPTY, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS,
-    POST, STEM,
+    META_EDITS, META_FORMAT, META_LANGUAGES, META_MAYBE_EMPTY, META_NEXT_NODE, META_OVERLAYS, META_POSITIONS,
+    META_STEMMING, POS, POST, POV, PSV, STEM,
 };
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
@@ -189,14 +189,24 @@ pub(super) fn partial_merge(key: &[u8], existing: Option<&[u8]>, operands: &Merg
 }
 
 fn merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands, full: bool) -> Option<Vec<u8>> {
+    let started = crate::engine::merge_trace::trace_start();
     let inputs = existing.into_iter().chain(operands.iter());
-    if key.starts_with(POST) {
+    let result = if key.starts_with(POST) {
         codec::merge_lists(inputs, ListKind::Postings, full)
     } else if key.starts_with(POS) {
         codec::merge_lists(inputs, ListKind::Positions, full)
-    } else if key.starts_with(STEM) || key == META_MAYBE_EMPTY {
+    } else if key.starts_with(POV) {
+        // O remendo guarda as lápides nos dois merges: a base é outra chave.
+        codec::merge_overlays(inputs, ListKind::Postings)
+    } else if key.starts_with(PSV) {
+        codec::merge_overlays(inputs, ListKind::Positions)
+    } else if key.starts_with(STEM) || key == META_MAYBE_EMPTY || key == META_OVERLAYS {
         codec::merge_node_sets(inputs)
     } else {
         None
+    };
+    if let Some(started) = started {
+        crate::engine::merge_trace::trace_record(full, existing, operands, result.as_deref(), started);
     }
+    result
 }

@@ -48,7 +48,7 @@ pub mod internals {
         NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, encode_tombstones_into, list_len, merge_positions,
         merge_postings,
     };
-    pub use crate::engine::{intersect, reads_on_this_thread};
+    pub use crate::engine::{MergeTrace, intersect, reads_on_this_thread, set_merge_trace, take_merge_trace};
 }
 
 pub type DocId = u64;

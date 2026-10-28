@@ -1,0 +1,3 @@
+# Addon compilado (npm run build).
+*.node
+node_modules/

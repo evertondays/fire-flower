@@ -1,4 +1,5 @@
 mod jsonl;
+mod monitor;
 mod tui;
 
 use std::collections::HashMap;
@@ -47,6 +48,8 @@ enum Command {
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia).
     /// Um ID que já existe é substituído; {"op": "delete", "id"} remove
@@ -70,6 +73,8 @@ enum Command {
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Remove documentos pelo ID
     Delete {
@@ -103,6 +108,21 @@ enum Command {
         #[arg(default_value_t = 10)]
         limit: usize,
     },
+    /// Painel do banco que outro processo está usando: lê o snapshot das
+    /// métricas que ele grava (Config::metrics), o /proc dele e a pasta do
+    /// banco. Nunca abre o banco
+    Monitor {
+        db: PathBuf,
+        /// Serve as métricas em /metrics (OpenMetrics) neste endereço
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9187", value_name = "ENDEREÇO")]
+        serve: Option<String>,
+        /// Imprime uma leitura em JSON e sai
+        #[arg(long)]
+        json: bool,
+        /// O arquivo do snapshot, se o motor grava fora da pasta do banco
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -112,6 +132,14 @@ struct LanguageArgs {
     /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_languages)]
     languages: Option<LanguageList>,
+}
+
+#[derive(clap::Args)]
+struct MetricsArgs {
+    /// Grava o snapshot das métricas na pasta do banco a cada segundo, para o
+    /// `fire-flower monitor` acompanhar a carga
+    #[arg(long)]
+    metrics: bool,
 }
 
 #[derive(clap::Args)]
@@ -176,12 +204,14 @@ fn main() -> ExitCode {
             let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, Config::reader()));
             tui::run(engine, &db.display().to_string(), reopen).map_err(Into::into)
         }),
-        Command::Index { db, paths, sync, languages, positions, stemming } => {
-            index(&db, &paths, sync, languages.languages, positions.config(), stemming)
+        Command::Index { db, paths, sync, languages, positions, stemming, metrics } => {
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            index(&db, &paths, sync, creation, metrics.metrics)
         }
-        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming } => {
+        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming, metrics } => {
             let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
-            open(&db, languages.languages, positions.config(), Some(stemming)).and_then(|engine| {
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            open(&db, creation, metrics.metrics).and_then(|engine| {
                 if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
@@ -205,6 +235,9 @@ fn main() -> ExitCode {
         }),
         Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
         Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
+        Command::Monitor { db, serve, json, metrics_file } => {
+            monitor::run(monitor::Options { db, metrics_file, serve, json })
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -227,16 +260,24 @@ fn open_existing(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
     Ok(Engine::open(db, Config { create_if_missing: false, ..Config::default() })?)
 }
 
-/// Abre (ou cria) o banco para indexar. `languages`, `positions` e
-/// `stemming` só importam na criação; `None` usa o que está gravado.
-fn open(
-    db: &Path,
+/// Opções que só importam na criação do banco; `None` usa o que está gravado.
+struct Creation {
     languages: Option<LanguageList>,
     positions: Option<bool>,
-    stemming: Option<StemmingArgs>,
-) -> Result<Engine, Box<dyn std::error::Error>> {
-    let (stemming, inflections) = stemming.map_or((None, None), |s| (s.stemming, s.inflections));
-    let config = Config { languages: languages.map(|l| l.0), positions, stemming, inflections, ..Config::default() };
+    stemming: StemmingArgs,
+}
+
+/// Abre (ou cria) o banco para indexar.
+fn open(db: &Path, creation: Creation, metrics: bool) -> Result<Engine, Box<dyn std::error::Error>> {
+    let Creation { languages, positions, stemming } = creation;
+    let config = Config {
+        languages: languages.map(|l| l.0),
+        positions,
+        stemming: stemming.stemming,
+        inflections: stemming.inflections,
+        metrics,
+        ..Config::default()
+    };
     Ok(Engine::open(db, config)?)
 }
 
@@ -271,15 +312,8 @@ fn indexed_files(engine: &Engine, paths: &[PathBuf]) -> Result<HashMap<String, u
     Ok(found)
 }
 
-fn index(
-    db: &Path,
-    paths: &[PathBuf],
-    sync: bool,
-    languages: Option<LanguageList>,
-    positions: Option<bool>,
-    stemming: StemmingArgs,
-) -> AnyResult {
-    let engine = open(db, languages, positions, Some(stemming))?;
+fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: bool) -> AnyResult {
+    let engine = open(db, creation, metrics)?;
     let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());

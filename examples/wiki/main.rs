@@ -27,6 +27,7 @@ use crate::load::load;
 use crate::oracle::{OracleArgs, oracle};
 use crate::queries::queries;
 use crate::relevance::run_relevance;
+use crate::reopen::reopen;
 use crate::sizes::sizes;
 use crate::vocab::vocab;
 
@@ -48,6 +49,7 @@ mod load;
 mod oracle;
 mod queries;
 mod relevance;
+mod reopen;
 mod rng;
 mod sizes;
 mod vocab;
@@ -116,6 +118,22 @@ enum Cmd {
         edits: bool,
         #[command(flatten)]
         plan: EditPlanArgs,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Quanto o Reader leva para reabrir enquanto o WAL cresce (lotes num banco novo)
+    Reopen {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 100_000)]
+        take: u64,
+        #[arg(long, default_value_t = 5000)]
+        batch: usize,
+        /// Config::max_wal_bytes do processo que grava, em MB
+        #[arg(long)]
+        max_wal_mb: Option<u64>,
         #[arg(long)]
         label: Option<String>,
     },
@@ -349,6 +367,9 @@ fn main() -> AnyResult {
         Cmd::Vocab { corpus, languages, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&languages)?), take, out),
         Cmd::Queries { vocab, corpus, languages, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&languages)?), seed, per_set, out)
+        }
+        Cmd::Reopen { db, corpus, take, batch, max_wal_mb, label } => {
+            reopen(&db, &corpus, take, batch.max(1), max_wal_mb.map(|m| m << 20), label)
         }
         Cmd::Edit { db, corpus, take, batch, max_ops, maintenance, plan, label } => {
             edit(&db, &corpus, take, batch.max(1), max_ops, plan, maintenance, label)

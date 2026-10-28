@@ -187,10 +187,20 @@ pub(crate) fn drop_os_caches() -> AnyResult {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize, cold: bool, perf_time: bool, config: Config, label: Option<String>) -> AnyResult {
+/// `level`: o `EnableTime` do crate corresponde a medir tempos no RocksDB 10
+/// (o enum está deslocado); `Disable` mede como uma aplicação.
+pub(crate) fn bench(
+    db: &Path,
+    paths: &[PathBuf],
+    threads: usize,
+    passes: usize,
+    cold: bool,
+    level: PerfStatsLevel,
+    config: Config,
+    label: Option<String>,
+) -> AnyResult {
     let sets = read_query_sets(paths)?;
-    // O enum do crate também está deslocado: `EnableTime` corresponde a medir tempos no RocksDB 10.
-    let level = if perf_time { PerfStatsLevel::EnableTime } else { PerfStatsLevel::EnableCount };
+    let perf_time = level == PerfStatsLevel::EnableTime;
     let mut engine = if cold { None } else { Some(Engine::open(db, crate::env::with_metrics(config.clone()))?) };
     let mut results = Vec::new();
 
@@ -223,11 +233,31 @@ pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize,
         let db_name = stem(db);
         format!("{db_name}-t{threads}{}", if cold { "-frio" } else { "" })
     });
+    // Com --plain (a base dos bindings): os rótulos dos 10 primeiros
+    // resultados de uma consulta frequente, num MultiGet.
+    let labels_10_us = match (&engine, level == PerfStatsLevel::Disable) {
+        (Some(engine), true) => Some(labels_cost(engine)?),
+        _ => None,
+    };
     save_result(
         "bench",
         &label,
         json!({ "db": db, "threads": threads, "passes": passes, "cold": cold, "perf_time": perf_time,
-                "config": config_json(&config), "sets": results }),
+                "config": config_json(&config), "sets": results, "labels_10_us": labels_10_us }),
     )?;
     Ok(())
+}
+
+/// Microssegundos para ler os rótulos dos 10 melhores de "brasil".
+fn labels_cost(engine: &Engine) -> AnyResult<f64> {
+    let ids: Vec<u64> = engine.search_top("brasil", 10)?.into_iter().map(|h| h.doc).collect();
+    let rounds = 20_000;
+    for _ in 0..rounds / 10 {
+        std::hint::black_box(engine.labels(&ids)?);
+    }
+    let t = Instant::now();
+    for _ in 0..rounds {
+        std::hint::black_box(engine.labels(&ids)?);
+    }
+    Ok(t.elapsed().as_secs_f64() * 1e6 / rounds as f64)
 }

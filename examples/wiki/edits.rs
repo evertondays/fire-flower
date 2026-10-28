@@ -195,7 +195,6 @@ pub(crate) fn edit(
     batch_size: usize,
     max_ops: Option<usize>,
     args: EditPlanArgs,
-    collect: bool,
     maintenance: Option<u64>,
     label: Option<String>,
 ) -> AnyResult {
@@ -208,10 +207,10 @@ pub(crate) fn edit(
 
     let started = Instant::now();
     let mut totals = CommitTotals::default();
-    let (mut replaced, mut deleted, mut tombstones) = (0usize, 0usize, 0usize);
+    let (mut replaced, mut deleted, mut killed) = (0usize, 0usize, 0usize);
     let mut commit_secs: Vec<f64> = Vec::new();
     prepared.apply(&engine, batch_size, |stats| {
-        (replaced, deleted, tombstones) = (replaced + stats.replaced, deleted + stats.deleted, tombstones + stats.tombstones);
+        (replaced, deleted, killed) = (replaced + stats.replaced, deleted + stats.deleted, killed + stats.killed);
         commit_secs.push(stats.total_secs);
         totals.add(&stats);
     })?;
@@ -223,9 +222,6 @@ pub(crate) fn edit(
         }
         worker.stop()?;
     }
-    let collect_started = Instant::now();
-    let emptied = if collect { Some(engine.collect_empty_words()?) } else { None };
-    let collect_secs = collect_started.elapsed().as_secs_f64();
     commit_secs.sort_by(f64::total_cmp);
     let pct = |p: f64| commit_secs.get(((commit_secs.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0);
     let (_, peak) = rss();
@@ -233,14 +229,13 @@ pub(crate) fn edit(
         "db": db, "corpus": corpus, "take": take, "batch": batch_size, "plan": format!("{args:?}"),
         "config": config_json(engine.config()), "format": fire_flower::FORMAT_VERSION,
         "ops": ops.len(), "seconds": secs, "ops_per_s": ops.len() as f64 / secs, "maintenance": maintenance,
-        "replaced": replaced, "deleted": deleted, "tombstones": tombstones,
+        "replaced": replaced, "deleted": deleted, "killed": killed, "dead_versions": engine.dead_versions(),
         "commits": commit_secs.len(), "commit_p50_s": pct(0.5), "commit_p99_s": pct(0.99),
-        "emptied_words": emptied, "collect_seconds": collect_secs,
         "peak_rss": peak, "db_bytes_before": size_before, "db_bytes": dir_size(db),
         "write": write_metrics(&engine), "commit_steps": totals.json(secs, ops.len() as f64),
     });
     println!(
-        "{} operações em {secs:.1}s: {:.0} ops/s ({replaced} substituídos, {deleted} removidos, {tombstones} lápides), commit p50 {:.1} ms, p99 {:.1} ms, banco {:.0} → {:.0} MB",
+        "{} operações em {secs:.1}s: {:.0} ops/s ({replaced} substituídos, {deleted} removidos, {killed} versões mortas), commit p50 {:.1} ms, p99 {:.1} ms, banco {:.0} → {:.0} MB",
         ops.len(),
         ops.len() as f64 / secs,
         pct(0.5) * 1e3,
@@ -248,9 +243,6 @@ pub(crate) fn edit(
         mb(size_before),
         mb(dir_size(db))
     );
-    if let Some(n) = emptied {
-        println!("limpeza: {n} palavras sem documento em {collect_secs:.2}s");
-    }
     save_result("edit", &label, result)?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Busca ranqueada (BM25F) com top-k.
 
-use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits, codec};
+use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits};
 use crate::codec::PostingsCursor;
 use crate::engine::conjunction::{AndList, Member, use_cursor};
 use crate::engine::groups::{GroupParts, decode_group};
@@ -122,12 +122,13 @@ impl View<'_> {
             }
         }
         // Decodifica uma lista inteira (a de um grupo guarda as entradas em `groups`).
+        let dead = self.dead()?;
         let decode = |m: Member<Posting>, i: usize, groups: &mut Vec<GroupParts>| -> Result<Vec<Posting>> {
             match m {
-                Member::Bytes { idx, .. } => codec::decode_postings(&bytes[idx]),
+                Member::Bytes { idx, .. } => self.postings_of(&bytes[idx]),
                 Member::Decoded(list) => Ok(list),
                 Member::Group { parts, .. } => {
-                    let (union, entries) = decode_group(&bytes, &parts)?;
+                    let (union, entries) = decode_group(&bytes, &parts, dead)?;
                     groups[group_of[i].expect("lista de grupo")] = entries;
                     Ok(union)
                 }
@@ -144,7 +145,7 @@ impl View<'_> {
             && matchers.is_empty()
             && let Some(Member::Group { parts, .. }) = lists.pop()
         {
-            let (_, entries) = decode_group(&bytes, &parts)?;
+            let (_, entries) = decode_group(&bytes, &parts, dead)?;
             let hits = self.top_single_group(&entries, *weight, *alpha, bound, &bm25, k)?;
             return Ok(TopHits { hits, total: entries.len() });
         }
@@ -204,18 +205,21 @@ impl View<'_> {
 
             // 3. Nota. Com o top-k cheio, um documento que nem com tamanho 0
             //    passaria do pior não precisa do tamanho (nem da nota exata).
-            //    Empate também perde: os IDs chegam em ordem crescente.
-            if let Some(worst) = top.threshold()
-                && doc_bound(&scorers, &sources, &groups, &counts) <= worst
-            {
-                continue;
+            //    No empate, o menor ID do usuário fica: os IDs internos chegam
+            //    em ordem, e só os da faixa alta (versões editadas) precisam
+            //    ser traduzidos para comparar.
+            if let Some(worst) = top.worst() {
+                let bound = doc_bound(&scorers, &sources, &groups, &counts);
+                if bound < worst.score || (bound == worst.score && self.user_id(doc)? > worst.doc) {
+                    continue;
+                }
             }
             let lens = match lens {
                 Some(l) => l,
                 None => norms.lens(doc)?,
             };
             let score = doc_score(&bm25, &scorers, &sources, &groups, &counts, bm25.doc_norm(lens));
-            top.push(Hit { doc, score });
+            top.push(Hit { doc: self.user_id(doc)?, score });
         }
         Ok(TopHits { hits: top.into_sorted(), total })
     }

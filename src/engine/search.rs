@@ -68,15 +68,16 @@ impl View<'_> {
             return Ok(Vec::new());
         }
 
-        // A lista menor conduz e é a única decodificada inteira; nas outras,
-        // cada documento dela é procurado por saltos (das menores para as
-        // maiores, que descartam mais cedo).
+        // A lista menor conduz e é a única decodificada inteira (sem as
+        // versões mortas: as outras listas só são consultadas nos documentos
+        // dela); nas outras, cada documento dela é procurado por saltos (das
+        // menores para as maiores, que descartam mais cedo).
         members.sort_by_key(Member::len);
         let mut members = members.into_iter();
         let mut result = match members.next().expect("há pelo menos uma lista") {
-            Member::Bytes { idx, .. } => codec::decode_docs(&bytes[idx])?,
+            Member::Bytes { idx, .. } => self.docs_of(&bytes[idx])?,
             Member::Decoded(list) => list,
-            Member::Group { parts, .. } => decode_group_docs(&bytes, &parts)?,
+            Member::Group { parts, .. } => decode_group_docs(&bytes, &parts, self.dead()?)?,
         };
         let mut cursors: Vec<PostingsCursor<'_>> = Vec::new();
         // Grupos de flexões: o documento precisa estar em alguma das listas.
@@ -87,11 +88,11 @@ impl View<'_> {
                 Member::Bytes { idx, len } if use_cursor(len, result.len()) => {
                     cursors.push(PostingsCursor::new(&bytes[idx])?)
                 }
-                Member::Bytes { idx, .. } => decoded.push((codec::decode_docs(&bytes[idx])?, 0)),
+                Member::Bytes { idx, .. } => decoded.push((self.docs_of(&bytes[idx])?, 0)),
                 Member::Decoded(list) => decoded.push((list, 0)),
                 Member::Group { parts, len } if use_cursor(len, result.len()) => group_cursors
                     .push(parts.iter().map(|&(_, idx)| PostingsCursor::new(&bytes[idx])).collect::<Result<_>>()?),
-                Member::Group { parts, .. } => decoded.push((decode_group_docs(&bytes, &parts)?, 0)),
+                Member::Group { parts, .. } => decoded.push((decode_group_docs(&bytes, &parts, self.dead()?)?, 0)),
             }
         }
         if !cursors.is_empty() || !decoded.is_empty() || !group_cursors.is_empty() {
@@ -137,7 +138,7 @@ impl View<'_> {
             }
             result = kept;
         }
-        Ok(result)
+        self.user_ids(result)
     }
 
     /// Guarda os bytes da lista `post:` do termo e devolve o df (0 se o termo

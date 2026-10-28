@@ -133,12 +133,17 @@ impl View<'_> {
             }
             for p in list {
                 let l = level(p);
+                if l < lo || l >= hi {
+                    continue;
+                }
+                // A lista traz IDs internos; o empate compara os do usuário.
                 let doc = doc_of(p);
-                if l < lo || l >= hi || loses(&top, bound.get_key(key_of(p)), doc) {
+                let user = self.user_id(doc)?;
+                if loses(&top, bound.get_key(key_of(p)), user) {
                     continue;
                 }
                 let norm = bm25.doc_norm(norms.lens(doc)?);
-                top.push(Hit { doc, score: score_of(p, norm) });
+                top.push(Hit { doc: user, score: score_of(p, norm) });
             }
             lo = hi;
         }
@@ -181,15 +186,9 @@ impl TopK {
         Self { k, heap: BinaryHeap::with_capacity(k.min(1 << 16) + 1) }
     }
 
-    /// Nota do pior guardado, quando já há `k`: só entra quem passar dela.
+    /// O pior guardado, quando já há `k`: só entra quem passar dele.
     #[inline]
-    pub(super) fn threshold(&self) -> Option<f64> {
-        self.worst().map(|w| w.score)
-    }
-
-    /// O pior guardado, quando já há `k`.
-    #[inline]
-    fn worst(&self) -> Option<Hit> {
+    pub(super) fn worst(&self) -> Option<Hit> {
         if self.heap.len() < self.k { None } else { self.heap.peek().map(|w| w.0) }
     }
 

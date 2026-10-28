@@ -11,18 +11,12 @@ pub const SKIP_BLOCK: usize = 128;
 /// Grava `n`, a tabela de saltos (se a lista for grande) e as entradas.
 /// `write` grava as entradas num buffer e anota, para cada bloco de
 /// `SKIP_BLOCK` entradas (o último pode ser menor), o último documento e onde
-/// o bloco termina (bytes desde o começo das entradas). `tombstones` diz se
-/// alguma entrada é uma lápide (só operandos de merge têm).
-pub(super) fn write_list(
-    buf: &mut Vec<u8>,
-    n: usize,
-    tombstones: bool,
-    write: impl FnOnce(&mut Vec<u8>, &mut Vec<(DocId, usize)>),
-) {
+/// o bloco termina (bytes desde o começo das entradas).
+pub(super) fn write_list(buf: &mut Vec<u8>, n: usize, write: impl FnOnce(&mut Vec<u8>, &mut Vec<(DocId, usize)>)) {
     put_varint(buf, n as u64);
     if n <= 2 * SKIP_BLOCK {
         // Lista pequena: sem tabela, e as entradas vão direto para `buf`.
-        put_skips(buf, &[], tombstones);
+        buf.push(0);
         write(buf, &mut Vec::new());
         return;
     }
@@ -36,7 +30,7 @@ pub(super) fn write_list(
         blocks.push(SkipEntry { last, bytes: end - start, count: count as u64 });
         start = end;
     }
-    put_skips(buf, &blocks, tombstones);
+    put_skips(buf, &blocks);
     buf.extend_from_slice(&body);
 }
 
@@ -51,10 +45,9 @@ pub(crate) struct SkipEntry {
     pub(super) count: u64,
 }
 
-/// `s << 1 | tem lápide`, depois `(Δúltimo doc, bytes, entradas − 1)` de
-/// cada bloco.
-pub(super) fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry], tombstones: bool) {
-    put_varint(buf, ((blocks.len() as u64) << 1) | u64::from(tombstones));
+/// `s`, depois `(Δúltimo doc, bytes, entradas − 1)` de cada bloco.
+pub(super) fn put_skips(buf: &mut Vec<u8>, blocks: &[SkipEntry]) {
+    put_varint(buf, blocks.len() as u64);
     let mut last = 0;
     for b in blocks {
         put_varint(buf, b.last - last);
@@ -76,11 +69,7 @@ pub(crate) struct Block {
 /// Cabeçalho de uma lista: quantas entradas, a tabela de saltos e onde as
 /// entradas começam.
 pub(super) struct ListHeader {
-    /// Entradas, lápides inclusive.
     pub(super) n: u64,
-    /// Alguma entrada é uma lápide. Só operandos de merge têm: o merge
-    /// completo as descarta, então uma busca nunca recebe uma.
-    pub(super) tombstones: bool,
     pub(super) blocks: Vec<Block>,
     pub(super) entries: Vec<SkipEntry>,
     pub(super) body: usize,
@@ -91,8 +80,7 @@ impl ListHeader {
     pub(super) fn parse(bytes: &[u8], parse_skips: bool) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
         let n = r.varint()?;
-        let packed = r.varint()?;
-        let (s, tombstones) = (packed >> 1, packed & 1 == 1);
+        let s = r.varint()?;
         // Tabela se e só se a lista for grande; cada bloco tem ao menos 3 bytes.
         if (s > 0) != (n as usize > 2 * SKIP_BLOCK) || s > n || s as usize > bytes.len() / 3 {
             return Err(corrupt("tabela de saltos inválida"));
@@ -121,21 +109,139 @@ impl ListHeader {
         } else {
             r.skip_varints(3 * s)?;
         }
-        Ok(Self { n, tombstones, blocks, entries, body: r.pos })
-    }
-
-    /// Como [`ListHeader::parse`], para quem lê a lista numa busca: uma
-    /// lápide ali é dado corrompido (o merge completo já as tirou).
-    pub(super) fn parse_clean(bytes: &[u8], parse_skips: bool) -> Result<Self, Error> {
-        let header = Self::parse(bytes, parse_skips)?;
-        if header.tombstones {
-            return Err(corrupt("lápide numa lista já unida"));
-        }
-        Ok(header)
+        Ok(Self { n, blocks, entries, body: r.pos })
     }
 }
 
 /// Quantas entradas a lista tem (o df do termo), sem decodificá-la.
 pub fn list_len(bytes: &[u8]) -> Result<u64, Error> {
     Reader::new(bytes).varint()
+}
+
+/// Os documentos mortos de uma lista (em ordem crescente), consultados com
+/// documentos crescentes: um teste por entrada enquanto o próximo morto não
+/// chega e, quando chega, um avanço exponencial a partir de onde parou (com
+/// mortos densos, o próximo quase sempre está a um passo; com esparsos,
+/// pula muitos de uma vez).
+pub(super) struct DeadSkip<'a> {
+    dead: &'a [DocId],
+    at: usize,
+    next: DocId,
+}
+
+impl<'a> DeadSkip<'a> {
+    pub(super) fn new(dead: &'a [DocId]) -> Self {
+        Self { dead, at: 0, next: dead.first().copied().unwrap_or(DocId::MAX) }
+    }
+
+    /// `doc` está entre os mortos (os documentos chegam em ordem crescente).
+    #[inline(always)]
+    pub(super) fn is_dead(&mut self, doc: DocId) -> bool {
+        if doc < self.next {
+            return false;
+        }
+        if doc > self.next {
+            self.reach(doc);
+        }
+        // `DocId::MAX` também marca o fim da lista.
+        self.next == doc && self.at < self.dead.len()
+    }
+
+    /// Vai até o primeiro morto ≥ `doc`.
+    #[inline]
+    fn reach(&mut self, doc: DocId) {
+        let rest = &self.dead[self.at..];
+        let mut hi = 1;
+        while hi < rest.len() && rest[hi] < doc {
+            hi *= 2;
+        }
+        let lo = hi / 2;
+        self.at += lo + rest[lo..hi.min(rest.len())].partition_point(|&d| d < doc);
+        self.next = self.dead.get(self.at).copied().unwrap_or(DocId::MAX);
+    }
+
+    /// Deixa para trás os mortos ≤ `doc`.
+    pub(super) fn pass(&mut self, doc: DocId) {
+        if self.next <= doc {
+            self.reach(doc);
+            if self.next == doc && self.at < self.dead.len() {
+                self.at += 1;
+                self.next = self.dead.get(self.at).copied().unwrap_or(DocId::MAX);
+            }
+        }
+    }
+
+    /// Algum morto ainda por vir é ≤ `doc`.
+    #[inline]
+    pub(super) fn any_up_to(&self, doc: DocId) -> bool {
+        self.next <= doc
+    }
+}
+
+/// Documentos mortos (ver `engine::versions`) para a busca pular ao
+/// decodificar. Os IDs até [`DeadBits::BITMAP_IDS`] ficam num mapa de bits
+/// (um teste por entrada); os outros (IDs de usuário enormes e a faixa alta,
+/// que é esparsa) numa lista em ordem, percorrida junto com a lista
+/// decodificada.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeadBits {
+    words: Vec<u64>,
+    rest: Vec<DocId>,
+}
+
+impl DeadBits {
+    /// Até onde vai o mapa de bits: no máximo 8 MB.
+    pub const BITMAP_IDS: DocId = 1 << 26;
+
+    /// `ids` em qualquer ordem.
+    pub fn new(ids: &[DocId]) -> Self {
+        let mut bits = Self::empty();
+        for &id in ids {
+            if id < Self::BITMAP_IDS {
+                let w = (id >> 6) as usize;
+                if bits.words.len() <= w {
+                    bits.words.resize(w + 1, 0);
+                }
+                bits.words[w] |= 1 << (id & 63);
+            } else {
+                bits.rest.push(id);
+            }
+        }
+        bits.rest.sort_unstable();
+        bits
+    }
+
+    /// Sem nenhum morto.
+    pub const fn empty() -> Self {
+        Self { words: Vec::new(), rest: Vec::new() }
+    }
+
+    /// Não há mortos: a decodificação usa o laço sem filtro.
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty() && self.rest.is_empty()
+    }
+
+    /// Para consultar com documentos crescentes (uma lista decodificada).
+    pub fn cursor(&self) -> DeadCursor<'_> {
+        DeadCursor { words: &self.words, limit: self.words.len() as u64 * 64, rest: DeadSkip::new(&self.rest) }
+    }
+}
+
+/// Consulta a [`DeadBits`] com documentos crescentes.
+pub struct DeadCursor<'a> {
+    words: &'a [u64],
+    limit: DocId,
+    rest: DeadSkip<'a>,
+}
+
+impl DeadCursor<'_> {
+    /// `doc` está morto. `doc` só cresce entre chamadas.
+    #[inline(always)]
+    pub fn is_dead(&mut self, doc: DocId) -> bool {
+        if doc < self.limit {
+            (self.words[(doc >> 6) as usize] >> (doc & 63)) & 1 == 1
+        } else {
+            self.rest.is_dead(doc)
+        }
+    }
 }

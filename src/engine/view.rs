@@ -1,26 +1,107 @@
 //! Leituras de uma busca sobre um snapshot ([`View`]): nós da Trie, listas,
 //! tamanhos dos documentos.
 
+use std::cell::OnceCell;
 use std::sync::Arc;
 
 use rocksdb::DB;
 use rustc_hash::FxHashMap;
 
 use crate::{DocId, Engine, Error, IndexStats, Posting, Result, codec};
-use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
-use crate::engine::keys::{Key, META_DOC_COUNT, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POST, ROOT_ID};
+use crate::codec::{DeadBits, DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
+use crate::engine::keys::{
+    Key, META_DOC_COUNT, META_EPOCH, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POS, POST, ROOT_ID, VER,
+};
+use crate::engine::versions;
+use crate::engine::versions::DeadSet;
 
 type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
 
 /// Leituras de uma única busca, todas sobre o mesmo snapshot.
+///
+/// As listas trazem IDs internos (ver `versions`): a busca tira as versões
+/// mortas que o snapshot vê ao decodificar, faz o E e o ranking com os IDs
+/// internos e traduz para os do usuário no fim.
 pub(super) struct View<'a> {
     pub(super) snap: Snapshot<'a>,
-    /// Número do último commit visível quando o snapshot foi criado.
+    /// Número do último commit visível quando o snapshot foi criado (o
+    /// snapshot pode ser de um commit depois deste).
     pub(super) epoch: u64,
+    /// O commit exato do snapshot, se `Engine::view` soube sem ler.
+    exact: Option<u64>,
+    /// Os mortos quando o snapshot foi criado (`None`: nenhum).
+    deaths: Option<Arc<DeadSet>>,
+    /// Os mortos que este snapshot vê, se forem só parte de `deaths`.
+    visible: OnceCell<Option<DeadBits>>,
     pub(super) engine: &'a Engine,
 }
 
+impl<'a> View<'a> {
+    pub(super) fn new(
+        snap: Snapshot<'a>,
+        epoch: u64,
+        exact: Option<u64>,
+        deaths: Option<Arc<DeadSet>>,
+        engine: &'a Engine,
+    ) -> Self {
+        Self { snap, epoch, exact, deaths, visible: OnceCell::new(), engine }
+    }
+}
+
 impl View<'_> {
+    /// As versões mortas que este snapshot vê (vazio no caso comum). Uma
+    /// morte de um commit depois do snapshot não conta: para ele, a versão
+    /// ainda está viva.
+    pub(super) fn dead(&self) -> Result<&DeadBits> {
+        static NONE: DeadBits = DeadBits::empty();
+        let Some(deaths) = &self.deaths else { return Ok(&NONE) };
+        if self.visible.get().is_none() {
+            let visible = if deaths.all_by(self.epoch) {
+                None
+            } else {
+                let epoch = match self.exact {
+                    Some(e) => e,
+                    None => self.snap.get_bytes(META_EPOCH)?.map(|v| codec::get_varint(&v)).transpose()?.unwrap_or(0),
+                };
+                (!deaths.all_by(epoch)).then(|| deaths.visible(epoch))
+            };
+            let _ = self.visible.set(visible);
+        }
+        Ok(match self.visible.get().expect("acabou de ser preenchido") {
+            Some(bits) => bits,
+            None => deaths.bits(),
+        })
+    }
+
+    /// Os documentos vivos de uma lista `post:` (IDs internos).
+    pub(super) fn docs_of(&self, bytes: &[u8]) -> Result<Vec<DocId>> {
+        codec::decode_docs_except(bytes, self.dead()?)
+    }
+
+    /// As entradas vivas de uma lista `post:` (IDs internos).
+    pub(super) fn postings_of(&self, bytes: &[u8]) -> Result<Vec<Posting>> {
+        codec::decode_postings_except(bytes, self.dead()?)
+    }
+
+    /// O ID do usuário de um ID interno.
+    #[inline]
+    pub(super) fn user_id(&self, id: DocId) -> Result<DocId> {
+        Ok(versions::user_of(id))
+    }
+
+    /// IDs internos em ordem → IDs do usuário em ordem.
+    pub(super) fn user_ids(&self, ids: Vec<DocId>) -> Result<Vec<DocId>> {
+        Ok(versions::users_sorted(ids))
+    }
+
+    /// O ID interno da última versão do documento (viva ou não).
+    pub(super) fn version_of(&self, doc: DocId) -> Result<u64> {
+        Ok(match self.snap.get_bytes(Key::new(VER, doc).as_ref())? {
+            Some(v) => codec::get_varint(&v)?,
+            None => doc,
+        })
+    }
+
     /// Bytes da lista `post:` de um nó, presos ao snapshot (sem cópia).
     pub(super) fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
         self.snap.get_bytes(Key::new(POST, node).as_ref())
@@ -94,18 +175,39 @@ impl View<'_> {
         Ok(Some(node))
     }
 
-    pub(super) fn load_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
-        match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
-            Some(v) => codec::decode_docs(&v),
+    /// Os documentos do termo do nó, com os IDs do usuário, em ordem.
+    pub(super) fn user_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
+        match self.post_bytes(node_id)? {
+            Some(v) => self.user_ids(self.docs_of(&v)?),
             None => Ok(Vec::new()),
         }
     }
 
-    pub(super) fn load_postings(&self, node_id: u64) -> Result<Vec<Posting>> {
-        match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
-            Some(v) => codec::decode_postings(&v),
-            None => Ok(Vec::new()),
+    /// Como [`View::user_docs`], com o tf.
+    pub(super) fn user_postings(&self, node_id: u64) -> Result<Vec<Posting>> {
+        let Some(v) = self.post_bytes(node_id)? else { return Ok(Vec::new()) };
+        let mut list = self.postings_of(&v)?;
+        if list.last().is_some_and(|p| p.doc >= versions::FIRST_VERSION) {
+            for p in &mut list {
+                p.doc = self.user_id(p.doc)?;
+            }
+            list.sort_unstable_by_key(|p| p.doc);
         }
+        Ok(list)
+    }
+
+    /// As posições do termo do nó em cada documento, com os IDs do usuário.
+    pub(super) fn user_positions(&self, node_id: u64) -> Result<Vec<(DocId, Vec<u32>)>> {
+        let Some(v) = self.snap.get_bytes(Key::new(POS, node_id).as_ref())? else { return Ok(Vec::new()) };
+        let mut dead = self.dead()?.cursor();
+        let mut list = Vec::new();
+        for (doc, positions) in codec::decode_positions(&v)? {
+            if !dead.is_dead(doc) {
+                list.push((self.user_id(doc)?, positions));
+            }
+        }
+        list.sort_unstable_by_key(|e| e.0);
+        Ok(list)
     }
 
     pub(super) fn norm_block(&self, block: u64) -> Result<Option<Arc<NormBlock>>> {

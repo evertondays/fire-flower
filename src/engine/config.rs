@@ -52,15 +52,6 @@ pub struct Config {
     /// faz o `open` falhar. Sem posições o banco fica menor e a carga mais
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
-    /// Grava os termos de cada documento (`fwd:`), o que permite substituir
-    /// ([`crate::IndexBatch::add_titled`] com um ID que já existe) e remover
-    /// ([`crate::IndexBatch::delete_document`]) documentos.
-    ///
-    /// Decidido na criação, como as posições: `None` usa o gravado (ou liga,
-    /// num banco novo). Sem ele o banco fica menor e a carga mais rápida, mas
-    /// remover dá erro, e reindexar um ID só troca tf, posições e tamanho
-    /// (termos que saíram do texto continuam apontando para o documento).
-    pub edits: Option<bool>,
     /// Reduz as palavras ao radical (Snowball) na indexação e na busca:
     /// "correndo" acha "corrida". Ver [`crate::analysis::stem`].
     ///
@@ -144,7 +135,6 @@ impl Default for Config {
             reader_cache_depth: Some(4),
             languages: None,
             positions: None,
-            edits: None,
             stemming: None,
             inflections: None,
             // Escolhidos pela grade da Fase 4 do plano de stemming (100k da

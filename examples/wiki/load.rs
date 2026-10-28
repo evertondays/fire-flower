@@ -78,7 +78,7 @@ pub(crate) fn load(
         "db": db, "corpus": corpus_path, "batch": batch_size, "skip": skip, "take": take,
         "remap_ids": remap_ids, "streaming": streaming, "config": config_json(engine.config()),
         "languages": engine.languages().iter().map(|l| l.code()).collect::<Vec<_>>(),
-        "format": fire_flower::FORMAT_VERSION, "positions": engine.has_positions(), "edits": engine.has_edits(),
+        "format": fire_flower::FORMAT_VERSION, "positions": engine.has_positions(),
         "stemming": engine.stemmer().stemming().code(),
         "inflections": engine.inflector().stemming().code(),
         "docs": docs, "bytes_corpus": bytes, "seconds": secs,
@@ -141,7 +141,6 @@ pub(crate) struct CommitTotals {
     pub(crate) write: f64,
     pub(crate) evict: f64,
     pub(crate) documents: f64,
-    pub(crate) fwd_reads: u64,
     pub(crate) total: f64,
 }
 
@@ -160,7 +159,6 @@ impl CommitTotals {
         self.write += c.write_secs;
         self.evict += c.evict_secs;
         self.documents += c.documents_secs;
-        self.fwd_reads += c.fwd_reads;
         self.total += c.total_secs;
     }
 
@@ -171,7 +169,6 @@ impl CommitTotals {
             "commit_fraction": f(self.total), "sort_fraction": f(self.sort), "trie_fraction": f(self.trie),
             "encode_fraction": f(self.encode), "nodes_fraction": f(self.nodes), "write_fraction": f(self.write),
             "evict_fraction": f(self.evict), "documents_fraction": f(self.documents), "commits": self.commits,
-            "fwd_reads_per_doc": self.fwd_reads as f64 / docs.max(1.0),
             "terms_per_commit": self.terms as f64 / self.commits.max(1) as f64,
             "commit_reads_per_doc": self.node_reads as f64 / docs.max(1.0),
             "new_nodes_per_doc": self.new_nodes as f64 / docs.max(1.0),

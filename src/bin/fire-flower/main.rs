@@ -77,8 +77,9 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<u64>,
     },
-    /// Compacta o banco: une os pedaços pendentes das listas de documentos e
-    /// tira da Trie as palavras que ficaram sem documento
+    /// Compacta o banco: une os pedaços pendentes das listas de documentos,
+    /// tira delas as versões de documentos substituídos ou removidos, e tira
+    /// da Trie as palavras que ficaram sem documento
     Compact {
         db: PathBuf,
     },
@@ -119,11 +120,6 @@ struct PositionArgs {
     /// busca por frase. Num banco existente, precisa combinar com a criação.
     #[arg(long)]
     no_positions: bool,
-    /// Cria o banco sem os termos de cada documento: menor e mais rápido de
-    /// carregar, mas sem remover nem substituir documentos (reindexar um ID
-    /// deixa os termos que saíram). Num banco existente, precisa combinar.
-    #[arg(long)]
-    no_edits: bool,
 }
 
 #[derive(clap::Args)]
@@ -147,18 +143,10 @@ fn parse_stemming(s: &str) -> Result<Stemming, String> {
 }
 
 impl PositionArgs {
-    /// Posições e `fwd:` para a config: `None` (usa o que o banco tiver)
-    /// quando a opção não foi dada.
-    fn config(&self) -> Features {
-        Features { positions: self.no_positions.then_some(false), edits: self.no_edits.then_some(false) }
+    /// `None` (usa o que o banco tiver) quando a opção não foi dada.
+    fn config(&self) -> Option<bool> {
+        self.no_positions.then_some(false)
     }
-}
-
-/// O que o banco grava, decidido na criação (`None`: o que estiver gravado).
-#[derive(Default)]
-struct Features {
-    positions: Option<bool>,
-    edits: Option<bool>,
 }
 
 /// Lista de idiomas já validada (o clap precisa de um tipo só para o valor).
@@ -183,7 +171,7 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { db } => open(&db, None, Features::default(), None).and_then(|engine| {
+        Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
             tui::run(&engine, &db.display().to_string()).map_err(Into::into)
         }),
         Command::Index { db, paths, sync, languages, positions, stemming } => {
@@ -195,21 +183,21 @@ fn main() -> ExitCode {
                 if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
-                    eprintln!("edição de documentos: {}", if engine.has_edits() { "sim" } else { "não" });
                     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
                 }
                 jsonl::index(&engine, &file, &opts)
             })
         }
         Command::Delete { db, ids } => delete(&db, &ids),
-        Command::Compact { db } => open(&db, None, Features::default(), None).and_then(|engine| {
+        Command::Compact { db } => open(&db, None, None, None).and_then(|engine| {
             let started = Instant::now();
-            engine.compact();
-            // Depois da compactação as listas não têm pedaços pendentes: conferir é barato.
-            let emptied = engine.collect_empty_words()?;
+            let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
-            if emptied > 0 {
-                println!("{emptied} palavra(s) sem documento saíram do índice");
+            if stats.purged > 0 {
+                println!("{} versão(ões) de documentos substituídos ou removidos saíram das listas", stats.purged);
+            }
+            if stats.emptied_words > 0 {
+                println!("{} palavra(s) sem documento saíram do índice", stats.emptied_words);
             }
             Ok(())
         }),
@@ -225,28 +213,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `languages`, `features` e `stemming` só importam na
+/// Abre o banco. `languages`, `positions` e `stemming` só importam na
 /// criação; `None` usa o que está gravado.
 fn open(
     db: &Path,
     languages: Option<LanguageList>,
-    features: Features,
+    positions: Option<bool>,
     stemming: Option<StemmingArgs>,
 ) -> Result<Engine, Box<dyn std::error::Error>> {
     let (stemming, inflections) = stemming.map_or((None, None), |s| (s.stemming, s.inflections));
-    let config = Config {
-        languages: languages.map(|l| l.0),
-        positions: features.positions,
-        edits: features.edits,
-        stemming,
-        inflections,
-        ..Config::default()
-    };
+    let config = Config { languages: languages.map(|l| l.0), positions, stemming, inflections, ..Config::default() };
     Ok(Engine::open(db, config)?)
 }
 
 fn delete(db: &Path, ids: &[u64]) -> AnyResult {
-    let engine = open(db, None, Features::default(), None)?;
+    let engine = open(db, None, None, None)?;
     let mut batch = engine.batch();
     for &id in ids {
         batch.delete_document(id)?;
@@ -281,13 +262,10 @@ fn index(
     paths: &[PathBuf],
     sync: bool,
     languages: Option<LanguageList>,
-    features: Features,
+    positions: Option<bool>,
     stemming: StemmingArgs,
 ) -> AnyResult {
-    let engine = open(db, languages, features, Some(stemming))?;
-    if sync && !engine.has_edits() {
-        return Err("--sync precisa de um banco com edição de documentos (criado sem --no-edits)".into());
-    }
+    let engine = open(db, languages, positions, Some(stemming))?;
     let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
@@ -355,7 +333,7 @@ fn index(
 }
 
 fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open(db, None, Features::default(), None)?;
+    let engine = open(db, None, None, None)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
     let (hits, total) = if by_id {
@@ -384,7 +362,7 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None, Features::default(), None)?;
+    let engine = open(db, None, None, None)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

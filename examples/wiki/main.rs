@@ -94,9 +94,6 @@ enum Cmd {
         /// Cria o banco sem posições (sem busca por frase)
         #[arg(long)]
         no_positions: bool,
-        /// Cria o banco sem os termos de cada documento (fwd:): sem editar nem remover
-        #[arg(long)]
-        no_edits: bool,
         /// Stemming de um banco novo ("pt", "pt-plural", "en" ou "none"). Sem a opção,
         /// usa o que está gravado no banco (ou nenhum)
         #[arg(long)]
@@ -133,9 +130,6 @@ enum Cmd {
         /// Aplica só as M primeiras operações do plano (para medir vazão)
         #[arg(long)]
         max_ops: Option<usize>,
-        /// Roda a limpeza de palavras sem documento no fim
-        #[arg(long)]
-        collect: bool,
         /// Manutenção em segundo plano que compacta a cada N edições
         #[arg(long)]
         maintenance: Option<u64>,
@@ -319,7 +313,7 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, no_edits, stemming, inflections, whole_filter, edits, plan, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, edits, plan, label } => {
             let languages = languages.as_deref().map(parse_languages).transpose()?;
             let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou none)"));
             let stemming = stemming.map(code).transpose()?;
@@ -329,7 +323,6 @@ fn main() -> AnyResult {
                 writer_cache_nodes: node_cache.unwrap_or(Config::default().writer_cache_nodes),
                 languages,
                 positions: no_positions.then_some(false),
-                edits: no_edits.then_some(false),
                 stemming,
                 inflections,
                 partition_filters: !whole_filter,
@@ -342,8 +335,8 @@ fn main() -> AnyResult {
         Cmd::Queries { vocab, corpus, languages, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&languages)?), seed, per_set, out)
         }
-        Cmd::Edit { db, corpus, take, batch, max_ops, collect, maintenance, plan, label } => {
-            edit(&db, &corpus, take, batch.max(1), max_ops, plan, collect, maintenance, label)
+        Cmd::Edit { db, corpus, take, batch, max_ops, maintenance, plan, label } => {
+            edit(&db, &corpus, take, batch.max(1), max_ops, plan, maintenance, label)
         }
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, edits, plan, label } => {
             let config = inflections.apply(Config::default())?;

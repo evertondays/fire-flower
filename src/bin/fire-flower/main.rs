@@ -88,6 +88,8 @@ enum Command {
     /// da Trie as palavras que ficaram sem documento
     Compact {
         db: PathBuf,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
     /// Os resultados saem por relevância (BM25), com a nota.
@@ -138,9 +140,19 @@ struct LanguageArgs {
 #[derive(clap::Args)]
 struct MetricsArgs {
     /// Grava o snapshot das métricas na pasta do banco a cada segundo, para o
-    /// `fire-flower monitor` acompanhar a carga
+    /// `fire-flower monitor` acompanhar o trabalho
     #[arg(long)]
     metrics: bool,
+    /// Como --metrics, gravando neste arquivo em vez da pasta do banco
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+}
+
+impl MetricsArgs {
+    fn apply(self, config: Config) -> Config {
+        let metrics = self.metrics || self.metrics_file.is_some();
+        Config { metrics, metrics_file: self.metrics_file, ..config }
+    }
 }
 
 #[derive(clap::Args)]
@@ -207,12 +219,12 @@ fn main() -> ExitCode {
         }),
         Command::Index { db, paths, sync, languages, positions, stemming, metrics } => {
             let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
-            index(&db, &paths, sync, creation, metrics.metrics)
+            index(&db, &paths, sync, creation, metrics)
         }
         Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming, metrics } => {
             let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
             let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
-            open(&db, creation, metrics.metrics).and_then(|engine| {
+            open(&db, creation, metrics).and_then(|engine| {
                 if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
@@ -222,7 +234,7 @@ fn main() -> ExitCode {
             })
         }
         Command::Delete { db, ids } => delete(&db, &ids),
-        Command::Compact { db } => open_existing(&db).and_then(|engine| {
+        Command::Compact { db, metrics } => open_existing(&db, metrics).and_then(|engine| {
             let started = Instant::now();
             let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
@@ -257,8 +269,8 @@ fn open_reader(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
 
 /// Abre um banco que já existe para gravar (`delete`, `compact`): um caminho
 /// errado dá erro em vez de criar um banco vazio.
-fn open_existing(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
-    Ok(Engine::open(db, Config { create_if_missing: false, ..Config::default() })?)
+fn open_existing(db: &Path, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open(db, metrics.apply(Config { create_if_missing: false, ..Config::default() }))?)
 }
 
 /// Opções que só importam na criação do banco; `None` usa o que está gravado.
@@ -269,21 +281,20 @@ struct Creation {
 }
 
 /// Abre (ou cria) o banco para indexar.
-fn open(db: &Path, creation: Creation, metrics: bool) -> Result<Engine, Box<dyn std::error::Error>> {
+fn open(db: &Path, creation: Creation, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
     let Creation { languages, positions, stemming } = creation;
     let config = Config {
         languages: languages.map(|l| l.0),
         positions,
         stemming: stemming.stemming,
         inflections: stemming.inflections,
-        metrics,
         ..Config::default()
     };
-    Ok(Engine::open(db, config)?)
+    Ok(Engine::open(db, metrics.apply(config))?)
 }
 
 fn delete(db: &Path, ids: &[u64]) -> AnyResult {
-    let engine = open_existing(db)?;
+    let engine = open_existing(db, MetricsArgs { metrics: false, metrics_file: None })?;
     let mut batch = engine.batch();
     for &id in ids {
         batch.delete_document(id)?;
@@ -313,7 +324,7 @@ fn indexed_files(engine: &Engine, paths: &[PathBuf]) -> Result<HashMap<String, u
     Ok(found)
 }
 
-fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: bool) -> AnyResult {
+fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: MetricsArgs) -> AnyResult {
     let engine = open(db, creation, metrics)?;
     let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));

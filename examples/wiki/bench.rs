@@ -191,7 +191,7 @@ pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize,
     let sets = read_query_sets(paths)?;
     // O enum do crate também está deslocado: `EnableTime` corresponde a medir tempos no RocksDB 10.
     let level = if perf_time { PerfStatsLevel::EnableTime } else { PerfStatsLevel::EnableCount };
-    let mut engine = if cold { None } else { Some(Engine::open(db, config.clone())?) };
+    let mut engine = if cold { None } else { Some(Engine::open(db, crate::env::with_metrics(config.clone()))?) };
     let mut results = Vec::new();
 
     println!("| conjunto | p50 µs | p95 µs | p99 µs | máx µs | qps | resultados | Gets | block reads |");
@@ -200,7 +200,7 @@ pub(crate) fn bench(db: &Path, paths: &[PathBuf], threads: usize, passes: usize,
         if cold {
             drop(engine.take()); // fecha antes de esvaziar o cache
             drop_os_caches()?;
-            engine = Some(Engine::open(db, config.clone())?);
+            engine = Some(Engine::open(db, crate::env::with_metrics(config.clone()))?);
         } else {
             run_set(engine.as_ref().unwrap(), set, threads, level)?; // aquecimento, descartado
         }

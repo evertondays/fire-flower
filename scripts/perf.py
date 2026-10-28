@@ -920,12 +920,12 @@ def phase_bindings(scale):
         for suffix, mode in (("-top10", ["--mode", "top10"]), ("", [])):
             wiki("bench", "--db", path, "--queries", qdir, "--plain", *mode, "--label", f"bindings-{scale}-native{suffix}")
             node("bench.js", "--db", path, "--queries", qdir, *mode, "--label", f"bindings-{scale}-node{suffix}")
-    step("leitores em paralelo: threads do Rust e worker_threads")
+    step("leitores em paralelo: threads do Rust e worker_threads (os 10 melhores do mixed)")
     mixed = os.path.join(qdir, "mixed.txt")
     for t in BINDING_THREADS:
-        wiki("bench", "--db", path, "--queries", mixed, "--threads", t, "--plain",
+        wiki("bench", "--db", path, "--queries", mixed, "--threads", t, "--plain", "--mode", "top10",
              "--label", f"bindings-{scale}-native-t{t}")
-    node("workers.js", "--db", path, "--queries", mixed, "--threads", *BINDING_THREADS,
+    node("workers.js", "--db", path, "--queries", mixed, "--mode", "top10", "--threads", *BINDING_THREADS,
          "--label", f"bindings-{scale}-node")
     load_scale = smaller(scale, "100k")
     tmp = db("tmp-bindings")

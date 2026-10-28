@@ -11,6 +11,8 @@ if (isMainThread) {
   const { args, list, percentile, readSets, saveResult } = require("./common");
   const opt = args();
   const set = readSets(list(opt.queries))[0];
+  // --mode: como o wiki bench --mode (top10 é o caminho de uma aplicação).
+  if (typeof opt.mode === "string") set.mode = opt.mode;
   const counts = list(opt.threads).map(Number);
   (async () => {
     const results = [];
@@ -51,15 +53,21 @@ if (isMainThread) {
   const engine = Engine.openSync(workerData.db);
   const samples = [];
   const { mode } = workerData;
+  const run = (record) => {
+    for (const q of workerData.queries) {
+      const t = process.hrtime.bigint();
+      if (mode === "suggest") engine.suggestSync(q, 10);
+      else if (mode === "top10") engine.searchTopSync(q, { k: 10 });
+      else engine.searchSync(q);
+      if (record) samples.push(String(process.hrtime.bigint() - t));
+    }
+  };
+  // Aquecimento dentro do worker: cada worker é um isolate novo do V8 (JIT
+  // frio) e uma thread nova para o RocksDB.
+  run(false);
   parentPort.postMessage("pronto");
   await new Promise((resolve) => parentPort.once("message", resolve));
-  for (const q of workerData.queries) {
-    const t = process.hrtime.bigint();
-    if (mode === "suggest") engine.suggestSync(q, 10);
-    else if (mode === "top10") engine.searchTopSync(q, { k: 10 });
-    else engine.searchSync(q);
-    samples.push(String(process.hrtime.bigint() - t));
-  }
+  run(true);
   engine.close();
   parentPort.postMessage(samples);
 })();

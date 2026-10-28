@@ -197,12 +197,27 @@ impl Engine {
         // Com a família padrão explícita, `cf_handle("default")` existe (o
         // `MultiGet` em lote do crate precisa dela). Para o RocksDB é o mesmo
         // banco; o descritor leva as mesmas opções (merge operator, cache…).
-        let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-        let opened = if read_only {
-            DB::open_cf_descriptors_read_only(&opts, path, [default_cf], false)
-        } else {
-            DB::open_cf_descriptors(&opts, path, [default_cf])
+        let open = || {
+            let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
+            if read_only {
+                DB::open_cf_descriptors_read_only(&opts, path, [default_cf], false)
+            } else {
+                DB::open_cf_descriptors(&opts, path, [default_cf])
+            }
         };
+        let mut opened = open();
+        // Só leitura, ao lado de quem grava: um WAL ou SST listado pode sumir
+        // no meio da abertura (o outro processo terminou um flush ou uma
+        // compactação). É passageiro; a próxima tentativa vê os arquivos novos.
+        for _ in 0..READ_ONLY_RETRIES {
+            match &opened {
+                Err(e) if read_only && is_missing_file(e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    opened = open();
+                }
+                _ => break,
+            }
+        }
         let db = match opened {
             Ok(db) => db,
             // Um banco antigo com merges pendentes no WAL falha já na
@@ -232,7 +247,8 @@ impl Engine {
         let loaded = versions::load(&db, &deaths)?;
         let metrics = if config.metrics {
             if !cfg!(feature = "metrics") {
-                return Err(Error::Config("Config::metrics pede a feature `metrics`, desligada nesta compilação".into()));
+                let msg = "Config::metrics pede a feature `metrics`, desligada nesta compilação";
+                return Err(Error::Config(msg.into()));
             }
             let m = Metrics::new();
             m.set_documents(stats.doc_count);
@@ -600,7 +616,7 @@ impl Engine {
 /// a pasta não é um banco, ou outro processo o tem aberto para escrita.
 fn open_error(path: &Path, e: rocksdb::Error) -> Error {
     let text = e.to_string();
-    if text.contains("does not exist") || text.contains("No such file") {
+    if !path.join("CURRENT").is_file() {
         not_a_database(path)
     } else if text.contains("lock") && text.contains("LOCK") {
         Error::Open(format!(
@@ -610,6 +626,15 @@ fn open_error(path: &Path, e: rocksdb::Error) -> Error {
     } else {
         Error::Db(e)
     }
+}
+
+/// Quantas vezes `open_read_only` tenta de novo quando um arquivo some no
+/// meio da abertura.
+const READ_ONLY_RETRIES: usize = 5;
+
+fn is_missing_file(e: &rocksdb::Error) -> bool {
+    let text = e.to_string();
+    text.contains("No such file") || text.contains("does not exist")
 }
 
 fn not_a_database(path: &Path) -> Error {

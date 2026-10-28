@@ -8,8 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
 
-use super::{ACCENT, ACCENT_SOFT, App, MUTED, Preview, PreviewContent};
-
+use super::{App, Preview, PreviewContent};
+use crate::style::{ACCENT, ACCENT_SOFT, MUTED, format_count, panel, truncate_left};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
@@ -255,7 +255,6 @@ impl App {
     }
 }
 
-
 /// `"copa _ mundo"`: a frase com um `_` por stopword pulada.
 pub(super) fn describe_phrase(clause: &Clause) -> String {
     let Clause::Phrase(parts) = clause else { return String::new() };
@@ -270,35 +269,4 @@ pub(super) fn describe_phrase(clause: &Clause) -> String {
         next = part.offset + 1;
     }
     format!("\"{}\"", words.join(" "))
-}
-
-fn panel(title: &str) -> Block<'_> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(MUTED))
-        .title(Span::styled(title, Style::new().fg(Color::Gray).bold()))
-}
-
-
-/// Corta pela esquerda: em caminhos, o fim (nome do arquivo) é o que importa.
-pub(super) fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max || max < 2 {
-        return s.to_string();
-    }
-    let skip = count - (max - 1);
-    format!("…{}", s.chars().skip(skip).collect::<String>())
-}
-
-/// 1234567 -> "1.234.567"
-pub(super) fn format_count(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
 }

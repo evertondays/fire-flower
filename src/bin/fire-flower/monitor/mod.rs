@@ -13,6 +13,7 @@ use self::process::Process;
 
 mod disk;
 mod openmetrics;
+mod panel;
 mod process;
 mod serve;
 #[cfg(test)]
@@ -87,7 +88,7 @@ pub(super) fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = opts.serve {
         return serve::serve(&addr, source);
     }
-    Err("o painel chega na fase 4; use --serve ou --json".into())
+    Ok(panel::run(source)?)
 }
 
 fn no_snapshot(file: &Path) -> String {

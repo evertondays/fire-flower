@@ -11,7 +11,6 @@ use fire_flower::analysis::normalize_term;
 use fire_flower::query::{Clause, QueryTerm};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::Color;
 use ratatui::text::Line;
 
 use self::preview::load_preview;
@@ -21,9 +20,6 @@ mod preview;
 #[cfg(test)]
 mod tests;
 
-const ACCENT: Color = Color::Rgb(255, 122, 48);
-const ACCENT_SOFT: Color = Color::Rgb(120, 60, 30);
-const MUTED: Color = Color::DarkGray;
 const MAX_SUGGESTIONS: usize = 8;
 /// A prévia só lê o começo de arquivos grandes.
 const MAX_PREVIEW_BYTES: usize = 2 << 20;

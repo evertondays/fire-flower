@@ -201,3 +201,156 @@ fn scrape_of_a_live_engine() {
         assert!(response.contains("fireflower_disk_index_bytes{kind=\"sst\"}"));
     }
 }
+
+mod panel_tests {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use fire_flower::metrics::{OpCounters, QUERY_BOUNDS, RocksdbProps, Snapshot};
+
+    use super::super::panel::{Panel, alerts, quantile, rates};
+    use super::super::{Reading, Source};
+    use super::process::Process;
+
+    #[test]
+    fn quantiles_from_buckets() {
+        let bounds = [1.0, 2.0, 4.0];
+        assert_eq!(quantile(&bounds, &[0, 10, 0, 0], 0.5), Some(1.5));
+        assert_eq!(quantile(&bounds, &[10, 0, 0, 0], 0.99), Some(0.99));
+        assert_eq!(quantile(&bounds, &[0, 0, 0, 3], 0.5), Some(4.0), "no +Inf, o maior limite");
+        assert_eq!(quantile(&bounds, &[0, 0, 0, 0], 0.5), None);
+    }
+
+    /// Duas leituras com 1 s entre elas: 100 buscas, 50 documentos, 20
+    /// substituídos e 5 removidos, 0,5 s de CPU.
+    fn two_readings() -> (Reading, Reading) {
+        let snapshot = |t: f64, n: u64| {
+            let mut buckets = vec![0; QUERY_BOUNDS.len() + 1];
+            buckets[4] = n; // ≤ 100 µs
+            let mut s = Snapshot {
+                pid: 7,
+                opened_unix: 1000.0,
+                written_unix: t,
+                sequence: t as u64,
+                interval_secs: 1.0,
+                queries: vec![OpCounters {
+                    op: "search_top".into(),
+                    count: n,
+                    buckets,
+                    reads: n * 12,
+                    ..OpCounters::default()
+                }],
+                ..Snapshot::default()
+            };
+            s.writer.indexed_documents = n / 2;
+            s.writer.replaced_documents = n / 5;
+            s.writer.deleted_documents = n / 20;
+            s.writer.commit_buckets = vec![0; 17];
+            s.writer.documents = 1000;
+            s
+        };
+        let reading = |t: f64, n: u64, cpu: f64| Reading {
+            read_unix: t,
+            snapshot: Some(snapshot(t, n)),
+            snapshot_age_secs: Some(0.1),
+            process: Some(Process { cpu_secs: cpu, ..Process::default() }),
+            disk: None,
+        };
+        (reading(2000.0, 100, 10.0), reading(2001.0, 200, 10.5))
+    }
+
+    #[test]
+    fn rates_between_readings() {
+        let (a, b) = two_readings();
+        let r = rates(&a, &b).unwrap();
+        assert_eq!(r.qps, 100.0);
+        assert_eq!(r.ops[0].reads_per_query, Some(12.0));
+        assert!(r.ops[0].p50.is_some_and(|p| p > 5e-5 && p <= 1e-4), "{:?}", r.ops[0].p50);
+        assert_eq!((r.docs_per_sec, r.replaced_per_sec, r.deleted_per_sec), (50.0, 20.0, 5.0));
+        assert_eq!(r.cpu_percent, Some(50.0));
+        // O motor reabriu: os contadores recomeçaram e não há taxa.
+        let mut reopened = b.clone();
+        reopened.snapshot.as_mut().unwrap().opened_unix = 1500.0;
+        assert!(rates(&a, &reopened).is_none());
+    }
+
+    #[test]
+    fn alerts_for_the_usual_trouble() {
+        let (_, mut r) = two_readings();
+        let quiet = alerts(&r, &VecDeque::new(), Duration::from_secs(1));
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let s = r.snapshot.as_mut().unwrap();
+        s.rocksdb = Some(RocksdbProps {
+            write_stopped: 1,
+            background_errors: 2,
+            sst_files: vec![25, 0, 0, 0, 0, 0, 0],
+            ..RocksdbProps::default()
+        });
+        s.writer.dead_versions = 5000;
+        s.writer.documents = 10_000;
+        r.snapshot_age_secs = Some(60.0);
+        r.disk = Some(super::disk::Disk { free_bytes: Some(5), size_bytes: Some(100), ..Default::default() });
+        let growing: VecDeque<u64> = [1, 2, 3, 4].into();
+        let all = alerts(&r, &growing, Duration::from_secs(1)).join("\n");
+        let expected = [
+            "snapshot velho",
+            "escrita parada",
+            "2 erro(s)",
+            "L0 com 25",
+            "só cresce",
+            "5% livre",
+            "5000 versões mortas",
+        ];
+        for text in expected {
+            assert!(all.contains(text), "falta {text:?} em:\n{all}");
+        }
+        r.snapshot = None;
+        assert!(alerts(&r, &VecDeque::new(), Duration::from_secs(1))[0].contains("sem snapshot"));
+    }
+
+    #[test]
+    fn panel_draws_every_section() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut panel = Panel::new(Source::new(dir.path(), None));
+        let (a, mut b) = two_readings();
+        panel.push(a);
+        b.snapshot.as_mut().unwrap().writer.dead_versions = 3;
+        assert!(panel.push(b.clone()), "snapshot novo");
+        assert!(!panel.push(b), "o mesmo snapshot não redesenha");
+        let mut terminal = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        terminal.draw(|f| panel.draw(f)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(130)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+        println!("{screen}");
+        for text in [
+            "fire-flower monitor",
+            "pid 7",
+            "Processo",
+            "CPU 50%",
+            "search_top",
+            "Indexação",
+            "docs/s 50",
+            "Edição e remoção",
+            "substituídos/s 20",
+            "removidos/s 5",
+            "versões mortas 3",
+            "commits 0  erros 0",
+            "limpas: 0 versões, 0 palavras",
+            "RocksDB",
+            "Memória",
+            "Disco",
+            "Alertas",
+            "nenhum",
+        ] {
+            assert!(screen.contains(text), "falta {text:?} na tela:\n{screen}");
+        }
+    }
+}

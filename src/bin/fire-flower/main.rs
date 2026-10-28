@@ -1,5 +1,6 @@
 mod jsonl;
 mod monitor;
+mod style;
 mod tui;
 
 use std::collections::HashMap;

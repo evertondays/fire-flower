@@ -3,7 +3,8 @@
 use fire_flower::Stemmer;
 
 use super::*;
-use super::draw::{describe_phrase, format_count, truncate_left};
+use super::draw::describe_phrase;
+use crate::style::{ACCENT, format_count, truncate_left};
 use super::preview::highlight;
 
 #[test]

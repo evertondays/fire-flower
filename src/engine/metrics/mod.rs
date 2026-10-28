@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::engine::writer::CommitStats;
 
 
+pub(crate) mod sampler;
 pub mod snapshot;
 #[cfg(test)]
 mod tests;

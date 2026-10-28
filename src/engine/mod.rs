@@ -33,6 +33,7 @@ use crate::engine::keys::{
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::metrics::{Metrics, Op};
+use crate::engine::metrics::sampler::{Sampler, Target};
 use crate::engine::meta::{
     previous_merge_operator, read_counter, resolve_format, resolve_languages, resolve_stemming, stored_format_error,
     varint,
@@ -76,7 +77,7 @@ pub use self::writer::{CommitStats, IndexBatch};
 /// Motor de busca. É `Sync`: compartilhe via `Arc<Engine>`. Buscas rodam em
 /// paralelo entre si e com a indexação; só um [`IndexBatch`] existe por vez.
 pub struct Engine {
-    db: DB,
+    db: Arc<DB>,
     writer: Mutex<WriterState>,
     config: Config,
     stopwords: Stopwords,
@@ -111,6 +112,8 @@ pub struct Engine {
     read_only: bool,
     /// Com `Config::metrics`.
     metrics: Option<Arc<Metrics>>,
+    /// A thread que grava o snapshot das métricas (ver `Config::metrics_file`).
+    sampler: Option<Sampler>,
     /// A pasta do banco e quando ele foi aberto (Unix, s), para as métricas.
     path: PathBuf,
     opened_unix: f64,
@@ -249,6 +252,24 @@ impl Engine {
             analyzer: Analyzer::default(),
             latest: loaded.latest,
         });
+        let db = Arc::new(db);
+        let opened_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let sampler = match &metrics {
+            // Só leitura: a pasta é de quem grava; só com um arquivo próprio.
+            Some(m) if !read_only || config.metrics_file.is_some() => {
+                let file = config.metrics_file.clone().unwrap_or_else(|| metrics::snapshot::default_path(path));
+                let target = Target {
+                    db: Arc::clone(&db),
+                    metrics: Arc::clone(m),
+                    file,
+                    db_path: path.display().to_string(),
+                    opened_unix,
+                    interval: config.metrics_interval,
+                };
+                Some(Sampler::spawn(target).map_err(|e| Error::Config(format!("snapshot das métricas: {e}")))?)
+            }
+            _ => None,
+        };
         Ok(Self {
             db,
             writer,
@@ -269,8 +290,9 @@ impl Engine {
             opts,
             read_only,
             metrics,
+            sampler,
             path: path.to_path_buf(),
-            opened_unix: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()),
+            opened_unix,
         })
     }
 
@@ -592,4 +614,11 @@ fn open_error(path: &Path, e: rocksdb::Error) -> Error {
 
 fn not_a_database(path: &Path) -> Error {
     Error::Open(format!("{} não é um banco do fire-flower (pasta vazia ou inexistente)", path.display()))
+}
+
+impl Drop for Engine {
+    /// A amostradora para antes do banco fechar (e grava um último snapshot).
+    fn drop(&mut self) {
+        drop(self.sampler.take());
+    }
 }

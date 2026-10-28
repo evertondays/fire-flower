@@ -148,3 +148,12 @@ pub fn read(path: &Path) -> std::io::Result<Snapshot> {
     let bytes = std::fs::read(path)?;
     serde_json::from_slice(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
+/// Grava `snapshot` num arquivo temporário ao lado de `path` e o renomeia por
+/// cima: quem lê nunca vê uma escrita pela metade.
+pub(crate) fn write(path: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, serde_json::to_vec(snapshot).map_err(std::io::Error::other)?)?;
+    std::fs::rename(&tmp, path)
+}

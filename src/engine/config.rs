@@ -1,5 +1,8 @@
 //! Configuração do motor ([`Config`]).
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::{Error, Result};
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::Language;
@@ -100,6 +103,14 @@ pub struct Config {
     /// por consulta. Desligado por padrão; sem a feature `metrics`, ligar dá
     /// erro no `open`.
     pub metrics: bool,
+    /// Onde a thread amostradora grava o snapshot das métricas, que o
+    /// `fire-flower monitor` lê. `None`: `fire-flower.metrics.json` na pasta
+    /// do banco. Um banco aberto só para leitura só grava com um arquivo
+    /// próprio aqui (o da pasta é de quem grava o banco).
+    pub metrics_file: Option<PathBuf>,
+    /// De quanto em quanto tempo a amostradora grava o snapshot; as
+    /// propriedades do RocksDB são relidas a cada 5 snapshots.
+    pub metrics_interval: Duration,
 }
 
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
@@ -128,6 +139,9 @@ impl Config {
             && self.title_weight.is_finite()
             && self.title_weight >= 0.0
             && in_unit(self.inflection_weight);
+        if self.metrics_interval.is_zero() {
+            return Err(Error::Config("Config::metrics_interval precisa ser maior que zero".into()));
+        }
         if ok {
             Ok(())
         } else {
@@ -170,6 +184,8 @@ impl Default for Config {
             title_b: 0.9,
             create_if_missing: true,
             metrics: false,
+            metrics_file: None,
+            metrics_interval: Duration::from_secs(1),
         }
     }
 }

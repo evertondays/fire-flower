@@ -1065,16 +1065,19 @@ def bindings_section(R, scale):
         native, node_ = runs("bench", f"bindings-{scale}-native{suffix}"), runs("bench", f"bindings-{scale}-node{suffix}")
         if not native or not node_:
             return [], None, None
-        out = ["| Conjunto | p50 nativo | p50 Node | Δ | p99 nativo | p99 Node |", "|---|---|---|---|---|---|"]
+        out = ["| Conjunto | p50 nativo | p50 Node | Δ | fronteira | p99 nativo | p99 Node |",
+               "|---|---|---|---|---|---|---|"]
         for s in native[-1]["sets"]:
             if sets and s["mode"] not in sets:
                 continue
             n50, b50 = med(native, s["set"], "p50_us"), med(node_, s["set"], "p50_us")
             n99, b99 = med(native, s["set"], "p99_us"), med(node_, s["set"], "p99_us")
+            inside = med(node_, s["set"], "inside_p50_us")
             if b50 is None:
                 continue
+            edge = f"{fmt(b50 - inside, 2)} µs" if inside is not None else "—"
             out.append(f"| {s['set']} | {us(n50)} | {us(b50)} | {fmt(b50 - n50, 2)} µs ({pct(b50, n50):+.1f}%) "
-                       f"| {us(n99)} | {us(b99)} |")
+                       f"| {edge} | {us(n99)} | {us(b99)} |")
         return out, native, node_
     top, native, node_ = table("-top10")
     if not top:
@@ -1082,6 +1085,9 @@ def bindings_section(R, scale):
     L = [f"## Binding Node ({scale})", "",
          f"Mediana de {len(node_)} rodadas alternando o `wiki bench --plain` e o `bench/node/bench.js` no mesmo "
          "banco ([docs/plano-bindings.md](" + DOCS_URL + "/plano-bindings.md)).", "",
+         "Δ é o Node contra o `wiki` (outro processo); **fronteira** é o Node contra a mesma consulta rodada "
+         "dentro do addon, no processo do Node: o custo de atravessar do JS para o Rust. O resto do Δ é rodar "
+         "dentro do processo do Node (V8, GC e suas threads disputando o cache da CPU).", "",
          "### Os 10 melhores (`searchTopSync`, a medida do plano)", ""] + top
     every, _, _ = table("", sets={"search", "suggest"})
     if every:

@@ -16,18 +16,23 @@ if (isMainThread) {
     const results = [];
     for (const n of counts.length ? counts : [1, 2, 4]) {
       const run = async () => {
+        // Cada worker carrega o addon e abre o banco antes; o relógio só
+        // começa quando todos estão prontos (como as threads do wiki bench).
+        const workers = Array.from({ length: n }, (_, i) => {
+          const queries = set.queries.filter((_, j) => j % n === i);
+          return new Worker(__filename, { workerData: { db: opt.db, mode: set.mode, queries } });
+        });
+        const message = (w) => new Promise((resolve, reject) => {
+          w.once("message", resolve);
+          w.once("error", reject);
+        });
+        await Promise.all(workers.map(message)); // prontos
         const started = process.hrtime.bigint();
-        const parts = await Promise.all(
-          Array.from({ length: n }, (_, i) =>
-            new Promise((resolve, reject) => {
-              const queries = set.queries.filter((_, j) => j % n === i);
-              const w = new Worker(__filename, { workerData: { db: opt.db, mode: set.mode, queries } });
-              w.once("message", resolve);
-              w.once("error", reject);
-            }),
-          ),
-        );
+        const done = workers.map(message);
+        for (const w of workers) w.postMessage("go");
+        const parts = await Promise.all(done);
         const wall = Number(process.hrtime.bigint() - started) / 1e9;
+        for (const w of workers) w.terminate();
         return { samples: parts.flat(), wall };
       };
       await run(); // aquecimento (e carga dos workers)
@@ -40,12 +45,14 @@ if (isMainThread) {
     }
     saveResult("workers", opt.label ?? "node", { binding: "node", db: opt.db, sets: results });
   })();
-} else {
+} else (async () => {
   const { binding } = require("./common");
   const { Engine } = binding();
   const engine = Engine.openSync(workerData.db);
   const samples = [];
   const { mode } = workerData;
+  parentPort.postMessage("pronto");
+  await new Promise((resolve) => parentPort.once("message", resolve));
   for (const q of workerData.queries) {
     const t = process.hrtime.bigint();
     if (mode === "suggest") engine.suggestSync(q, 10);
@@ -55,4 +62,4 @@ if (isMainThread) {
   }
   engine.close();
   parentPort.postMessage(samples);
-}
+})();

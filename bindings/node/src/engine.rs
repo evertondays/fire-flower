@@ -187,3 +187,24 @@ pub fn native_search_top_nanos(h: Handle, query: String, k: u32, iterations: u32
         Ok(started.elapsed().as_nanos() as f64 / f64::from(iterations.max(1)))
     })
 }
+
+/// Diagnóstico do harness: cada consulta de `queries` dentro do addon, como o
+/// `wiki bench` (`mode`: `top10`, `search` ou `suggest`), em nanossegundos.
+/// Separa o custo da fronteira (a mesma consulta pelo JS) do efeito de rodar
+/// dentro do processo do Node (a mesma consulta no `wiki`).
+#[napi(catch_unwind)]
+pub fn native_query_nanos(h: Handle, queries: Vec<String>, mode: String) -> Result<Vec<f64>> {
+    h.with(|e| {
+        let mut out = Vec::with_capacity(queries.len());
+        for q in &queries {
+            let started = std::time::Instant::now();
+            match mode.as_str() {
+                "suggest" => drop(std::hint::black_box(e.suggest(q, 10).map_err(js_error)?)),
+                "top10" => drop(std::hint::black_box(e.search_ranked(q, 10).map_err(js_error)?)),
+                _ => drop(std::hint::black_box(e.search(q).map_err(js_error)?)),
+            }
+            out.push(started.elapsed().as_nanos() as f64);
+        }
+        Ok(out)
+    })
+}

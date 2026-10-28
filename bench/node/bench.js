@@ -29,6 +29,16 @@ function run(set) {
   return { samples, results };
 }
 
+// A mesma consulta dentro do addon, no processo do Node: a diferença para a
+// chamada pelo JS é a fronteira; para o wiki, o efeito de rodar dentro do Node.
+const native = require(require("node:path").join(require("./common").ROOT, "bindings", "node", "fire-flower.node"));
+const handle = native.openEngineSync(opt.db);
+function inside(set) {
+  native.nativeQueryNanos(handle, set.queries, set.mode); // aquecimento
+  const ns = native.nativeQueryNanos(handle, set.queries, set.mode).map((x) => BigInt(Math.round(x)));
+  return percentile(ns.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), 0.5);
+}
+
 function summarize(set, samples, results, wall) {
   const sorted = samples.slice().sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const total = sorted.reduce((s, x) => s + x, 0n);
@@ -61,6 +71,7 @@ for (const set of querySets()) {
     results += r.results;
   }
   const s = summarize(set, samples, results, Number(process.hrtime.bigint() - t) / 1e9);
+  s.inside_p50_us = inside(set);
   console.log(`| ${s.set} | ${s.p50_us.toFixed(1)} | ${s.p95_us.toFixed(1)} | ${s.p99_us.toFixed(1)} | ${s.qps.toFixed(0)} |`);
   sets.push(s);
 }

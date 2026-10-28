@@ -53,6 +53,7 @@ mod phrase;
 mod prefix;
 mod purge;
 mod ranking;
+mod reader;
 mod search;
 mod versions;
 mod view;
@@ -66,6 +67,7 @@ pub use self::empty_words::CompactStats;
 pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
+pub use self::reader::Reader;
 pub use self::view::reads_on_this_thread;
 pub use self::writer::{CommitStats, IndexBatch, OwnedBatch};
 

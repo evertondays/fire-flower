@@ -11,6 +11,7 @@ mod indexing;
 mod metrics;
 mod phrases;
 mod read_only;
+mod reader;
 mod ranking;
 mod search;
 mod stemming;

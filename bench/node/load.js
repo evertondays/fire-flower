@@ -5,7 +5,6 @@
 "use strict";
 
 const fs = require("node:fs");
-const readline = require("node:readline");
 
 const { args, binding, saveResult } = require("./common");
 
@@ -16,7 +15,17 @@ const { Engine } = binding();
   const take = opt.take ? Number(opt.take) : Infinity;
   const batchSize = Number(opt.batch ?? 10_000);
   const engine = await Engine.open(opt.db);
-  const lines = readline.createInterface({ input: fs.createReadStream(opt.corpus), crlfDelay: Infinity });
+  // Linhas só em "\n", como o wiki: o readline também quebra em U+2028, que
+  // aparece dentro do texto de alguns artigos.
+  async function* lines(file) {
+    let rest = "";
+    for await (const chunk of fs.createReadStream(file, { encoding: "utf8" })) {
+      const parts = (rest + chunk).split("\n");
+      rest = parts.pop();
+      yield* parts;
+    }
+    if (rest) yield rest;
+  }
   let batch = [];
   let docs = 0;
   let bytes = 0;
@@ -28,7 +37,7 @@ const { Engine } = binding();
     indexSecs += Number(process.hrtime.bigint() - t) / 1e9;
     batch = [];
   };
-  for await (const line of lines) {
+  for await (const line of lines(opt.corpus)) {
     if (docs >= take) break;
     if (!line.trim()) continue;
     const a = JSON.parse(line);

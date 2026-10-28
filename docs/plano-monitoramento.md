@@ -300,3 +300,48 @@ A/B próprio e decisão explícita.
 7. **Exposição:** `127.0.0.1` por padrão; outro endereço só se pedido
    (autenticação fica com quem estiver na frente).
 8. **TUI e dados novos:** reabrir com Ctrl+R ou sozinha depois de 10 s.
+
+## Resultado (28/10/2026)
+
+As seis fases estão implementadas. A/B completo (`perf.py all --scale full` e
+`perf.py edits --scale 100k`) em cinco variantes, uma depois da outra: a
+`v0.2-release`, a branch sem a feature `metrics`, com a feature e as métricas
+desligadas (o padrão), ligadas, e ligadas com scrape do `/metrics` e
+`monitor --json` a cada segundo (o painel não roda sem terminal; ele lê os
+mesmos dados). Zero divergências nos cinco oráculos das cinco variantes.
+
+As diferenças acima de 1% foram repetidas alternando os binários, com bisect
+pelos commits e, por fim, com builds de alinhamento fixo
+(`-C llvm-args=-align-all-functions=6 -align-all-nofallthru-blocks=6`), que
+tiram o efeito do alinhamento do código.
+
+| Medida | Meta | Resultado |
+|---|---|---|
+| Registro de uma consulta (microbench) | ≤ 50 ns | 6,9 ns; 8,0 ns com 12 threads; 38 ns numa consulta de verdade (relógio, leituras, registro) |
+| p50 de `t-miss` e `t-mid` | ≤ 1% | alinhamento fixo, ligada contra sem a feature: −1,0% e +1,6% (+240 ns), com o padrão desligado em −12,8% e −1,9%: abaixo do ruído |
+| Todos os conjuntos | sem piora além de ±5% | alinhamento fixo: entre −5,6% e +1,6% nos 12 conjuntos; o +5% do `t-freq` no A/B é alinhamento (aparece na Fase 2 sem a feature e some com o alinhamento fixo) |
+| Indexação (docs/s, lote de 10 mil) | ≥ 99,5% | alternando: −1,3% (inteira) e −0,7% (100k) ligada; a variante sem a feature, sem código de métricas, ficou em −1,9% e −2,6% numa rodada e −0,2% na seguinte: o ruído entre rodadas é de ±2%, maior que a meta |
+| p99 de `mixed` com 4 leitores e indexação | sem piora | −4,0% ligada, −1,3% com scrape |
+| CPU da amostradora | ≤ 0,1% de um núcleo | 0,016% (0,02 s em 123 s de carga da Wikipédia inteira) |
+| Scrape a cada 1 s e monitor lendo | igual a sem scrape | carga inteira −0,3% contra a ligada; latência e concorrência dentro do ruído |
+
+### Edição e remoção
+
+| Medida | Meta | Ligada | Ligada + scrape |
+|---|---|---|---|
+| Vazão, lote de 10 mil | ≥ 99,5% | +2,8% | +0,7% |
+| Vazão, lotes de 100 e de 1 | sem piora além do ruído | −0,2% e +1,2% | −0,3% e +0,2% |
+| Commit p50/p99 de 1 documento | sem piora além do ruído | 0,29/6,05 ms (base 0,29/6,00) | 0,29/5,93 ms |
+| Latência com 1.000 edições, antes de compactar | sem piora além do ruído | −0,1% a +7,1% (`s-1`, 7 µs) | −1,2% a +8,4% (`rank-freq`; a variante sem a feature dá +6,2%) |
+| Banco editado, antes e depois de compactar | sem piora além do ruído | dentro de ±5%, menos conjuntos de µs que oscilam igual nas variantes sem métricas | idem |
+| Compactação com versões mortas | sem piora além do ruído | +2,6% | +1,0% |
+| Buscas com edições em paralelo (p99, `mixed`, 4 leitores) | sem piora | −0,1% | −1,9% |
+| Registro por commit | ≤ 1 µs | 26 ns | — |
+| `fire-flower delete` de 1.000 IDs | sem piora além do ruído | 31 ms (base 31–33 ms) | — |
+
+**Fora do previsto:**
+
+- a TUI e o painel não desenham num pseudo-terminal sem resposta (`script`):
+  o painel foi testado com o terminal virtual do ratatui;
+- `promtool check metrics` e `check rules` não rodaram aqui; o formato é
+  conferido pelos testes do monitor.

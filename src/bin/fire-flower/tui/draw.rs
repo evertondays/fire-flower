@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
 use super::{ACCENT, ACCENT_SOFT, App, MUTED, Preview, PreviewContent};
 
 
-impl<'a> App<'a> {
+impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
         let [header, search, status, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -242,6 +242,7 @@ impl<'a> App<'a> {
                 ("↑↓", "resultado"),
                 ("Enter", "abrir"),
                 ("^W", "apagar"),
+                ("^R", "recarregar"),
                 ("Esc", "sair"),
             ]
         };

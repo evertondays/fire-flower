@@ -104,12 +104,32 @@ pub struct Engine {
     pending_edits: AtomicU64,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
+    /// Aberto com [`Engine::open_read_only`]: lotes e compactação dão erro.
+    read_only: bool,
 }
 
 impl Engine {
+    /// Abre (ou cria, com [`Config::create_if_missing`]) o banco para leitura
+    /// e escrita. Só um processo por vez abre um banco assim: o RocksDB trava
+    /// a pasta (`LOCK`).
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_with(path.as_ref(), config, false)
+    }
+
+    /// Abre um banco que já existe só para leitura, ao lado do processo que o
+    /// grava (que continua com o `LOCK`). Não cria nem altera arquivos e não
+    /// roda compactação. A visão é a do momento da abertura: o que for gravado
+    /// depois só aparece abrindo de novo. Lotes e [`Engine::compact`] dão erro.
+    pub fn open_read_only(path: impl AsRef<Path>, config: Config) -> Result<Self> {
+        Self::open_with(path.as_ref(), config, true)
+    }
+
+    fn open_with(path: &Path, config: Config, read_only: bool) -> Result<Self> {
         config.validate()?;
+        // Antes do RocksDB: ele cria a pasta mesmo sem `create_if_missing`.
+        if (read_only || !config.create_if_missing) && !path.join("CURRENT").is_file() {
+            return Err(not_a_database(path));
+        }
         let mut table = BlockBasedOptions::default();
         table.set_bloom_filter(config.bloom_bits_per_key, false);
         table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
@@ -130,7 +150,7 @@ impl Engine {
 
         let purge = Arc::new(Purge::default());
         let mut opts = Options::default();
-        opts.create_if_missing(true);
+        opts.create_if_missing(config.create_if_missing && !read_only);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
         let (full, partial) = (Arc::clone(&purge), Arc::clone(&purge));
@@ -143,9 +163,12 @@ impl Engine {
                 purge::merge(&partial, key, existing, operands)
             },
         );
-        opts.set_compaction_filter_factory(FilterFactory { purge: Arc::clone(&purge) });
-        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
-        opts.increase_parallelism(cpus as i32);
+        if !read_only {
+            // Só leitura: sem compactação nem threads extras do RocksDB.
+            opts.set_compaction_filter_factory(FilterFactory { purge: Arc::clone(&purge) });
+            let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+            opts.increase_parallelism(cpus as i32);
+        }
         if config.statistics {
             opts.enable_statistics();
             opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptTimers);
@@ -164,13 +187,19 @@ impl Engine {
         // `MultiGet` em lote do crate precisa dela). Para o RocksDB é o mesmo
         // banco; o descritor leva as mesmas opções (merge operator, cache…).
         let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-        let db = match DB::open_cf_descriptors(&opts, path, [default_cf]) {
+        let opened = if read_only {
+            DB::open_cf_descriptors_read_only(&opts, path, [default_cf], false)
+        } else {
+            DB::open_cf_descriptors(&opts, path, [default_cf])
+        };
+        let db = match opened {
             Ok(db) => db,
             // Um banco antigo com merges pendentes no WAL falha já na
             // recuperação, porque o merge operator não entende o formato antigo.
-            Err(e) => return Err(stored_format_error(path).unwrap_or(Error::Db(e))),
+            Err(e) => return Err(stored_format_error(path).unwrap_or_else(|| open_error(path, e))),
         };
-        let positions = resolve_format(&db, config.positions)?;
+        let writable = !read_only;
+        let positions = resolve_format(&db, config.positions, writable)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
         let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
         let stats = IndexStats {
@@ -178,9 +207,9 @@ impl Engine {
             total_len: read_counter(&db, META_TOTAL_LEN)?.unwrap_or(0),
             total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
         };
-        let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref())?);
-        let stemmer = Stemmer::new(resolve_stemming(&db, META_STEMMING, config.stemming)?);
-        let inflector = Stemmer::new(resolve_stemming(&db, META_INFLECTIONS, config.inflections)?);
+        let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref(), writable)?);
+        let stemmer = Stemmer::new(resolve_stemming(&db, META_STEMMING, config.stemming, writable)?);
+        let inflector = Stemmer::new(resolve_stemming(&db, META_INFLECTIONS, config.inflections, writable)?);
         if stemmer.is_on() && inflector.is_on() {
             return Err(Error::Config(format!(
                 "stemming ({}) e flexões na consulta ({}) não combinam: escolha um",
@@ -219,7 +248,21 @@ impl Engine {
             compaction: Mutex::new(()),
             pending_edits: AtomicU64::new(0),
             opts,
+            read_only,
         })
+    }
+
+    /// Aberto com [`Engine::open_read_only`].
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Erro para quem tenta gravar num banco aberto só para leitura.
+    fn require_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
@@ -337,6 +380,7 @@ impl Engine {
     /// pega a trava do escritor por um instante: espera um lote aberto (não
     /// chame com um lote aberto na mesma thread).
     pub fn compact(&self) -> Result<CompactStats> {
+        self.require_writable()?;
         let _one = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
         // As edições que chegarem durante a compactação podem ficar fora dela.
         let before = self.pending_edits.load(AtomicOrdering::Acquire);
@@ -464,4 +508,24 @@ impl Engine {
     pub fn inflector(&self) -> &Stemmer {
         &self.inflector
     }
+}
+
+/// O erro do RocksDB ao abrir, com uma mensagem melhor para os casos comuns:
+/// a pasta não é um banco, ou outro processo o tem aberto para escrita.
+fn open_error(path: &Path, e: rocksdb::Error) -> Error {
+    let text = e.to_string();
+    if text.contains("does not exist") || text.contains("No such file") {
+        not_a_database(path)
+    } else if text.contains("lock") && text.contains("LOCK") {
+        Error::Open(format!(
+            "{} está aberto para escrita por outro processo; para só ler, use Engine::open_read_only",
+            path.display()
+        ))
+    } else {
+        Error::Db(e)
+    }
+}
+
+fn not_a_database(path: &Path) -> Error {
+    Error::Open(format!("{} não é um banco do fire-flower (pasta vazia ou inexistente)", path.display()))
 }

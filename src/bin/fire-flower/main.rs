@@ -171,8 +171,10 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
-            tui::run(&engine, &db.display().to_string()).map_err(Into::into)
+        Command::Tui { db } => open_reader(&db).and_then(|engine| {
+            let path = db.clone();
+            let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, Config::reader()));
+            tui::run(engine, &db.display().to_string(), reopen).map_err(Into::into)
         }),
         Command::Index { db, paths, sync, languages, positions, stemming } => {
             index(&db, &paths, sync, languages.languages, positions.config(), stemming)
@@ -189,7 +191,7 @@ fn main() -> ExitCode {
             })
         }
         Command::Delete { db, ids } => delete(&db, &ids),
-        Command::Compact { db } => open(&db, None, None, None).and_then(|engine| {
+        Command::Compact { db } => open_existing(&db).and_then(|engine| {
             let started = Instant::now();
             let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
@@ -213,8 +215,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `languages`, `positions` e `stemming` só importam na
-/// criação; `None` usa o que está gravado.
+/// Abre um banco que já existe só para leitura, ao lado de quem o grava: a
+/// TUI, `search` e `suggest` não travam o banco nem disputam memória com ele.
+fn open_reader(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open_read_only(db, Config::reader())?)
+}
+
+/// Abre um banco que já existe para gravar (`delete`, `compact`): um caminho
+/// errado dá erro em vez de criar um banco vazio.
+fn open_existing(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open(db, Config { create_if_missing: false, ..Config::default() })?)
+}
+
+/// Abre (ou cria) o banco para indexar. `languages`, `positions` e
+/// `stemming` só importam na criação; `None` usa o que está gravado.
 fn open(
     db: &Path,
     languages: Option<LanguageList>,
@@ -227,7 +241,7 @@ fn open(
 }
 
 fn delete(db: &Path, ids: &[u64]) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_existing(db)?;
     let mut batch = engine.batch();
     for &id in ids {
         batch.delete_document(id)?;
@@ -333,7 +347,7 @@ fn index(
 }
 
 fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
     let (hits, total) = if by_id {
@@ -362,7 +376,7 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

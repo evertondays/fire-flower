@@ -90,6 +90,10 @@ pub struct Config {
     pub title_weight: f64,
     /// `b` do título: quanto um título longo perde para um curto (0 a 1).
     pub title_b: f64,
+    /// Cria o banco se a pasta não tiver um (ligado por padrão). Desligado, o
+    /// `open` de um caminho errado dá erro em vez de criar um banco vazio.
+    /// [`Engine::open_read_only`](crate::Engine::open_read_only) nunca cria.
+    pub create_if_missing: bool,
 }
 
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
@@ -103,6 +107,12 @@ pub enum InflectionMode {
 }
 
 impl Config {
+    /// Para quem só lê e convive com o processo que grava (a TUI, `search` e
+    /// `suggest` da CLI): block cache de 32 MB e nada de criar banco.
+    pub fn reader() -> Self {
+        Self { block_cache_bytes: 32 << 20, create_if_missing: false, ..Self::default() }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         let in_unit = |v: f64| (0.0..=1.0).contains(&v);
         let ok = self.bm25_k1.is_finite()
@@ -152,6 +162,7 @@ impl Default for Config {
             // ~50 e depois quase não muda; b 0,9 mantém o limite do corte finito.
             title_weight: 50.0,
             title_b: 0.9,
+            create_if_missing: true,
         }
     }
 }

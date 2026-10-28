@@ -8,6 +8,7 @@ mod edit_model;
 mod editing;
 mod indexing;
 mod phrases;
+mod read_only;
 mod ranking;
 mod search;
 mod stemming;

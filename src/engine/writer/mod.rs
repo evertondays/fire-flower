@@ -312,6 +312,7 @@ impl IndexBatch<'_> {
     /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
     /// Usado pelo harness de performance para achar o gargalo da carga.
     pub fn commit_with_stats(mut self) -> Result<CommitStats> {
+        self.engine.require_writable()?;
         let started = Instant::now();
         let mut stats = CommitStats::default();
         let positions = self.engine.positions;

@@ -1,6 +1,8 @@
 // fire-flower para Node.js, Bun e Deno: a API pública sobre o addon nativo
-// (napi-rs). Uma chamada nativa por busca ou por lote; os resultados vêm
-// num Float64Array só, fatiado aqui sem cópia. Ver docs/plano-bindings.md.
+// (napi-rs). Uma chamada nativa por busca ou por lote. A busca síncrona
+// escreve num buffer de trabalho do Engine (criar um Float64Array por busca
+// custa ~0,5 µs no Node 24) e os k resultados viram arrays JS comuns (~30 ns).
+// Ver docs/plano-bindings.md.
 "use strict";
 
 const native = loadNative();
@@ -40,15 +42,20 @@ function rethrow(e) {
   throw e;
 }
 
-/** Os k melhores de uma busca: ids e notas são visões do mesmo buffer. */
+/** Os k melhores de uma busca, da maior nota para a menor. */
 class TopHits {
-  constructor(buf, labels) {
-    const n = (buf.length - 1) / 2;
+  /** `buf`: `[total, ids…, notas…]` com `n` resultados. */
+  constructor(buf, n) {
     /** Quantos documentos casaram ao todo. */
     this.total = buf[0];
-    this.ids = buf.subarray(1, 1 + n);
-    this.scores = buf.subarray(1 + n);
-    if (labels !== undefined) this.labels = labels;
+    const ids = new Array(n);
+    const scores = new Array(n);
+    for (let i = 0; i < n; i++) {
+      ids[i] = buf[1 + i];
+      scores[i] = buf[1 + n + i];
+    }
+    this.ids = ids;
+    this.scores = scores;
   }
 
   get length() {
@@ -72,12 +79,19 @@ function toQuery(query) {
 }
 
 class Engine {
-  /** @param {object} handle o NativeEngine */
+  /** @param {object} handle o handle nativo (External) */
   constructor(handle) {
-    this.#native = handle;
+    this.#h = handle;
   }
 
-  #native;
+  #h;
+  /** O buffer de trabalho da busca síncrona e dos rótulos (cresce com k). */
+  #scratch = new Float64Array(1 + 2 * DEFAULT_K);
+
+  #scratchFor(size) {
+    if (this.#scratch.length < size) this.#scratch = new Float64Array(size);
+    return this.#scratch;
+  }
 
   /** Abre fora do event loop. O mesmo caminho devolve o mesmo banco nativo. */
   static async open(path, options) {
@@ -99,13 +113,14 @@ class Engine {
   /** Busca ranqueada (BM25) na hora: o caminho rápido. */
   searchTopSync(query, options) {
     const k = options?.k ?? DEFAULT_K;
-    let buf;
+    const buf = this.#scratchFor(1 + 2 * k);
+    let n;
     try {
-      buf = this.#native.searchTopSync(toQuery(query), k);
+      n = native.searchTopInto(this.#h, toQuery(query), k, buf);
     } catch (e) {
       rethrow(e);
     }
-    return this.#hits(buf, options);
+    return this.#hits(new TopHits(buf, n), options);
   }
 
   /** Como searchTopSync, no pool de threads: para consultas pesadas. */
@@ -113,23 +128,22 @@ class Engine {
     const k = options?.k ?? DEFAULT_K;
     let buf;
     try {
-      buf = await this.#native.searchTop(toQuery(query), k);
+      buf = await native.searchTop(this.#h, toQuery(query), k);
     } catch (e) {
       rethrow(e);
     }
-    return this.#hits(buf, options);
+    return this.#hits(new TopHits(buf, (buf.length - 1) / 2), options);
   }
 
-  #hits(buf, options) {
-    if (!options?.labels) return new TopHits(buf);
-    const n = (buf.length - 1) / 2;
-    return new TopHits(buf, this.labels(buf.subarray(1, 1 + n)));
+  #hits(top, options) {
+    if (options?.labels) top.labels = this.labels(top.ids);
+    return top;
   }
 
   /** Todos os documentos que casam, em ordem de ID. */
   searchSync(query) {
     try {
-      return this.#native.searchSync(toQuery(query));
+      return native.searchSync(this.#h, toQuery(query));
     } catch (e) {
       rethrow(e);
     }
@@ -137,7 +151,7 @@ class Engine {
 
   async search(query) {
     try {
-      return await this.#native.search(toQuery(query));
+      return await native.search(this.#h, toQuery(query));
     } catch (e) {
       rethrow(e);
     }
@@ -145,7 +159,7 @@ class Engine {
 
   suggestSync(prefix, limit = 10) {
     try {
-      return this.#native.suggestSync(prefix, limit);
+      return native.suggestSync(this.#h, prefix, limit);
     } catch (e) {
       rethrow(e);
     }
@@ -153,17 +167,27 @@ class Engine {
 
   /** Rótulos de vários documentos num MultiGet só (null para quem não tem). */
   labels(ids) {
+    const n = ids.length;
+    if (n === 0) return [];
+    const buf = this.#scratchFor(n);
+    for (let i = 0; i < n; i++) buf[i] = ids[i];
+    let out;
     try {
-      return this.#native.labels(ids instanceof Float64Array ? ids : Float64Array.from(ids));
+      out = native.labels(this.#h, buf, n);
     } catch (e) {
       rethrow(e);
     }
+    if (typeof out !== "string") return out;
+    // Uma string só (ver o addon): "\0" separa, "\u0001" é quem não tem rótulo.
+    const labels = out.split("\0");
+    for (let i = 0; i < labels.length; i++) if (labels[i] === "\u0001") labels[i] = null;
+    return labels;
   }
 
   /** Adiciona ou substitui documentos num lote, com commit fora do event loop. */
   async index(docs) {
     try {
-      return await this.#native.index(docs);
+      return await native.index(this.#h, docs);
     } catch (e) {
       rethrow(e);
     }
@@ -172,7 +196,7 @@ class Engine {
   /** Como index, na hora: FF_BUSY se outro lote estiver aberto. */
   indexSync(docs) {
     try {
-      return this.#native.indexSync(docs);
+      return native.indexSync(this.#h, docs);
     } catch (e) {
       rethrow(e);
     }
@@ -180,7 +204,7 @@ class Engine {
 
   async delete(ids) {
     try {
-      return await this.#native.deleteDocuments(Array.from(ids));
+      return await native.deleteDocuments(this.#h, Array.from(ids));
     } catch (e) {
       rethrow(e);
     }
@@ -188,7 +212,7 @@ class Engine {
 
   deleteSync(ids) {
     try {
-      return this.#native.deleteDocumentsSync(Array.from(ids));
+      return native.deleteDocumentsSync(this.#h, Array.from(ids));
     } catch (e) {
       rethrow(e);
     }
@@ -201,7 +225,7 @@ class Engine {
 
   async compact() {
     try {
-      return await this.#native.compact();
+      return await native.compact(this.#h);
     } catch (e) {
       rethrow(e);
     }
@@ -209,7 +233,7 @@ class Engine {
 
   contains(id) {
     try {
-      return this.#native.contains(id);
+      return native.contains(this.#h, id);
     } catch (e) {
       rethrow(e);
     }
@@ -217,7 +241,7 @@ class Engine {
 
   stats() {
     try {
-      return this.#native.stats();
+      return native.stats(this.#h);
     } catch (e) {
       rethrow(e);
     }
@@ -227,7 +251,7 @@ class Engine {
   metrics() {
     let json;
     try {
-      json = this.#native.metricsJson();
+      json = native.metricsJson(this.#h);
     } catch (e) {
       rethrow(e);
     }
@@ -236,19 +260,19 @@ class Engine {
 
   get readOnly() {
     try {
-      return this.#native.readOnly;
+      return native.isReadOnly(this.#h);
     } catch (e) {
       rethrow(e);
     }
   }
 
   get closed() {
-    return this.#native.closed;
+    return native.isClosed(this.#h);
   }
 
   /** Solta o handle; o banco fecha quando o último handle do processo soltar. */
   close() {
-    this.#native.close();
+    native.close(this.#h);
   }
 
   [Symbol.dispose]() {
@@ -257,7 +281,7 @@ class Engine {
 
   /** Mede o custo de uma chamada pela fronteira (harness). */
   noop() {
-    this.#native.noop();
+    native.noop(this.#h);
   }
 }
 

@@ -2,6 +2,10 @@
 //! lote, resultados em `Float64Array` sem cópia. A camada JS (`index.js`)
 //! monta a API pública por cima; ver `docs/plano-bindings.md`.
 
+// Compilado como teste (`cargo clippy --all-targets`), o napi-derive não gera o
+// registro das funções no Node: tudo pareceria sem uso. Os testes são em JS.
+#![cfg_attr(test, allow(dead_code))]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -11,11 +15,12 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::convert::OpenOptions;
-use crate::engine::NativeEngine;
+use crate::handle::NewHandle;
 use crate::tasks::OpenTask;
 
 mod convert;
 mod engine;
+mod handle;
 mod tasks;
 
 /// Abre o banco fora do event loop (dezenas de ms num banco grande).
@@ -27,9 +32,9 @@ pub fn open_engine(path: String, options: Option<OpenOptions>) -> Result<AsyncTa
 
 /// Como [`open_engine`], na hora (scripts, testes).
 #[napi(catch_unwind)]
-pub fn open_engine_sync(path: String, options: Option<OpenOptions>) -> Result<NativeEngine> {
+pub fn open_engine_sync(path: String, options: Option<OpenOptions>) -> Result<NewHandle> {
     let (config, read_only) = convert::config(options.unwrap_or_default())?;
-    Ok(NativeEngine::new(open_shared(Path::new(&path), config, read_only).map_err(js_error)?))
+    Ok(NewHandle(open_shared(Path::new(&path), config, read_only).map_err(js_error)?))
 }
 
 /// Os bancos abertos neste processo, por (caminho, só leitura). Abrir de novo
@@ -64,3 +69,4 @@ pub(crate) fn js_error(e: fire_flower::Error) -> Error {
 pub(crate) fn binding_error(code: &str, message: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("{code}: {message}"))
 }
+

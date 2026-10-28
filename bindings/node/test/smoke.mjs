@@ -18,7 +18,7 @@ await engine.index([
   { id: 2, title: "Marte", text: "o planeta vermelho" },
 ]);
 const top = engine.searchTopSync("planeta", { k: 10 });
-check(top.total === 2 && top.ids instanceof Float64Array, "busca ranqueada");
+check(top.total === 2 && top.ids.length === 2, "busca ranqueada");
 check(engine.suggestSync("verm", 5)[0] === "vermelho", "autocompletar");
 await engine.delete([2]);
 check([...engine.searchSync("planeta")].join() === "1", "remoção");

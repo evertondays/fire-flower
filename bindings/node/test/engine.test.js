@@ -29,7 +29,7 @@ test("indexa, busca e devolve typed arrays", async () => {
   const top = engine.searchTopSync("planeta", { k: 10 });
   assert.ok(top instanceof TopHits);
   assert.equal(top.total, 2);
-  assert.ok(top.ids instanceof Float64Array && top.scores instanceof Float64Array);
+  assert.ok(Array.isArray(top.ids) && Array.isArray(top.scores));
   assert.deepEqual([...top.ids].sort(), [1, 2]);
   assert.ok(top.scores[0] >= top.scores[1]);
   assert.deepEqual([...top].map((h) => h.id), [...top.ids]);
@@ -43,6 +43,7 @@ test("indexa, busca e devolve typed arrays", async () => {
   assert.deepEqual([...(await engine.search('"copa do mundo"'))], [3]);
   assert.deepEqual(engine.suggestSync("pla", 5), ["planeta"]);
   assert.deepEqual(engine.labels([2, 3, 99]), ["marte.txt", null, null]);
+  assert.deepEqual(engine.labels([]), []);
   assert.equal(engine.stats().docCount, 3);
   assert.ok(engine.contains(1) && !engine.contains(4));
   engine.close();
@@ -163,6 +164,19 @@ test("construtor de consultas", () => {
   const engine = Engine.openSync(path.join(tempDir(), "db"));
   engine.indexSync(DOCS);
   assert.deepEqual([...engine.searchTopSync(q.and(q.phrase("copa do mundo"), q.prefix("fut"))).ids], [3]);
+  engine.close();
+});
+
+test("rótulos com qualquer caractere", () => {
+  const engine = Engine.openSync(path.join(tempDir(), "db"));
+  engine.indexSync([
+    { id: 1, text: "a", label: "" },
+    { id: 2, text: "b", label: "com\0nulo" },
+    { id: 3, text: "c", label: "\u0001" },
+    { id: 4, text: "d", label: "ação 🌸" },
+  ]);
+  assert.deepEqual(engine.labels([1, 4, 5]), ["", "ação 🌸", null]);
+  assert.deepEqual(engine.labels([2, 3, 5]), ["com\0nulo", "\u0001", null], "volta para a lista");
   engine.close();
 });
 

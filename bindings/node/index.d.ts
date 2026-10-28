@@ -44,9 +44,9 @@ export interface Hit {
 export declare class TopHits implements Iterable<Hit> {
   /** Quantos documentos casaram ao todo. */
   readonly total: number;
-  /** IDs, da maior nota para a menor (visão do buffer nativo, sem cópia). */
-  readonly ids: Float64Array;
-  readonly scores: Float64Array;
+  /** IDs, da maior nota para a menor. */
+  readonly ids: number[];
+  readonly scores: number[];
   /** Com `labels: true`. */
   readonly labels?: (string | null)[];
   readonly length: number;

@@ -9,8 +9,8 @@ use fire_flower::{Config, DocId, Engine};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::convert::{self, Doc};
-use crate::engine::NativeEngine;
+use crate::convert::{self, Doc, Doubles};
+use crate::handle::NewHandle;
 use crate::{binding_error, js_error, open_shared};
 
 /// Roda `f` pegando um pânico: sem isso, ele atravessaria a fronteira e
@@ -34,14 +34,14 @@ pub struct OpenTask {
 
 impl Task for OpenTask {
     type Output = Arc<Engine>;
-    type JsValue = NativeEngine;
+    type JsValue = NewHandle;
 
     fn compute(&mut self) -> Result<Self::Output> {
         guarded(|| open_shared(&self.path, self.config.clone(), self.read_only).map_err(js_error))
     }
 
     fn resolve(&mut self, _: Env, engine: Self::Output) -> Result<Self::JsValue> {
-        Ok(NativeEngine::new(engine))
+        Ok(NewHandle(engine))
     }
 }
 
@@ -52,8 +52,8 @@ pub struct SearchTopTask {
 }
 
 impl Task for SearchTopTask {
-    type Output = Float64Array;
-    type JsValue = Float64Array;
+    type Output = Doubles;
+    type JsValue = Doubles;
 
     fn compute(&mut self) -> Result<Self::Output> {
         guarded(|| {
@@ -73,8 +73,8 @@ pub struct SearchTask {
 }
 
 impl Task for SearchTask {
-    type Output = Float64Array;
-    type JsValue = Float64Array;
+    type Output = Doubles;
+    type JsValue = Doubles;
 
     fn compute(&mut self) -> Result<Self::Output> {
         guarded(|| Ok(convert::ids_buffer(self.engine.search(&self.query).map_err(js_error)?)))

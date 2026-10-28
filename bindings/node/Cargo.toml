@@ -7,6 +7,9 @@ publish = false
 
 [lib]
 crate-type = ["cdylib"]
+# Os testes são em JS (test/*.test.js), sobre o addon compilado.
+test = false
+doctest = false
 
 [features]
 default = ["metrics"]
@@ -14,7 +17,7 @@ metrics = ["fire-flower/metrics"]
 
 [dependencies]
 fire-flower.workspace = true
-napi = { version = "3", features = ["napi8"] }
+napi = "3"
 napi-derive = "3"
 serde_json.workspace = true
 

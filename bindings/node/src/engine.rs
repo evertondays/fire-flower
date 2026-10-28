@@ -1,22 +1,14 @@
-//! A classe nativa (`NativeEngine`): um handle para um `Engine` compartilhado.
-//! Busca e autocompletar são síncronos (latência nativa); o resto, `Promise`.
-
-use std::sync::Arc;
+//! As funções nativas sobre um handle (ver `handle`). Busca e autocompletar
+//! são síncronos (latência nativa); o resto, `Promise`.
 
 use fire_flower::Engine;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::convert::{self, Doc};
+use crate::convert::{self, Doc, Doubles};
+use crate::handle::{F64Slice, Handle};
 use crate::js_error;
 use crate::tasks::{self, CompactTask, IndexResult, Op, SearchTask, SearchTopTask, WriteTask};
-
-/// Um banco aberto. `close()` solta o handle; o banco fecha quando o último
-/// handle do processo for solto (ver `REGISTRY`).
-#[napi]
-pub struct NativeEngine {
-    engine: Option<Arc<Engine>>,
-}
 
 /// Estatísticas do índice (as do BM25).
 #[napi(object)]
@@ -26,123 +18,172 @@ pub struct IndexStats {
     pub total_title_len: f64,
 }
 
-impl NativeEngine {
-    pub(crate) fn new(engine: Arc<Engine>) -> Self {
-        Self { engine: Some(engine) }
-    }
+/// Não faz nada: mede o custo de uma chamada pela fronteira.
+#[napi]
+pub fn noop(_h: Handle) {}
 
-    fn engine(&self) -> Result<&Arc<Engine>> {
-        self.engine.as_ref().ok_or_else(|| js_error(fire_flower::Error::Closed))
-    }
+/// Os `k` melhores (BM25) em `out`, `[total, ids…, notas…]`, e quantos são.
+/// `out` é o buffer de trabalho do JS (cabe `1 + 2k`): nenhuma alocação na
+/// fronteira.
+#[napi(catch_unwind)]
+pub fn search_top_into(h: Handle, query: String, k: u32, mut out: F64Slice) -> Result<u32> {
+    let k = (k as usize).min(out.len().saturating_sub(1) / 2);
+    h.with(|e| {
+        let top = e.search_ranked(&query, k).map_err(js_error)?;
+        let n = top.hits.len();
+        out[0] = top.total as f64;
+        for (i, hit) in top.hits.iter().enumerate() {
+            out[1 + i] = hit.doc as f64;
+            out[1 + n + i] = hit.score;
+        }
+        Ok(n as u32)
+    })
 }
 
-#[napi]
-impl NativeEngine {
-    /// Não faz nada: mede o custo de uma chamada pela fronteira.
-    #[napi]
-    pub fn noop(&self) {}
+#[napi(catch_unwind)]
+pub fn search_top(h: Handle, query: String, k: u32) -> Result<AsyncTask<SearchTopTask>> {
+    Ok(AsyncTask::new(SearchTopTask { engine: h.engine()?, query, k: k as usize }))
+}
 
-    /// `[total, ids…, notas…]` dos `k` melhores (BM25).
-    #[napi(catch_unwind)]
-    pub fn search_top_sync(&self, query: String, k: u32) -> Result<Float64Array> {
-        let top = self.engine()?.search_ranked(&query, k as usize).map_err(js_error)?;
-        Ok(convert::top_buffer(top.total, &top.hits))
+/// Todos os documentos que casam, em ordem de ID.
+#[napi(catch_unwind)]
+pub fn search_sync(h: Handle, query: String) -> Result<Doubles> {
+    h.with(|e| Ok(convert::ids_buffer(e.search(&query).map_err(js_error)?)))
+}
+
+#[napi(catch_unwind)]
+pub fn search(h: Handle, query: String) -> Result<AsyncTask<SearchTask>> {
+    Ok(AsyncTask::new(SearchTask { engine: h.engine()?, query }))
+}
+
+#[napi(catch_unwind)]
+pub fn suggest_sync(h: Handle, prefix: String, limit: u32) -> Result<Vec<String>> {
+    h.with(|e| e.suggest(&prefix, limit as usize).map_err(js_error))
+}
+
+/// Os rótulos dos `n` primeiros IDs de `ids`, num `MultiGet` só.
+///
+/// Numa string só, separados por `\0`, com `\u{1}` no lugar de quem não tem
+/// rótulo: criar uma string na fronteira em vez de dez economiza ~1,5 µs (a
+/// camada JS faz o `split`). Um rótulo com um desses caracteres faz voltar a
+/// lista de strings.
+#[napi(catch_unwind)]
+pub fn labels(h: Handle, ids: F64Slice, n: u32) -> Result<Either<String, Vec<Option<String>>>> {
+    let ids = ids.iter().take(n as usize).map(|&v| convert::doc_id(v)).collect::<Result<Vec<_>>>()?;
+    let labels = h.with(|e| e.labels(&ids).map_err(js_error))?;
+    let plain = labels.iter().flatten().all(|l| !l.contains(['\0', '\u{1}']));
+    if !plain {
+        return Ok(Either::B(labels));
     }
-
-    #[napi(catch_unwind)]
-    pub fn search_top(&self, query: String, k: u32) -> Result<AsyncTask<SearchTopTask>> {
-        Ok(AsyncTask::new(SearchTopTask { engine: Arc::clone(self.engine()?), query, k: k as usize }))
+    let mut joined = String::with_capacity(labels.iter().flatten().map(|l| l.len() + 1).sum::<usize>() + labels.len());
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
+            joined.push('\0');
+        }
+        joined.push_str(label.as_deref().unwrap_or("\u{1}"));
     }
+    Ok(Either::A(joined))
+}
 
-    /// Todos os documentos que casam, em ordem de ID.
-    #[napi(catch_unwind)]
-    pub fn search_sync(&self, query: String) -> Result<Float64Array> {
-        Ok(convert::ids_buffer(self.engine()?.search(&query).map_err(js_error)?))
-    }
+/// Adiciona (ou substitui) documentos num lote só, fora do event loop.
+#[napi(catch_unwind)]
+pub fn index(h: Handle, docs: Vec<Doc>) -> Result<AsyncTask<WriteTask>> {
+    let ops = docs.into_iter().map(Op::Add).collect();
+    Ok(AsyncTask::new(WriteTask { engine: h.engine()?, ops }))
+}
 
-    #[napi(catch_unwind)]
-    pub fn search(&self, query: String) -> Result<AsyncTask<SearchTask>> {
-        Ok(AsyncTask::new(SearchTask { engine: Arc::clone(self.engine()?), query }))
-    }
+/// Como `index`, na hora: `FF_BUSY` se outro lote estiver aberto.
+#[napi(catch_unwind)]
+pub fn index_sync(h: Handle, docs: Vec<Doc>) -> Result<IndexResult> {
+    let ops: Vec<Op> = docs.into_iter().map(Op::Add).collect();
+    h.with(|e| tasks::apply(e, &ops, false))
+}
 
-    #[napi(catch_unwind)]
-    pub fn suggest_sync(&self, prefix: String, limit: u32) -> Result<Vec<String>> {
-        self.engine()?.suggest(&prefix, limit as usize).map_err(js_error)
-    }
+#[napi(catch_unwind)]
+pub fn delete_documents(h: Handle, ids: Vec<f64>) -> Result<AsyncTask<WriteTask>> {
+    let ops = ids.into_iter().map(|v| convert::doc_id(v).map(Op::Delete)).collect::<Result<_>>()?;
+    Ok(AsyncTask::new(WriteTask { engine: h.engine()?, ops }))
+}
 
-    /// Os rótulos de `ids`, num `MultiGet` só.
-    #[napi(catch_unwind)]
-    pub fn labels(&self, ids: Float64Array) -> Result<Vec<Option<String>>> {
-        let ids = ids.iter().map(|&v| convert::doc_id(v)).collect::<Result<Vec<_>>>()?;
-        self.engine()?.labels(&ids).map_err(js_error)
-    }
+#[napi(catch_unwind)]
+pub fn delete_documents_sync(h: Handle, ids: Vec<f64>) -> Result<IndexResult> {
+    let ops: Vec<Op> = ids.into_iter().map(|v| convert::doc_id(v).map(Op::Delete)).collect::<Result<_>>()?;
+    h.with(|e| tasks::apply(e, &ops, false))
+}
 
-    /// Adiciona (ou substitui) documentos num lote só, fora do event loop.
-    #[napi(catch_unwind)]
-    pub fn index(&self, docs: Vec<Doc>) -> Result<AsyncTask<WriteTask>> {
-        let ops = docs.into_iter().map(Op::Add).collect();
-        Ok(AsyncTask::new(WriteTask { engine: Arc::clone(self.engine()?), ops }))
-    }
+#[napi(catch_unwind)]
+pub fn compact(h: Handle) -> Result<AsyncTask<CompactTask>> {
+    Ok(AsyncTask::new(CompactTask { engine: h.engine()? }))
+}
 
-    /// Como `index`, na hora: `FF_BUSY` se outro lote estiver aberto.
-    #[napi(catch_unwind)]
-    pub fn index_sync(&self, docs: Vec<Doc>) -> Result<IndexResult> {
-        let ops: Vec<Op> = docs.into_iter().map(Op::Add).collect();
-        tasks::apply(self.engine()?, &ops, false)
-    }
+#[napi(catch_unwind)]
+pub fn contains(h: Handle, id: f64) -> Result<bool> {
+    let id = convert::doc_id(id)?;
+    h.with(|e| e.contains(id).map_err(js_error))
+}
 
-    #[napi(catch_unwind)]
-    pub fn delete_documents(&self, ids: Vec<f64>) -> Result<AsyncTask<WriteTask>> {
-        let ops = ids.into_iter().map(|v| convert::doc_id(v).map(Op::Delete)).collect::<Result<_>>()?;
-        Ok(AsyncTask::new(WriteTask { engine: Arc::clone(self.engine()?), ops }))
-    }
-
-    #[napi(catch_unwind)]
-    pub fn delete_documents_sync(&self, ids: Vec<f64>) -> Result<IndexResult> {
-        let ops: Vec<Op> = ids.into_iter().map(|v| convert::doc_id(v).map(Op::Delete)).collect::<Result<_>>()?;
-        tasks::apply(self.engine()?, &ops, false)
-    }
-
-    #[napi(catch_unwind)]
-    pub fn compact(&self) -> Result<AsyncTask<CompactTask>> {
-        Ok(AsyncTask::new(CompactTask { engine: Arc::clone(self.engine()?) }))
-    }
-
-    #[napi(catch_unwind)]
-    pub fn contains(&self, id: f64) -> Result<bool> {
-        self.engine()?.contains(convert::doc_id(id)?).map_err(js_error)
-    }
-
-    #[napi(catch_unwind)]
-    pub fn stats(&self) -> Result<IndexStats> {
-        let s = self.engine()?.stats().map_err(js_error)?;
+#[napi(catch_unwind)]
+pub fn stats(h: Handle) -> Result<IndexStats> {
+    h.with(|e| {
+        let s = e.stats().map_err(js_error)?;
         Ok(IndexStats {
             doc_count: s.doc_count as f64,
             total_len: s.total_len as f64,
             total_title_len: s.total_title_len as f64,
         })
-    }
+    })
+}
 
-    /// O snapshot das métricas em JSON, se o banco abriu com `metrics: true`.
-    #[napi(catch_unwind)]
-    pub fn metrics_json(&self) -> Result<Option<String>> {
-        let Some(snapshot) = self.engine()?.metrics_snapshot() else { return Ok(None) };
+/// O snapshot das métricas em JSON, se o banco abriu com `metrics: true`.
+#[napi(catch_unwind)]
+pub fn metrics_json(h: Handle) -> Result<Option<String>> {
+    h.with(|e| {
+        let Some(snapshot) = e.metrics_snapshot() else { return Ok(None) };
         serde_json::to_string(&snapshot).map(Some).map_err(|e| crate::binding_error("FF_PANIC", e))
-    }
+    })
+}
 
-    #[napi(getter)]
-    pub fn read_only(&self) -> Result<bool> {
-        Ok(self.engine()?.is_read_only())
-    }
+#[napi(catch_unwind)]
+pub fn is_read_only(h: Handle) -> Result<bool> {
+    h.with(|e| Ok(Engine::is_read_only(e)))
+}
 
-    #[napi(getter)]
-    pub fn closed(&self) -> bool {
-        self.engine.is_none()
-    }
+#[napi]
+pub fn is_closed(h: Handle) -> bool {
+    h.is_closed()
+}
 
-    /// Solta este handle. Promessas em andamento terminam (têm o próprio `Arc`).
-    #[napi]
-    pub fn close(&mut self) {
-        self.engine = None;
-    }
+/// Solta o motor deste handle. Promessas em andamento terminam (têm o próprio
+/// `Arc`); o banco fecha quando o último handle do processo soltar.
+#[napi]
+pub fn close(h: Handle) {
+    h.close();
+}
+
+/// Diagnóstico do harness: os rótulos dos `n` primeiros IDs `iterations` vezes
+/// dentro do addon, em nanossegundos por leitura.
+#[napi(catch_unwind)]
+pub fn native_labels_nanos(h: Handle, ids: F64Slice, n: u32, iterations: u32) -> Result<f64> {
+    let ids = ids.iter().take(n as usize).map(|&v| convert::doc_id(v)).collect::<Result<Vec<_>>>()?;
+    h.with(|e| {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(e.labels(&ids).map_err(js_error)?);
+        }
+        Ok(started.elapsed().as_nanos() as f64 / f64::from(iterations.max(1)))
+    })
+}
+
+/// Diagnóstico do harness: a mesma busca `iterations` vezes dentro do addon
+/// (no mesmo processo, com os mesmos caches), em nanossegundos por busca.
+/// A diferença para a chamada pelo JS é o custo da fronteira.
+#[napi(catch_unwind)]
+pub fn native_search_top_nanos(h: Handle, query: String, k: u32, iterations: u32) -> Result<f64> {
+    h.with(|e| {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(e.search_ranked(&query, k as usize).map_err(js_error)?);
+        }
+        Ok(started.elapsed().as_nanos() as f64 / f64::from(iterations.max(1)))
+    })
 }

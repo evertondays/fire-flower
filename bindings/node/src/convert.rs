@@ -1,8 +1,11 @@
 //! Conversões na fronteira: opções do JS para `Config`, documentos, IDs e o
 //! buffer dos resultados.
 
+use std::ptr;
+
 use fire_flower::{Config, DocId, Hit, Language, Stemming};
 use napi::bindgen_prelude::*;
+use napi::{check_status, sys};
 use napi_derive::napi;
 
 use crate::binding_error;
@@ -78,17 +81,61 @@ pub(crate) fn text(doc: &Doc) -> Result<&str> {
     }
 }
 
+/// Um `Float64Array` com memória do próprio V8, copiada do Rust.
+///
+/// O `Float64Array` do napi-rs aponta para a memória do Rust (ArrayBuffer
+/// externo, com finalizador): criar um custa microssegundos e enche o GC de
+/// finalizadores, e um resultado grande fica preso até a coleta, sem a
+/// memória voltar ao alocador. Copiar os 21 números de um top 10 custa
+/// nanossegundos; uma lista grande custa um `memcpy`.
+pub struct Doubles(pub(crate) Vec<f64>);
+
+impl TypeName for Doubles {
+    fn type_name() -> &'static str {
+        "Float64Array"
+    }
+
+    fn value_type() -> ValueType {
+        ValueType::Object
+    }
+}
+
+impl ToNapiValue for Doubles {
+    unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
+        let bytes = std::mem::size_of_val(val.0.as_slice());
+        let (mut data, mut buffer, mut array) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        // SAFETY: `data` aponta para `bytes` bytes recém-alocados pelo V8, que
+        // não se sobrepõem ao `Vec`; o array tipado cobre exatamente esse buffer.
+        unsafe {
+            check_status!(sys::napi_create_arraybuffer(env, bytes, &mut data, &mut buffer))?;
+            if bytes > 0 {
+                ptr::copy_nonoverlapping(val.0.as_ptr().cast::<u8>(), data.cast::<u8>(), bytes);
+            }
+            check_status!(sys::napi_create_typedarray(
+                env,
+                sys::TypedarrayType::float64_array,
+                val.0.len(),
+                buffer,
+                0,
+                &mut array
+            ))?;
+        }
+        Ok(array)
+    }
+}
+
 /// `[total, ids…, notas…]` num `Float64Array` só: um valor criado na
 /// fronteira em vez de um objeto com três; a camada JS fatia com `subarray`
 /// (sem cópia). IDs vão até 2^40 − 1: cabem num `f64` sem perda.
-pub(crate) fn top_buffer(total: usize, hits: &[Hit]) -> Float64Array {
+pub(crate) fn top_buffer(total: usize, hits: &[Hit]) -> Doubles {
     let mut buf = Vec::with_capacity(1 + 2 * hits.len());
     buf.push(total as f64);
     buf.extend(hits.iter().map(|h| h.doc as f64));
     buf.extend(hits.iter().map(|h| h.score));
-    Float64Array::new(buf)
+    Doubles(buf)
 }
 
-pub(crate) fn ids_buffer(ids: Vec<DocId>) -> Float64Array {
-    Float64Array::new(ids.into_iter().map(|d| d as f64).collect())
+pub(crate) fn ids_buffer(ids: Vec<DocId>) -> Doubles {
+    // Mesmo tamanho de elemento: a conversão reaproveita a alocação.
+    Doubles(ids.into_iter().map(|d| d as f64).collect())
 }

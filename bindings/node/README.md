@@ -2,8 +2,8 @@
 
 O fire-flower no Node.js, no Bun e no Deno: busca full-text embutida, no
 mesmo processo, sem servidor. É um addon nativo (napi-rs) fino sobre o core
-em Rust: uma chamada por busca ou por lote, resultados em `Float64Array` sem
-cópia. O plano e as metas de performance estão em
+em Rust: uma chamada por busca ou por lote, ~0,1 µs de fronteira numa
+chamada vazia e ~1 µs numa busca. O plano e as metas de performance estão em
 [docs/plano-bindings.md](../../docs/plano-bindings.md).
 
 ## Compilar
@@ -33,11 +33,11 @@ await engine.index([
   { id: 2, title: "Marte", text: Buffer.from("Marte é o planeta vermelho") }, // UTF-8, sem conversão
 ]);
 
-// Caminho rápido, síncrono (µs): ids e notas são Float64Array sem cópia.
+// Caminho rápido, síncrono (µs).
 const top = engine.searchTopSync("planeta verm*", { k: 10 });
 top.total;  // quantos casaram
-top.ids;    // Float64Array
-top.scores; // Float64Array
+top.ids;    // number[]
+top.scores; // number[]
 for (const hit of top) console.log(hit.id, hit.score);
 
 // Consultas pesadas (prefixo curto, frase frequente) no pool de threads,

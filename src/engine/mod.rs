@@ -14,34 +14,28 @@
 //! Em `post:`, `pos:` e `norm:` o documento é o ID interno da versão (ver
 //! `versions`); a API recebe e devolve o ID do usuário.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch};
+use rocksdb::{DB, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
-use crate::analysis::{Analyzer, normalize_term};
+use crate::analysis::normalize_term;
 use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::{Language, Stopwords};
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::cache::EpochCache;
-use crate::engine::keys::{
-    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_EPOCH, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
-    META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
-};
+use crate::engine::keys::{DOC, Key, META_EPOCH};
+use crate::engine::meta::varint;
 use crate::engine::metrics::{Metrics, Op};
-use crate::engine::metrics::sampler::{Sampler, Target};
-use crate::engine::meta::{
-    previous_merge_operator, read_counter, resolve_format, resolve_languages, resolve_stemming, stored_format_error,
-    varint,
-};
-use crate::engine::purge::{FilterFactory, Purge};
+use crate::engine::metrics::sampler::Sampler;
+use crate::engine::purge::Purge;
 use crate::engine::versions::Deaths;
 use crate::engine::view::View;
-use crate::engine::writer::{NodeCache, WriterState};
+use crate::engine::writer::{EngineRef, WriterSlot, WriterState};
 use crate::query::{Clause, parse_query_stemmed};
 
 mod cache;
@@ -54,6 +48,7 @@ mod groups;
 mod keys;
 mod meta;
 pub(crate) mod metrics;
+mod open;
 mod phrase;
 mod prefix;
 mod purge;
@@ -72,13 +67,13 @@ pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
 pub use self::view::reads_on_this_thread;
-pub use self::writer::{CommitStats, IndexBatch};
+pub use self::writer::{CommitStats, IndexBatch, OwnedBatch};
 
 /// Motor de busca. É `Sync`: compartilhe via `Arc<Engine>`. Buscas rodam em
 /// paralelo entre si e com a indexação; só um [`IndexBatch`] existe por vez.
 pub struct Engine {
     db: Arc<DB>,
-    writer: Mutex<WriterState>,
+    writer: WriterSlot,
     config: Config,
     stopwords: Stopwords,
     /// Stemming gravado no banco (`meta:stemming`).
@@ -120,198 +115,6 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Abre (ou cria, com [`Config::create_if_missing`]) o banco para leitura
-    /// e escrita. Só um processo por vez abre um banco assim: o RocksDB trava
-    /// a pasta (`LOCK`).
-    pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        Self::open_with(path.as_ref(), config, false)
-    }
-
-    /// Abre um banco que já existe só para leitura, ao lado do processo que o
-    /// grava (que continua com o `LOCK`). Não cria nem altera arquivos e não
-    /// roda compactação. A visão é a do momento da abertura: o que for gravado
-    /// depois só aparece abrindo de novo. Lotes e [`Engine::compact`] dão erro.
-    pub fn open_read_only(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        Self::open_with(path.as_ref(), config, true)
-    }
-
-    fn open_with(path: &Path, config: Config, read_only: bool) -> Result<Self> {
-        config.validate()?;
-        // Antes do RocksDB: ele cria a pasta mesmo sem `create_if_missing`.
-        if (read_only || !config.create_if_missing) && !path.join("CURRENT").is_file() {
-            return Err(not_a_database(path));
-        }
-        let mut table = BlockBasedOptions::default();
-        table.set_bloom_filter(config.bloom_bits_per_key, false);
-        table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
-        table.set_cache_index_and_filter_blocks(true);
-        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
-        // Filtro e índice em partições de 4 KB, com um índice de topo fixo no
-        // cache. O cache LRU se divide em até 64 partes (4 MB com 256 MB), e um
-        // bloco maior que uma parte não fica nele. Com filtro inteiro, um SST de
-        // chaves `node:` gerado pela compactação passa de 6 MB de filtro na
-        // Wikipédia inteira: cada `Get` relia o filtro todo e a carga caía de
-        // ~5.000 para ~200 artigos/s (teste `bloom_filters_larger_than_...`).
-        if config.partition_filters {
-            table.set_partition_filters(true);
-            table.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
-            table.set_metadata_block_size(4096);
-            table.set_pin_top_level_index_and_filter(true);
-        }
-
-        let purge = Arc::new(Purge::default());
-        let mut opts = Options::default();
-        opts.create_if_missing(config.create_if_missing && !read_only);
-        opts.set_block_based_table_factory(&table);
-        opts.set_compression_type(DBCompressionType::Lz4);
-        let (full, partial) = (Arc::clone(&purge), Arc::clone(&purge));
-        opts.set_merge_operator(
-            MERGE_OPERATOR,
-            move |key: &[u8], existing: Option<&[u8]>, operands: &rocksdb::MergeOperands| {
-                purge::merge(&full, key, existing, operands)
-            },
-            move |key: &[u8], existing: Option<&[u8]>, operands: &rocksdb::MergeOperands| {
-                purge::merge(&partial, key, existing, operands)
-            },
-        );
-        if !read_only {
-            // Só leitura: sem compactação nem threads extras do RocksDB.
-            opts.set_compaction_filter_factory(FilterFactory { purge: Arc::clone(&purge) });
-            let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
-            opts.increase_parallelism(cpus as i32);
-        }
-        if config.statistics {
-            opts.enable_statistics();
-            opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptTimers);
-        }
-
-        // Antes de abrir para escrita: a recuperação do WAL de um banco de
-        // outro formato rodaria o merge operator novo sobre listas antigas.
-        if let Some(name) = previous_merge_operator(path)
-            && name != MERGE_OPERATOR
-        {
-            return Err(stored_format_error(path).unwrap_or_else(|| {
-                Error::Config(format!("banco de outro formato (merge operator {name}); recarregue o banco"))
-            }));
-        }
-        // Com a família padrão explícita, `cf_handle("default")` existe (o
-        // `MultiGet` em lote do crate precisa dela). Para o RocksDB é o mesmo
-        // banco; o descritor leva as mesmas opções (merge operator, cache…).
-        let open = || {
-            let default_cf = rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-            if read_only {
-                DB::open_cf_descriptors_read_only(&opts, path, [default_cf], false)
-            } else {
-                DB::open_cf_descriptors(&opts, path, [default_cf])
-            }
-        };
-        let mut opened = open();
-        // Só leitura, ao lado de quem grava: um WAL ou SST listado pode sumir
-        // no meio da abertura (o outro processo terminou um flush ou uma
-        // compactação). É passageiro; a próxima tentativa vê os arquivos novos.
-        for _ in 0..READ_ONLY_RETRIES {
-            match &opened {
-                Err(e) if read_only && is_missing_file(e) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    opened = open();
-                }
-                _ => break,
-            }
-        }
-        let db = match opened {
-            Ok(db) => db,
-            // Um banco antigo com merges pendentes no WAL falha já na
-            // recuperação, porque o merge operator não entende o formato antigo.
-            Err(e) => return Err(stored_format_error(path).unwrap_or_else(|| open_error(path, e))),
-        };
-        let writable = !read_only;
-        let positions = resolve_format(&db, config.positions, writable)?;
-        let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
-        let next_doc_id = read_counter(&db, META_NEXT_DOC)?.unwrap_or(1);
-        let stats = IndexStats {
-            doc_count: read_counter(&db, META_DOC_COUNT)?.unwrap_or(0),
-            total_len: read_counter(&db, META_TOTAL_LEN)?.unwrap_or(0),
-            total_title_len: read_counter(&db, META_TOTAL_TITLE_LEN)?.unwrap_or(0),
-        };
-        let stopwords = Stopwords::new(&resolve_languages(&db, config.languages.as_deref(), writable)?);
-        let stemmer = Stemmer::new(resolve_stemming(&db, META_STEMMING, config.stemming, writable)?);
-        let inflector = Stemmer::new(resolve_stemming(&db, META_INFLECTIONS, config.inflections, writable)?);
-        if stemmer.is_on() && inflector.is_on() {
-            return Err(Error::Config(format!(
-                "stemming ({}) e flexões na consulta ({}) não combinam: escolha um",
-                stemmer.stemming(),
-                inflector.stemming()
-            )));
-        }
-        let deaths = Deaths::default();
-        let loaded = versions::load(&db, &deaths)?;
-        let metrics = if config.metrics {
-            if !cfg!(feature = "metrics") {
-                let msg = "Config::metrics pede a feature `metrics`, desligada nesta compilação";
-                return Err(Error::Config(msg.into()));
-            }
-            let m = Metrics::new();
-            m.set_documents(stats.doc_count);
-            m.set_edit_backlog(loaded.dead.len() as u64, 0);
-            Some(Arc::new(m))
-        } else {
-            None
-        };
-        // Os números de commit continuam os do último `open`: `meta:epoch`
-        // gravado por um commit tem que bater com o relógio (ver `view`).
-        let epoch = read_counter(&db, META_EPOCH)?.unwrap_or(0);
-        let writer = Mutex::new(WriterState {
-            next_node_id,
-            next_doc_id,
-            stats,
-            cache: NodeCache::default(),
-            analyzer: Analyzer::default(),
-            latest: loaded.latest,
-        });
-        let db = Arc::new(db);
-        let opened_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-        let sampler = match &metrics {
-            // Só leitura: a pasta é de quem grava; só com um arquivo próprio.
-            Some(m) if !read_only || config.metrics_file.is_some() => {
-                let file = config.metrics_file.clone().unwrap_or_else(|| metrics::snapshot::default_path(path));
-                let target = Target {
-                    db: Arc::clone(&db),
-                    metrics: Arc::clone(m),
-                    file,
-                    db_path: path.display().to_string(),
-                    opened_unix,
-                    interval: config.metrics_interval,
-                };
-                Some(Sampler::spawn(target).map_err(|e| Error::Config(format!("snapshot das métricas: {e}")))?)
-            }
-            _ => None,
-        };
-        Ok(Self {
-            db,
-            writer,
-            config,
-            stopwords,
-            stemmer,
-            inflector,
-            positions,
-            clock: AtomicU64::new(epoch << 1),
-            norms: EpochCache::default(),
-            nodes: EpochCache::default(),
-            deaths,
-            purge,
-            // Mortos de antes do `open`: todo snapshot de agora já os vê.
-            dead: Mutex::new(loaded.dead.into_iter().map(|id| (0, id)).collect()),
-            compaction: Mutex::new(()),
-            pending_edits: AtomicU64::new(0),
-            opts,
-            read_only,
-            metrics,
-            sampler,
-            path: path.to_path_buf(),
-            opened_unix,
-        })
-    }
-
     /// Os contadores das métricas agora, se `Config::metrics` estiver
     /// ligado (sem as propriedades do RocksDB, que a amostradora lê). Para
     /// expor as métricas no próprio processo; o `fire-flower monitor` lê o
@@ -354,17 +157,46 @@ impl Engine {
     /// Inicia um lote de indexação. Bloqueia se outro lote estiver aberto
     /// (inclusive na mesma thread: não chame `index_document` com um lote aberto).
     pub fn batch(&self) -> IndexBatch<'_> {
-        // Os contadores só mudam após um commit bem-sucedido, então o estado
-        // continua válido mesmo se outra thread entrou em pânico com o lock.
+        let state = self.wait_for_writer();
+        self.start_batch(EngineRef::Borrowed(self), state)
+    }
+
+    /// Como [`Engine::batch`], sem esperar: [`Error::Busy`] se outro lote
+    /// estiver aberto. Para quem não pode bloquear (o event loop do Node, um
+    /// request do PHP).
+    pub fn try_batch(&self) -> Result<IndexBatch<'_>> {
+        let state = self.writer.try_take().ok_or(Error::Busy)?;
+        Ok(self.start_batch(EngineRef::Borrowed(self), state))
+    }
+
+    /// Como [`Engine::batch`], com um lote dono de um `Arc` do motor
+    /// ([`OwnedBatch`]): pode ser guardado num objeto de outra linguagem e
+    /// fazer commit em outra thread.
+    pub fn owned_batch(self: &Arc<Self>) -> OwnedBatch {
+        let state = self.wait_for_writer();
+        self.start_batch(EngineRef::Shared(Arc::clone(self)), state)
+    }
+
+    /// Como [`Engine::owned_batch`], sem esperar ([`Error::Busy`]).
+    pub fn try_owned_batch(self: &Arc<Self>) -> Result<OwnedBatch> {
+        let state = self.writer.try_take().ok_or(Error::Busy)?;
+        Ok(self.start_batch(EngineRef::Shared(Arc::clone(self)), state))
+    }
+
+    fn wait_for_writer(&self) -> WriterState {
         let waiting = self.metrics().map(|_| Instant::now());
-        let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.writer.take();
         if let (Some(m), Some(t)) = (self.metrics(), waiting) {
             m.record_lock_wait(t.elapsed());
         }
+        state
+    }
+
+    fn start_batch<'a>(&self, engine: EngineRef<'a>, mut state: WriterState) -> IndexBatch<'a> {
         let cache = std::mem::take(&mut state.cache);
         let analyzer = std::mem::take(&mut state.analyzer);
         IndexBatch {
-            engine: self,
+            engine,
             next_node_id: state.next_node_id,
             next_doc_id: state.next_doc_id,
             state,
@@ -518,6 +350,25 @@ impl Engine {
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     }
 
+    /// Os rótulos de vários documentos, na ordem de `docs` (`None` para quem
+    /// não tem), num único `MultiGet`: mostrar os 10 primeiros resultados de
+    /// uma busca custa uma leitura em lote, não 10.
+    pub fn labels(&self, docs: &[DocId]) -> Result<Vec<Option<String>>> {
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self
+            .db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
+        let keys: Vec<Key> = docs.iter().map(|&doc| Key::new(DOC, doc)).collect();
+        self.db
+            .batched_multi_get_cf(cf, keys.iter().map(|k| k.as_ref()), false)
+            .into_iter()
+            .map(|value| Ok(value?.map(|v| String::from_utf8_lossy(&v).into_owned())))
+            .collect()
+    }
+
     /// Percorre os rótulos de todos os documentos (`f(documento, rótulo)`),
     /// em ordem de chave. Lê só as chaves `doc:`: serve para achar um
     /// documento pelo rótulo (o `index --sync` da CLI acha assim os arquivos
@@ -610,35 +461,6 @@ impl Engine {
     pub fn inflector(&self) -> &Stemmer {
         &self.inflector
     }
-}
-
-/// O erro do RocksDB ao abrir, com uma mensagem melhor para os casos comuns:
-/// a pasta não é um banco, ou outro processo o tem aberto para escrita.
-fn open_error(path: &Path, e: rocksdb::Error) -> Error {
-    let text = e.to_string();
-    if !path.join("CURRENT").is_file() {
-        not_a_database(path)
-    } else if text.contains("lock") && text.contains("LOCK") {
-        Error::Open(format!(
-            "{} está aberto para escrita por outro processo; para só ler, use Engine::open_read_only",
-            path.display()
-        ))
-    } else {
-        Error::Db(e)
-    }
-}
-
-/// Quantas vezes `open_read_only` tenta de novo quando um arquivo some no
-/// meio da abertura.
-const READ_ONLY_RETRIES: usize = 5;
-
-fn is_missing_file(e: &rocksdb::Error) -> bool {
-    let text = e.to_string();
-    text.contains("No such file") || text.contains("does not exist")
-}
-
-fn not_a_database(path: &Path) -> Error {
-    Error::Open(format!("{} não é um banco do fire-flower (pasta vazia ou inexistente)", path.display()))
 }
 
 impl Drop for Engine {

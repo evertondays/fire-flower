@@ -406,8 +406,8 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
     };
     let elapsed = started.elapsed();
 
-    for (doc, score) in &hits {
-        let label = engine.label(*doc)?;
+    let docs: Vec<u64> = hits.iter().map(|(doc, _)| *doc).collect();
+    for ((doc, score), label) in hits.iter().zip(engine.labels(&docs)?) {
         let score = score.map(|s| format!("{s:.3}\t")).unwrap_or_default();
         match label {
             Some(label) => println!("{score}{doc}\t{label}"),

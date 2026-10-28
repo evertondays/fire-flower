@@ -35,7 +35,7 @@ pub mod query;
 
 pub use engine::{
     CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, Maintenance,
-    MaintenanceOptions,
+    MaintenanceOptions, OwnedBatch,
 };
 pub use error::{Error, Result};
 

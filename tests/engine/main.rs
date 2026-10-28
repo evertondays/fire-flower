@@ -15,6 +15,7 @@ mod ranking;
 mod search;
 mod stemming;
 mod storage;
+mod writer;
 
 pub(crate) fn open(dir: &tempfile::TempDir) -> Engine {
     Engine::open(dir.path(), Config::default()).unwrap()

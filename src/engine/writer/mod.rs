@@ -1,6 +1,7 @@
 //! Indexação: o lote ([`IndexBatch`]) e o commit.
 
-use std::sync::MutexGuard;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
@@ -22,6 +23,7 @@ use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 mod documents;
 pub(super) mod trie;
 
+#[derive(Default)]
 pub(crate) struct WriterState {
     pub(super) next_node_id: u64,
     pub(super) next_doc_id: DocId,
@@ -38,6 +40,71 @@ pub(crate) struct WriterState {
     pub(super) latest: FxHashMap<DocId, u64>,
 }
 
+/// O estado do único escritor. O lote o pega para si ([`WriterSlot::take`]) e
+/// o devolve ao terminar, com ou sem commit: por isso o lote não guarda uma
+/// trava e pode ir para outra thread ([`OwnedBatch`]).
+pub(crate) struct WriterSlot {
+    state: Mutex<Option<WriterState>>,
+    returned: Condvar,
+}
+
+impl WriterSlot {
+    pub(crate) fn new(state: WriterState) -> Self {
+        Self { state: Mutex::new(Some(state)), returned: Condvar::new() }
+    }
+
+    /// Pega o estado, esperando o lote aberto terminar.
+    pub(super) fn take(&self) -> WriterState {
+        // O estado só muda depois de um commit gravado: uma thread que entrou
+        // em pânico com a trava não o deixou pela metade.
+        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(state) = slot.take() {
+                return state;
+            }
+            slot = self.returned.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Pega o estado se nenhum lote estiver aberto.
+    pub(super) fn try_take(&self) -> Option<WriterState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn put(&self, state: WriterState) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        self.returned.notify_one();
+    }
+}
+
+/// O motor de um lote: emprestado ([`Engine::batch`]) ou compartilhado
+/// ([`Engine::owned_batch`]).
+pub(crate) enum EngineRef<'a> {
+    Borrowed(&'a Engine),
+    Shared(Arc<Engine>),
+}
+
+impl Deref for EngineRef<'_> {
+    type Target = Engine;
+
+    #[inline]
+    fn deref(&self) -> &Engine {
+        match self {
+            EngineRef::Borrowed(e) => e,
+            EngineRef::Shared(e) => e,
+        }
+    }
+}
+
+impl Clone for EngineRef<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            EngineRef::Borrowed(e) => EngineRef::Borrowed(e),
+            EngineRef::Shared(e) => EngineRef::Shared(Arc::clone(e)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct NodeCache {
     pub(super) nodes: FxHashMap<u64, CachedNode>,
@@ -52,9 +119,13 @@ pub(super) struct NodeCache {
 /// O lote é invertido: `add_document` só junta termo → documentos (com tf e
 /// posições), e a Trie é percorrida no commit, uma vez por termo distinto do
 /// lote (e não uma vez por documento que contém o termo).
+///
+/// Só um lote existe por vez: enquanto este estiver vivo, [`Engine::batch`]
+/// espera e [`Engine::try_batch`] dá [`Error::Busy`].
 pub struct IndexBatch<'a> {
-    pub(super) engine: &'a Engine,
-    pub(super) state: MutexGuard<'a, WriterState>,
+    pub(super) engine: EngineRef<'a>,
+    /// O estado do escritor, devolvido ao [`WriterSlot`] no `Drop`.
+    pub(super) state: WriterState,
     pub(super) next_node_id: u64,
     pub(super) next_doc_id: DocId,
     /// Cache de nós emprestado do `WriterState`, mais os nós lidos ou criados
@@ -75,6 +146,19 @@ pub struct IndexBatch<'a> {
     pub(super) repeated: bool,
     pub(super) labels: Vec<(DocId, String)>,
     pub(super) analyzer: Analyzer,
+}
+
+/// Um lote que é dono de um `Arc<Engine>`: `Send + 'static`, pode viver num
+/// objeto de outra linguagem (binding) e fazer commit em outra thread.
+pub type OwnedBatch = IndexBatch<'static>;
+
+impl Drop for IndexBatch<'_> {
+    /// Com ou sem commit, o estado volta para o próximo lote. Sem commit, o
+    /// cache de nós emprestado vai embora com o lote: nada que não foi
+    /// gravado sobrevive.
+    fn drop(&mut self) {
+        self.engine.writer.put(std::mem::take(&mut self.state));
+    }
 }
 
 /// Uma operação do lote sobre um documento.
@@ -312,7 +396,7 @@ impl IndexBatch<'_> {
     /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
     /// Usado pelo harness de performance para achar o gargalo da carga.
     pub fn commit_with_stats(self) -> Result<CommitStats> {
-        let engine = self.engine;
+        let engine = self.engine.clone();
         let result = self.write();
         if result.is_err()
             && let Some(m) = engine.metrics()
@@ -357,7 +441,9 @@ impl IndexBatch<'_> {
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
         // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
-        let inflector = &self.engine.inflector;
+        // Um clone da referência ao motor: `self` é emprestado mutável na travessia.
+        let engine = self.engine.clone();
+        let inflector = &engine.inflector;
         let mut new_by_stem: FxHashMap<String, Vec<u64>> = FxHashMap::default();
         for (term, mut acc) in terms {
             if versions.remapped {
@@ -416,7 +502,6 @@ impl IndexBatch<'_> {
         stats.batch_bytes = wb.size_in_bytes();
 
         // Ver `EpochCache` e `versions`: marca e publica o que muda, grava, publica o commit.
-        let engine = self.engine;
         let next = engine.epoch() + 1;
         engine.norms.mark(blocks, next);
         if let Some(max) = engine.config.reader_cache_depth {

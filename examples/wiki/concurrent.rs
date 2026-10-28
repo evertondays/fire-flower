@@ -12,13 +12,13 @@ use serde_json::{Value, json};
 use crate::AnyResult;
 use crate::bench::{Sample, read_query_sets, run_query, summarize};
 use crate::corpus::{Corpus, stem};
-use crate::edits::{EditPlanArgs, prepare};
+use crate::edits::{EditPlanArgs, prepare, spawn_maintenance};
 use crate::env::{save_result, write_metrics};
 
 /// Com `edits`, a escrita da fase B é o plano de edições sobre a fatia dos
 /// `skip` primeiros artigos (o que o banco tem), em vez de carregar mais artigos.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queries_path: &Path, threads: usize, batch_size: usize, baseline_secs: u64, edits: Option<EditPlanArgs>, label: Option<String>) -> AnyResult {
+pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queries_path: &Path, threads: usize, batch_size: usize, baseline_secs: u64, edits: Option<EditPlanArgs>, maintenance: Option<u64>, label: Option<String>) -> AnyResult {
     let set = read_query_sets(&[queries_path.to_path_buf()])?.pop().ok_or("conjunto de consultas vazio")?;
     let engine = Arc::new(Engine::open(db, Config { statistics: true, ..Config::default() })?);
 
@@ -70,6 +70,7 @@ pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<
     // O plano é preparado antes de medir: ler o corpus não é escrita.
     let prepared = edits.map(|plan| prepare(corpus_path, skip, &plan, take.map(|t| t as usize))).transpose()?;
     let started = Instant::now();
+    let worker = maintenance.map(|n| spawn_maintenance(&engine, n));
     if let Some(prepared) = &prepared {
         prepared.apply(&engine, batch_size, |_| {})?;
         docs = prepared.ops.len() as u64;
@@ -92,6 +93,9 @@ pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<
         batch.commit()?;
     }
     let write_secs = started.elapsed().as_secs_f64();
+    if let Some(worker) = worker {
+        worker.stop()?;
+    }
     stop.store(true, Ordering::Relaxed);
     let during = collect(handles);
     let after = write_metrics(&engine);
@@ -110,7 +114,7 @@ pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<
         "concurrent",
         &label.unwrap_or_else(|| format!("{}-t{threads}", stem(db))),
         json!({ "db": db, "corpus": corpus_path, "skip": skip, "take": take, "threads": threads, "batch": batch_size,
-                "edits": edits.map(|e| format!("{e:?}")),
+                "edits": edits.map(|e| format!("{e:?}")), "maintenance": maintenance,
                 "read_without_write": a, "read_with_write": b,
                 "indexing": { "docs": docs, "bytes": bytes, "seconds": write_secs, "docs_per_s": docs as f64 / write_secs },
                 "write_before": before, "write_after": after }),

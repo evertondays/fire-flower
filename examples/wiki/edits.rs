@@ -3,9 +3,10 @@
 //! mesmo plano produz, para o oráculo (`wiki oracle --edits`).
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
-use fire_flower::{CommitStats, Config, DocId, Engine};
+use fire_flower::{CommitStats, Config, DocId, Engine, Maintenance, MaintenanceOptions};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::json;
 
@@ -133,6 +134,12 @@ pub(crate) fn final_docs(corpus: &Path, take: u64, args: &EditPlanArgs) -> AnyRe
     Ok(out)
 }
 
+/// Manutenção em segundo plano que compacta a cada `edits` edições.
+pub(crate) fn spawn_maintenance(engine: &Arc<Engine>, edits: u64) -> Maintenance {
+    let options = MaintenanceOptions { edits_before_compact: Some(edits), ..MaintenanceOptions::default() };
+    Maintenance::spawn(Arc::clone(engine), options)
+}
+
 /// O plano pronto para aplicar: as operações e os textos que elas usam.
 pub(crate) struct Prepared {
     pub(crate) ops: Vec<Edit>,
@@ -189,9 +196,11 @@ pub(crate) fn edit(
     max_ops: Option<usize>,
     args: EditPlanArgs,
     collect: bool,
+    maintenance: Option<u64>,
     label: Option<String>,
 ) -> AnyResult {
-    let engine = Engine::open(db, Config { statistics: true, ..Config::default() })?;
+    let engine = Arc::new(Engine::open(db, Config { statistics: true, ..Config::default() })?);
+    let worker = maintenance.map(|n| spawn_maintenance(&engine, n));
     let prepared = prepare(corpus, take, &args, max_ops)?;
     let ops = &prepared.ops;
     let label = label.unwrap_or_else(|| format!("{}-{take}-b{batch_size}", stem(corpus)));
@@ -207,6 +216,13 @@ pub(crate) fn edit(
         totals.add(&stats);
     })?;
     let secs = started.elapsed().as_secs_f64();
+    if let Some(worker) = worker {
+        // Espera a compactação que o fim do plano pode ter disparado.
+        while engine.pending_edits() >= maintenance.unwrap_or(u64::MAX) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        worker.stop()?;
+    }
     let collect_started = Instant::now();
     let emptied = if collect { Some(engine.collect_empty_words()?) } else { None };
     let collect_secs = collect_started.elapsed().as_secs_f64();
@@ -216,7 +232,7 @@ pub(crate) fn edit(
     let result = json!({
         "db": db, "corpus": corpus, "take": take, "batch": batch_size, "plan": format!("{args:?}"),
         "config": config_json(engine.config()), "format": fire_flower::FORMAT_VERSION,
-        "ops": ops.len(), "seconds": secs, "ops_per_s": ops.len() as f64 / secs,
+        "ops": ops.len(), "seconds": secs, "ops_per_s": ops.len() as f64 / secs, "maintenance": maintenance,
         "replaced": replaced, "deleted": deleted, "tombstones": tombstones,
         "commits": commit_secs.len(), "commit_p50_s": pct(0.5), "commit_p99_s": pct(0.99),
         "emptied_words": emptied, "collect_seconds": collect_secs,

@@ -793,6 +793,13 @@ def phase_edits(scale):
     wiki("concurrent", "--db", tmp, "--corpus", src, "--skip", n, "--edits", "--batch", 1000,
          "--queries", os.path.join(queries_dir(scale), "mixed.txt"), "--threads", 4,
          "--baseline-secs", 5 if n <= 10000 else 15, "--label", f"edits-{scale}-mixed-t4")
+    for label, extra in (("trickle", []), ("trickle-maintenance", ["--maintenance", 1000])):
+        step("buscas com 3.000 edições de 1 documento em paralelo (4 leitores)"
+             + (", com manutenção a cada 1.000" if extra else ""))
+        copy_db(clean, tmp)
+        wiki("concurrent", "--db", tmp, "--corpus", src, "--skip", n, "--edits", "--batch", 1, "--take", 3000,
+             "--queries", os.path.join(queries_dir(scale), "mixed.txt"), "--threads", 4, *extra,
+             "--baseline-secs", 5 if n <= 10000 else 15, "--label", f"edits-{scale}-{label}-t4")
     shutil.rmtree(tmp, ignore_errors=True)
     return ok
 
@@ -858,13 +865,19 @@ def edits_section(R, scale):
                 cells.append(cell(v, base, us))
             L.append(f"| `{name}` | " + " | ".join(cells) + " |")
         L.append("")
-    conc = latest(R, "concurrent", f"edits-{scale}-mixed-t4")
-    if conc:
-        a, b = conc["read_without_write"], conc["read_with_write"]
-        L += ["### Buscas com o plano rodando (4 leitores, `mixed`)", "",
-              "| | p50 | p99 | qps |", "|---|---|---|---|",
-              f"| sem escrita | {us(a['p50_us'])} | {us(a['p99_us'])} | {fmt(a['qps'])} |",
-              f"| com o plano (lote de 1.000) | {us(b['p50_us'])} | {us(b['p99_us'])} | {fmt(b['qps'])} |", ""]
+    concs = [(title, latest(R, "concurrent", f"edits-{scale}-{label}-t4"))
+             for label, title in (("mixed", "o plano inteiro (lote de 1.000)"),
+                                  ("trickle", "3.000 edições de 1 documento"),
+                                  ("trickle-maintenance", "3.000 edições de 1 documento, com manutenção a cada 1.000"))]
+    if any(c for _, c in concs):
+        L += ["### Buscas com edições em paralelo (4 leitores, `mixed`)", "",
+              "| Escrita | p50 sem → com | p99 sem → com | qps sem → com |", "|---|---|---|---|"]
+        for title, c in concs:
+            if c:
+                a, b = c["read_without_write"], c["read_with_write"]
+                L.append(f"| {title} | {us(a['p50_us'])} → {us(b['p50_us'])} | {us(a['p99_us'])} → {us(b['p99_us'])} "
+                         f"| {fmt(a['qps'])} → {fmt(b['qps'])} |")
+        L.append("")
     return L
 
 

@@ -136,6 +136,9 @@ enum Cmd {
         /// Roda a limpeza de palavras sem documento no fim
         #[arg(long)]
         collect: bool,
+        /// Manutenção em segundo plano que compacta a cada N edições
+        #[arg(long)]
+        maintenance: Option<u64>,
         #[command(flatten)]
         plan: EditPlanArgs,
         #[arg(long)]
@@ -304,6 +307,9 @@ enum Cmd {
         /// que o banco tem); --take limita as operações
         #[arg(long)]
         edits: bool,
+        /// Manutenção em segundo plano que compacta a cada N edições
+        #[arg(long)]
+        maintenance: Option<u64>,
         #[command(flatten)]
         plan: EditPlanArgs,
         #[arg(long)]
@@ -336,8 +342,8 @@ fn main() -> AnyResult {
         Cmd::Queries { vocab, corpus, languages, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&languages)?), seed, per_set, out)
         }
-        Cmd::Edit { db, corpus, take, batch, max_ops, collect, plan, label } => {
-            edit(&db, &corpus, take, batch.max(1), max_ops, plan, collect, label)
+        Cmd::Edit { db, corpus, take, batch, max_ops, collect, maintenance, plan, label } => {
+            edit(&db, &corpus, take, batch.max(1), max_ops, plan, collect, maintenance, label)
         }
         Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, edits, plan, label } => {
             let config = inflections.apply(Config::default())?;
@@ -363,8 +369,8 @@ fn main() -> AnyResult {
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),
-        Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, edits, plan, label } => {
-            concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, edits.then_some(plan), label)
+        Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, edits, maintenance, plan, label } => {
+            concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, edits.then_some(plan), maintenance, label)
         }
     }
 }

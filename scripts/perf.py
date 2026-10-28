@@ -14,7 +14,7 @@
     python3 scripts/perf.py long-load       # carga inteira janela a janela; falha se a velocidade colapsar
                                               #   [--reproduce: roda antes o cenário que colapsava]
     python3 scripts/perf.py stemming          # stemming ligado vs. desligado (A/B no mesmo binário)
-    python3 scripts/perf.py edits             # edição e remoção (docs/plano-edicao.md); escala até 100k
+    python3 scripts/perf.py edits             # edição e remoção (docs/analise-edicao.md, plano A); até 100k
     python3 scripts/perf.py report         # escreve RESULTADOS.md no repositório de resultados
     python3 scripts/perf.py compare A.json B.json
 
@@ -699,26 +699,24 @@ EDIT_SETS = ["t-mid", "t-freq", "titles", "and-freq", "rank-freq", "rank-titles"
 # Lotes da vazão das edições e quantas operações cada um aplica (None = o plano inteiro).
 EDIT_BATCHES = [(10000, None), (100, 3000), (1, 300)]
 # Latência: cada banco editado contra um carregado direto com o mesmo estado
-# final (mesmo conteúdo, sem edições), e a fatia com e sem `fwd:`.
+# final (mesmo conteúdo, sem edições).
 EDIT_STAGES = [("clean-pre", "fatia carregada, antes de compactar"),
                ("trickle-pre", "fatia + 1.000 edições de 1 documento, antes de compactar"),
                ("final-pre", "estado final carregado, antes de compactar"),
                ("edited-pre", "editado, antes de compactar"),
-               ("edited-collected", "editado + limpeza de palavras, antes de compactar"),
                ("final-compacted", "estado final carregado, compactado"),
                ("edited-compacted", "editado, compactado"),
-               ("no-fwd-compacted", "fatia sem fwd:, compactada"),
-               ("clean-compacted", "fatia com fwd:, compactada")]
+               ("clean-compacted", "fatia, compactada")]
 # Com o que cada etapa é comparada.
-EDIT_BASES = {"trickle-pre": "clean-pre", "edited-pre": "final-pre", "edited-collected": "final-pre", "edited-compacted": "final-compacted",
-              "clean-compacted": "no-fwd-compacted"}
+EDIT_BASES = {"trickle-pre": "clean-pre", "edited-pre": "final-pre", "edited-compacted": "final-compacted"}
 
 
 def phase_edits(scale):
-    """Edição e remoção (docs/plano-edicao.md): oráculo e equivalência com um
-    plano de edições, carga com e sem `fwd:`, vazão das edições por tamanho de
+    """Edição e remoção (docs/analise-edicao.md, plano A): oráculo e
+    equivalência com um plano de edições, vazão das edições por tamanho de
     lote, latência do banco editado contra o limpo (antes e depois de
-    compactar) e buscas com um editor em paralelo."""
+    compactar) e buscas com um editor em paralelo. A carga e o banco sem
+    edições se comparam com a `main` no A/B de sempre."""
     if scale not in EDIT_DONORS:
         sys.exit(f"edits: escala {scale} sem artigos depois da fatia para o plano; use 100k ou menor")
     n = docs_in(scale)
@@ -735,24 +733,27 @@ def phase_edits(scale):
          "--label", f"edits-{small}-oracle")
     wiki("edit", "--db", edited, "--corpus", small_src, "--take", docs_in(small), "--batch", 1000,
          "--label", f"edits-{small}-oracle")
-    ok &= wiki("oracle", "--db", edited, "--corpus", small_src, "--take", docs_in(small), "--edits",
-               "--label", f"{small}-edits", check=False) == 0
     wiki("load", "--db", final, "--corpus", small_src, "--take", docs_in(small), "--batch", BATCH, "--edits",
          "--label", f"edits-{small}-final")
-    same = digest(edited)["digest"] == digest(final)["digest"]
-    save_result("edits-digest", small, {"same": same})
+    # Antes da compactação as versões mortas ainda estão nas listas: o
+    # conteúdo lógico (listas sem os mortos) já tem que ser o mesmo. As notas
+    # (o df conta os mortos) e o autocompletar só batem depois dela.
+    same_pre = digest(edited)["digest"] == digest(final)["digest"]
+    run([FF, "compact", edited])
+    ok &= wiki("oracle", "--db", edited, "--corpus", small_src, "--take", docs_in(small), "--edits",
+               "--label", f"{small}-edits", check=False) == 0
+    same = same_pre and digest(edited)["digest"] == digest(final)["digest"]
+    save_result("edits-digest", small, {"same": same, "same_before_compaction": same_pre})
     if not same:
         print(f"{RED}✗ o banco editado difere do carregado direto no estado final{RESET}")
     ok &= same
     for path in (edited, final):
         shutil.rmtree(path, ignore_errors=True)
 
-    clean, no_fwd = db(f"edits-{scale}-fwd"), db(f"edits-{scale}-no-fwd")
-    step(f"carga {scale} com fwd: (o padrão)")
-    load_rounds(clean, scale, f"edits-{scale}-fwd", "--batch", BATCH)
-    sizes_of(clean, f"edits-{scale}-fwd")
-    step(f"carga {scale} sem fwd: (--no-edits)")
-    load_rounds(no_fwd, scale, f"edits-{scale}-no-fwd", "--batch", BATCH, "--no-edits")
+    clean = db(f"edits-{scale}-clean")
+    step(f"carga {scale}")
+    fresh(clean)
+    wiki("load", "--db", clean, "--corpus", corpus(scale), "--batch", BATCH, "--label", f"edits-{scale}-clean")
 
     tmp = db("tmp-edits")
     for batch, max_ops in EDIT_BATCHES:
@@ -775,21 +776,17 @@ def phase_edits(scale):
     wiki("load", "--db", final, "--corpus", src, "--take", n, "--batch", BATCH, "--edits",
          "--label", f"edits-{scale}-final")
     bench(final, scale, EDIT_SETS, f"edits-{scale}-final-pre")
-    step("latência: editado antes de compactar (merge pendente e palavras por conferir)")
+    step("latência: editado antes de compactar (versões mortas nas listas)")
     copy_db(clean, edited)
     wiki("edit", "--db", edited, "--corpus", src, "--take", n, "--batch", BATCH, "--label", f"edits-{scale}-latency")
     bench(edited, scale, EDIT_SETS, f"edits-{scale}-edited-pre")
-    step("latência: editado depois da limpeza de palavras sem documento")
-    wiki("edit", "--db", edited, "--corpus", src, "--take", n, "--max-ops", 0, "--collect",
-         "--label", f"edits-{scale}-collect")
-    bench(edited, scale, EDIT_SETS, f"edits-{scale}-edited-collected")
-    step("compactação dos quatro bancos")
-    banks = ((final, "final"), (edited, "edited"), (no_fwd, "no-fwd"), (clean, "fwd"))
+    step("compactação dos três bancos")
+    banks = ((final, "final"), (edited, "edited"), (clean, "clean"))
     for path, label in banks:
         compact_and_save(path, f"edits-{scale}-{label}")
-    sizes_of(clean, f"edits-{scale}-fwd-compacted")
-    sizes_of(no_fwd, f"edits-{scale}-no-fwd-compacted")
-    for (path, _), stage in zip(banks, ("final-compacted", "edited-compacted", "no-fwd-compacted", "clean-compacted")):
+    sizes_of(edited, f"edits-{scale}-edited-compacted")
+    sizes_of(final, f"edits-{scale}-final-compacted")
+    for (path, _), stage in zip(banks, ("final-compacted", "edited-compacted", "clean-compacted")):
         step(f"latência: {dict(EDIT_STAGES)[stage]}")
         bench(path, scale, EDIT_SETS, f"edits-{scale}-{stage}")
     shutil.rmtree(final, ignore_errors=True)
@@ -812,48 +809,40 @@ def phase_edits(scale):
 
 
 def edits_section(R, scale):
-    loads = {k: median_load(R, f"edits-{scale}-{k}") for k in ("fwd", "no-fwd")}
-    if not all(loads.values()):
+    load = latest(R, "load", f"edits-{scale}-clean")
+    if not load:
         return []
     small = smaller(scale, "10k")
-    comps = {k: latest(R, "compact", f"edits-{scale}-{k}") for k in ("fwd", "no-fwd", "edited")}
-    sizes = latest(R, "sizes", f"edits-{scale}-fwd-compacted")
-    fwd_bytes = next((e["key_bytes"] + e["value_bytes"] for e in (sizes or {}).get("spaces", [])
-                      if e["space"] == "fwd"), None)
+    comps = {k: latest(R, "compact", f"edits-{scale}-{k}") for k in ("clean", "final", "edited")}
     oracle = latest(R, "oracle", f"{small}-edits")
     same = latest(R, "edits-digest", small)
     L = [f"## Edição e remoção ({scale})", "",
          "Plano com seed fixa sobre a fatia: troca o texto de 50% dos documentos pelo de artigos seguintes, "
-         "remove 10% e readiciona 1% ([docs/plano-edicao.md](" + DOCS_URL + "/plano-edicao.md)).", ""]
+         "remove 10% e readiciona 1% ([docs/analise-edicao.md](" + DOCS_URL + "/analise-edicao.md), plano A).", ""]
     if oracle or same:
-        L += [f"- Oráculo de {small} depois do plano: **{oracle['divergences'] if oracle else '—'} divergências**; "
-              f"digest do banco editado {'**igual**' if same and same.get('same') else '**diferente**'} ao da carga "
-              "direta do estado final.", ""]
-    a, b = loads["no-fwd"], loads["fwd"]
+        L += [f"- Oráculo de {small} depois do plano (compactado): "
+              f"**{oracle['divergences'] if oracle else '—'} divergências**; digest do banco editado "
+              f"{'**igual**' if same and same.get('same') else '**diferente**'} ao da carga direta do estado final "
+              "(antes e depois de compactar).", ""]
     def cell(v, base, f):
         if v is None:
             return "—"
         return f"{f(v)} ({pct(v, base):+.1f}%)" if base else f(v)
-    db_a, db_b = (comps["no-fwd"] or {}).get("db_after"), (comps["fwd"] or {}).get("db_after")
-    L += ["| | sem `fwd:` | com `fwd:` (padrão) |", "|---|---|---|",
-          f"| Carga (s) | {fmt(a['seconds'], 1)} | {cell(b['seconds'], a['seconds'], lambda v: fmt(v, 1))} |",
-          f"| Carga (docs/s) | {docs_s(a)} | {docs_s(b)} |",
-          f"| Pico de RSS (MB) | {mb(a['peak_rss'])} | {mb(b['peak_rss'])} |",
-          f"| Banco compactado (MB) | {mb(db_a) if db_a else '—'} | {cell(db_b, db_a, mb)} |",
-          f"| `fwd:` (MB) | — | {mb(fwd_bytes) if fwd_bytes else '—'} |", ""]
+    db_final, db_edited = (comps["final"] or {}).get("db_after"), (comps["edited"] or {}).get("db_after")
+    L += [f"- Carga da fatia: {fmt(load['seconds'], 1)} s ({docs_s(load)} docs/s).",
+          f"- Compactação: fatia {fmt((comps['clean'] or {}).get('seconds'), 1)} s; estado final carregado "
+          f"{fmt((comps['final'] or {}).get('seconds'), 1)} s; editado {fmt((comps['edited'] or {}).get('seconds'), 1)} s.",
+          f"- Banco compactado: estado final carregado {mb(db_final) if db_final else '—'} MB; editado "
+          f"{cell(db_edited, db_final, mb)} MB.", ""]
     rows = [(batch, latest(R, "edit", f"edits-{scale}-b{batch}")) for batch, _ in EDIT_BATCHES]
     if any(r for _, r in rows):
-        L += ["### Vazão das edições", "", "| Lote | Operações | ops/s | commit p50 | commit p99 | lápides |",
+        L += ["### Vazão das edições", "", "| Lote | Operações | ops/s | commit p50 | commit p99 | versões mortas |",
               "|---|---|---|---|---|---|"]
         for batch, r in rows:
             if r:
                 L.append(f"| {fmt(batch)} | {fmt(r['ops'])} | {fmt(r['ops_per_s'])} "
                          f"| {fmt(r['commit_p50_s'] * 1e3, 1)} ms | {fmt(r['commit_p99_s'] * 1e3, 1)} ms "
-                         f"| {fmt(r['tombstones'])} |")
-        collect = latest(R, "edit", f"edits-{scale}-collect")
-        if collect and collect.get("emptied_words") is not None:
-            L += ["", f"Limpeza de palavras sem documento: {fmt(collect['emptied_words'])} palavras em "
-                      f"{fmt(collect['collect_seconds'], 2)} s."]
+                         f"| {fmt(r.get('killed', r.get('tombstones')))} |")
         L.append("")
     benches = {stage: latest(R, "bench", f"edits-{scale}-{stage}") for stage, _ in EDIT_STAGES}
     if all(benches.values()):
@@ -861,7 +850,7 @@ def edits_section(R, scale):
         L += ["### Latência p50", "",
               "Entre parênteses, a diferença para a referência: as edições contínuas contra a fatia sem edições; "
               "o banco do plano inteiro contra o estado final carregado direto (mesmo conteúdo) no mesmo estado "
-              "de compactação; a fatia com `fwd:` contra a sem.", "",
+              "de compactação.", "",
               "| Conjunto | " + " | ".join(title for _, title in EDIT_STAGES) + " |",
               "|---" * (len(EDIT_STAGES) + 1) + "|"]
         for name in by["clean-pre"]:
@@ -1348,7 +1337,7 @@ def main():
                         ("concurrency", "Fase 5"), ("phrases", "frases e ranking (Fase E do plano)"),
                         ("relevance", "ordenação: consultas de resposta conhecida"),
                         ("stemming", "stemming ligado vs. desligado (A/B no mesmo binário)"),
-                        ("edits", "edição e remoção: oráculo, fwd: ligado vs. desligado, vazão e latência"),
+                        ("edits", "edição e remoção: oráculo, vazão, latência antes e depois de compactar"),
                         ("report", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")

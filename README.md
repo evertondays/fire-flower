@@ -210,6 +210,21 @@ simples no shell:
 ./target/release/fire-flower suggest /tmp/indice prog 10
 ```
 
+### JavaScript (Node, Bun e Deno)
+
+O binding [`bindings/node`](bindings/node/) (napi-rs) roda o motor no mesmo
+processo: ~0,1 µs por chamada vazia e a busca top 10 com a latência do Rust.
+
+```javascript
+const { Engine } = require("@fire-flower/node");
+const engine = await Engine.open("./indice");
+await engine.index([{ id: 1, title: "Planeta Terra", text: "…" }]); // commit fora do event loop
+const top = engine.searchTopSync("planeta ter*", { k: 10 });          // top.ids, top.scores, top.total
+```
+
+Detalhes, compilação e medidas: [bindings/node/README.md](bindings/node/README.md)
+e [docs/plano-bindings.md](docs/plano-bindings.md).
+
 ### Monitoramento
 
 O processo que grava o banco pode publicar métricas de custo desprezível

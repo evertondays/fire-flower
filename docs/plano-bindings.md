@@ -167,3 +167,45 @@ binários continuou em +8,6% (301,6 → 327,6 µs; `and-freq` +3,6%). Com builds
 de alinhamento fixo (`-align-all-functions=6 -align-all-nofallthru-blocks=6`)
 a diferença some: 315,7 → 318,0 µs (+0,7%), `and-freq` +0,3%. É alinhamento
 do código, como no A/B do monitoramento; a Fase 0 não perde nada.
+
+## Resultado da Fase 1 (28/10/2026)
+
+`perf.py bindings --scale full`: o binding contra o `wiki` (`--plain`, sem
+PerfContext nem estatísticas), no mesmo banco, 3 rodadas alternadas.
+
+| Medida | Meta | Resultado |
+|---|---|---|
+| Chamada vazia | ≤ 0,2 µs | 0,099 µs |
+| `searchTopSync` k = 10, `t-mid` p50 | ≤ nativo + max(1 µs, 5%) | 56 µs contra 55 µs (+0,24 µs) |
+| `rank-freq`, `phrase-freq` p50 (top 10) | ≤ nativo + 2% | +0,9% e −2,7% |
+| Rótulos de 10 resultados | ≤ `MultiGet` nativo + 2 µs | +1,6 µs no mesmo processo; +3,2 µs contra o `wiki` |
+| Carga 100k (lote 10k) | ≥ 97% | 89% a 94% (ver abaixo) |
+| Busca assíncrona | medir | +50 µs (ida e volta ao pool do libuv): só para consultas de ms |
+| Leitores em `worker_threads` (top 10 do `mixed`) | escala como o Rust | 1, 2, 4 e 8 workers: −7%, −4%, −4% e −18% do nativo |
+
+O caminho até aí:
+
+- **Método de classe do napi-rs: ~240 ns por chamada** (desembrulhar o
+  objeto e conferir a classe). Com a feature `napi8`, mais ~120 ns de type
+  tag. O addon expõe funções soltas sobre um handle (`External` lido direto,
+  conferido por um número mágico): 364 → 99 ns.
+- **Criar um `Float64Array` custa ~550 ns no Node 24**, inclusive no próprio
+  JS (o buffer fica fora do heap, com contabilidade no GC), e o do napi-rs
+  ainda é externo, com finalizador. `searchTopSync` escreve num buffer de
+  trabalho do `Engine` JS e o `TopHits` copia os k resultados para `number[]`
+  (~30 ns). **Desvio do plano original:** `TopHits.ids` e `scores` são
+  `number[]`, não `Float64Array`. `searchSync` (todos os IDs) e as promessas
+  continuam em `Float64Array`, com memória do V8.
+- **Rótulos numa string só** (separados por `\0`): uma string criada na
+  fronteira em vez de dez.
+- **Carga:** com o próximo lote montado enquanto o anterior grava, o parse
+  do JSON e a conversão das strings (1,5 s em 100k) ficam escondidos; o
+  event loop passa 13,8 s de 18 s esperando o commit. O que falta para 97% é
+  o próprio commit (o mesmo código Rust) rodar ~5% mais devagar dentro do
+  processo do Node, disputando a CPU com o V8 e o GC; uma arena só do malloc
+  piora (19,4 s). Fica como investigação.
+- **Fronteira contra processo:** o harness roda cada consulta também dentro
+  do addon, no processo do Node. A diferença para a chamada pelo JS (de 1,3
+  a 3,8 µs nas consultas curtas) inclui o trabalho JS entre as buscas
+  disputando o cache; a diferença para o `wiki` varia de rodada para rodada
+  em ±5 µs.

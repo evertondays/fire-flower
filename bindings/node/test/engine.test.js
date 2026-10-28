@@ -189,3 +189,41 @@ test("métricas pelo binding", () => {
   assert.equal(m.queries.find((x) => x.op === "search_ranked").count, 1);
   engine.close();
 });
+
+test("leitor com refreshMs acompanha um escritor em outro processo", async () => {
+  const { spawn } = require("node:child_process");
+  const db = path.join(tempDir(), "db");
+  const first = Engine.openSync(db);
+  first.indexSync([{ id: 1, text: "alfa comum" }]);
+  first.close(); // solta o LOCK para o escritor do outro processo
+  // O escritor é outro processo (o LOCK do RocksDB é por processo).
+  const writer = spawn(process.execPath, ["-e", `
+    const { Engine } = require(${JSON.stringify(path.resolve(__dirname, ".."))});
+    const engine = Engine.openSync(${JSON.stringify(db)});
+    (async () => {
+      for (let i = 1; i <= 30; i++) {
+        await engine.index([{ id: 1, text: "alfa comum versão " + i },
+          { id: i * 2, text: "beta comum" }, { id: i * 2 + 1, text: "gama comum" }]);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      engine.close();
+    })();
+  `]);
+  const exited = new Promise((resolve) => writer.once("exit", resolve));
+  const reader = await Engine.open(db, { readOnly: true, refreshMs: 20 });
+  let done = false;
+  exited.then(() => (done = true));
+  let last = 1;
+  while (!done) {
+    const found = reader.searchSync("comum").length;
+    assert.equal(found % 2, 1, `um commit pela metade: ${found}`);
+    assert.ok(found >= last, "o leitor voltou no tempo");
+    last = found;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(await exited, 0);
+  await reader.refresh();
+  assert.equal(reader.searchSync("comum").length, 61);
+  assert.ok(last > 1, "viu commits durante a escrita");
+  reader.close();
+});

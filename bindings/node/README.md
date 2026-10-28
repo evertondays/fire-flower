@@ -64,8 +64,10 @@ engine.close(); // ou: using engine = Engine.openSync(…)
 - **Gravação em fluxo:** `engine.writer({ batchSize })` acumula e grava a cada
   lote cheio (`await writer.add(doc)`, `await writer.flush()`).
 - **Vários processos:** um processo grava; os outros abrem com
-  `{ readOnly: true }`, sem travar o banco. A visão é a da abertura (abra de
-  novo para ver commits novos).
+  `{ readOnly: true, refreshMs: 1000 }`, sem travar o banco, e reabrem sozinhos
+  (no pool de threads) quando o banco muda, conferindo a pasta no máximo a cada
+  `refreshMs`. `await engine.refresh()` confere na hora. Sem `refreshMs`, a
+  visão é a da abertura.
 - **IDs** são `number` inteiros de 0 a 2^40 − 1.
 - **Erros** são `FireFlowerError` com `code` estável: `FF_OPEN`, `FF_BUSY`,
   `FF_READ_ONLY`, `FF_CLOSED`, `FF_CONFIG`, `FF_CORRUPT`, `FF_DB`,

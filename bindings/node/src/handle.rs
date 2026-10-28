@@ -9,7 +9,7 @@
 use std::ptr;
 use std::sync::{Arc, RwLock};
 
-use fire_flower::Engine;
+use fire_flower::{Engine, Reader};
 use napi::bindgen_prelude::*;
 use napi::{check_status, sys};
 
@@ -18,11 +18,19 @@ use crate::{binding_error, js_error};
 /// "fireflow": confere que o `External` recebido é um handle deste addon.
 const MAGIC: u64 = 0x6669_7265_666c_6f77;
 
-/// Um banco aberto do lado do JS. `close()` solta o `Engine`; o handle em si
-/// vai embora com o objeto JS (finalizador do `External`).
+/// O que um handle abre: um `Engine`, ou um `Reader` que troca a instância só
+/// leitura quando o banco muda.
+#[derive(Clone)]
+pub enum Backend {
+    Engine(Arc<Engine>),
+    Reader(Arc<Reader>),
+}
+
+/// Um banco aberto do lado do JS. `close()` solta o banco; o handle em si vai
+/// embora com o objeto JS (finalizador do `External`).
 pub struct EngineHandle {
     magic: u64,
-    engine: RwLock<Option<Arc<Engine>>>,
+    backend: RwLock<Option<Backend>>,
 }
 
 impl EngineHandle {
@@ -30,9 +38,20 @@ impl EngineHandle {
     /// próprio handle: cada thread JS tem os seus, sem disputa entre elas.
     #[inline]
     pub(crate) fn with<R>(&self, f: impl FnOnce(&Arc<Engine>) -> Result<R>) -> Result<R> {
-        let engine = self.engine.read().unwrap_or_else(|e| e.into_inner());
-        match engine.as_ref() {
-            Some(engine) => f(engine),
+        let backend = self.backend.read().unwrap_or_else(|e| e.into_inner());
+        match backend.as_ref() {
+            Some(Backend::Engine(engine)) => f(engine),
+            // A instância atual; uma reabertura no meio não a solta.
+            Some(Backend::Reader(reader)) => f(&reader.engine()),
+            None => Err(js_error(fire_flower::Error::Closed)),
+        }
+    }
+
+    /// O `Reader`, se o banco abriu com `refreshMs`.
+    pub(crate) fn reader(&self) -> Result<Option<Arc<Reader>>> {
+        match self.backend.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(Backend::Reader(reader)) => Ok(Some(Arc::clone(reader))),
+            Some(Backend::Engine(_)) => Ok(None),
             None => Err(js_error(fire_flower::Error::Closed)),
         }
     }
@@ -43,16 +62,16 @@ impl EngineHandle {
     }
 
     pub(crate) fn close(&self) {
-        *self.engine.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.backend.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.engine.read().unwrap_or_else(|e| e.into_inner()).is_none()
+        self.backend.read().unwrap_or_else(|e| e.into_inner()).is_none()
     }
 }
 
 /// Um handle novo, devolvido ao JS como `External`.
-pub struct NewHandle(pub(crate) Arc<Engine>);
+pub struct NewHandle(pub(crate) Backend);
 
 impl TypeName for NewHandle {
     fn type_name() -> &'static str {
@@ -72,7 +91,7 @@ unsafe extern "C" fn finalize_handle(_env: sys::napi_env, data: *mut std::ffi::c
 
 impl ToNapiValue for NewHandle {
     unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
-        let handle = Box::into_raw(Box::new(EngineHandle { magic: MAGIC, engine: RwLock::new(Some(val.0)) }));
+        let handle = Box::into_raw(Box::new(EngineHandle { magic: MAGIC, backend: RwLock::new(Some(val.0)) }));
         let mut out = ptr::null_mut();
         // SAFETY: o Node guarda o ponteiro e chama `finalize_handle` quando o
         // objeto JS for coletado.

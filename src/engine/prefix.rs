@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{DocId, Posting, Result, codec};
+use crate::{DocId, Posting, Result};
 use crate::codec::TrieNode;
 use crate::engine::keys::{NODE, POST};
 use crate::engine::view::{View, missing_node};
@@ -32,7 +32,7 @@ impl View<'_> {
     fn union_postings(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<Posting>> {
         let mut all: Vec<Posting> = Vec::new();
         for value in self.get_many(POST, nodes)?.into_iter().flatten() {
-            all.extend(codec::decode_postings(&value)?);
+            all.extend(self.postings_of(&value)?);
         }
         // `all` é a concatenação de listas já ordenadas: a ordenação estável
         // detecta os trechos ordenados e só os intercala (o `sort_unstable`
@@ -59,7 +59,7 @@ impl View<'_> {
     fn union_docs(&self, nodes: impl Iterator<Item = u64>) -> Result<Vec<DocId>> {
         let mut all = Vec::new();
         for value in self.get_many(POST, nodes)?.into_iter().flatten() {
-            all.extend(codec::decode_docs(&value)?);
+            all.extend(self.docs_of(&value)?);
         }
         all.sort(); // trechos já ordenados: ver `prefix_postings`
         all.dedup();
@@ -69,6 +69,10 @@ impl View<'_> {
     /// Busca em largura a partir do nó do prefixo, até `limit` palavras, das
     /// mais curtas para as mais longas e, no mesmo comprimento, em ordem
     /// alfabética. Retorna (palavra, id do nó).
+    ///
+    /// Uma palavra cujos documentos foram todos substituídos ou removidos
+    /// continua aqui até a compactação (que a tira da Trie): conferir as
+    /// listas de cada palavra custaria uma leitura por palavra.
     ///
     /// Percorre nível a nível (a mesma ordem de uma fila) e lê os nós que não
     /// estão no cache em lotes de até `WORDS_CHUNK` com um `MultiGet`: um

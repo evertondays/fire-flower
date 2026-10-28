@@ -1,11 +1,12 @@
 //! Diagnóstico e medição: usados pelo harness de performance (`examples/wiki/`).
 
-use crate::{Config, DocId, Engine, Error, Posting, Result, codec};
+use crate::{Config, DocId, Engine, Error, Posting, Result};
 use crate::analysis::normalize_term;
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
-use crate::engine::keys::{Key, META_NEXT_NODE, NORM, POS, ROOT_ID};
+use crate::engine::keys::{META_NEXT_NODE, NORM, ROOT_ID};
 use crate::engine::meta::read_counter;
-use crate::engine::view::{Source, load_node, missing_node};
+use crate::engine::versions;
+use crate::engine::view::{load_node, missing_node};
 
 /// Diagnóstico e medição: usados pelo harness de performance (`examples/wiki/`).
 impl Engine {
@@ -37,25 +38,27 @@ impl Engine {
 
     /// IDs da lista de postagem pelo ID do nó terminal (ver [`Engine::for_each_term`]).
     pub fn postings_of_node(&self, node_id: u64) -> Result<Vec<DocId>> {
-        self.view().load_docs(node_id)
+        self.view().user_docs(node_id)
     }
 
     /// Lista de postagem com tf, pelo ID do nó terminal.
     pub fn term_postings_of_node(&self, node_id: u64) -> Result<Vec<Posting>> {
-        self.view().load_postings(node_id)
+        self.view().user_postings(node_id)
     }
 
     /// Posições do termo em cada documento, pelo ID do nó terminal. Vazio
     /// num banco sem posições.
     pub fn positions_of_node(&self, node_id: u64) -> Result<Vec<(DocId, Vec<u32>)>> {
-        match self.view().snap.get_bytes(Key::new(POS, node_id).as_ref())? {
-            Some(v) => codec::decode_positions(&v),
-            None => Ok(Vec::new()),
-        }
+        self.view().user_positions(node_id)
     }
 
-    /// Percorre os tamanhos de todos os documentos (em ordem de bloco):
-    /// `f(documento, tamanho inteiro, tamanho do título)`.
+    /// Versões mortas que ainda estão nas listas (saem na compactação).
+    pub fn dead_versions(&self) -> usize {
+        self.dead.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Percorre os tamanhos de todos os documentos (em ordem de bloco, que
+    /// não é a de documento): `f(documento, tamanho inteiro, tamanho do título)`.
     pub fn for_each_doc_len(&self, mut f: impl FnMut(DocId, u32, u32)) -> Result<()> {
         let mode = rocksdb::IteratorMode::From(NORM, rocksdb::Direction::Forward);
         for item in self.db.iterator(mode) {
@@ -66,7 +69,8 @@ impl Engine {
                 .and_then(|b| b.parse().ok())
                 .ok_or_else(|| Error::Corrupt("chave norm: inválida".into()))?;
             for (offset, l) in NormBlock::decode(&value)?.iter() {
-                f(block * NORM_BLOCK_DOCS + u64::from(offset), l.len, u32::from(l.title_len));
+                let doc = versions::user_of(block * NORM_BLOCK_DOCS + u64::from(offset));
+                f(doc, l.len, u32::from(l.title_len));
             }
         }
         Ok(())

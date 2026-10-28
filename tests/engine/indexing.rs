@@ -66,6 +66,9 @@ pub(crate) fn labels_and_auto_ids() {
     assert_eq!(engine.search("automatico").unwrap(), [42, 43]);
     assert_eq!(engine.label(43).unwrap().as_deref(), Some("b.txt"));
     assert_eq!(engine.label(41).unwrap(), None);
+    let mut labels = Vec::new();
+    engine.for_each_label(|doc, label| labels.push((doc, label.to_string()))).unwrap();
+    assert_eq!(labels, [(42, "a.txt".to_string()), (43, "b.txt".to_string())]);
 }
 
 #[test]
@@ -99,7 +102,7 @@ pub(crate) fn explicit_labels_and_compaction() {
     }
     // Três pedaços de merge em "compartilhado"; depois da compactação, um só.
     assert_eq!(engine.search("compartilhado").unwrap(), [100, 101, 102]);
-    engine.compact();
+    engine.compact().unwrap();
     assert_eq!(engine.search("compartilhado").unwrap(), [100, 101, 102]);
     assert_eq!(engine.label(101).unwrap().as_deref(), Some("Artigo 1"));
 }
@@ -210,7 +213,7 @@ pub(crate) fn stores_tf_positions_lengths_and_stats() {
     drop(engine);
     let engine = open(&dir);
     engine.index_document(2000, "papel papel").unwrap(); // outro bloco de norm:
-    engine.compact();
+    engine.compact().unwrap();
     assert_eq!(engine.term_postings("papel").unwrap(), [p(1, 1), p(2, 1), p(2000, 2)]);
     assert_eq!(positions(&engine, "papel"), [(1, vec![2]), (2, vec![0]), (2000, vec![0, 1])]);
     assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 4, total_len: 7, total_title_len: 0 });
@@ -242,7 +245,7 @@ pub(crate) fn reindexing_replaces_tf_positions_and_length() {
     assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 1 + 2 + 3, total_title_len: 0 });
 
     // Depois de compactar (merge completo) continua igual.
-    engine.compact();
+    engine.compact().unwrap();
     assert_eq!(engine.term_postings("sol").unwrap(), [p(8, 1), p(9, 1)]);
     assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 3, total_len: 6, total_title_len: 0 });
     drop(engine);

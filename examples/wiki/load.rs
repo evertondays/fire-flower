@@ -8,7 +8,8 @@ use rustc_hash::FxHashMap as HashMap;
 use serde_json::{Value, json};
 
 use crate::AnyResult;
-use crate::corpus::{Corpus, stem};
+use crate::corpus::{Corpus, Doc, stem};
+use crate::edits::{EditPlanArgs, final_docs};
 use crate::env::{config_json, dir_size, machine, mb, rss, save_result, swap_used, tickers, write_metrics};
 
 #[allow(clippy::too_many_arguments)]
@@ -21,10 +22,19 @@ pub(crate) fn load(
     remap_ids: bool,
     streaming: bool,
     config: Config,
+    edits: Option<EditPlanArgs>,
     label: Option<String>,
 ) -> AnyResult {
     let engine = Engine::open(db, config.clone())?;
-    let corpus = Corpus::open(corpus_path, skip, take, remap_ids)?;
+    // Com `edits`: o estado final da fatia depois do plano, para comparar
+    // (pelo `digest`) com um banco que passou pelas edições.
+    let corpus: Box<dyn Iterator<Item = AnyResult<Doc>>> = match &edits {
+        Some(plan) => {
+            let take = take.ok_or("--edits precisa de --take (o tamanho da fatia)")?;
+            Box::new(final_docs(corpus_path, take, plan)?.into_iter().map(Ok))
+        }
+        None => Box::new(Corpus::open(corpus_path, skip, take, remap_ids)?),
+    };
     let label = label.unwrap_or_else(|| format!("{}-b{batch_size}", stem(corpus_path)));
     // O sistema pode já ter swap em uso; o que conta é o aumento durante a carga.
     let swap_before = swap_used();
@@ -130,6 +140,7 @@ pub(crate) struct CommitTotals {
     pub(crate) nodes: f64,
     pub(crate) write: f64,
     pub(crate) evict: f64,
+    pub(crate) documents: f64,
     pub(crate) total: f64,
 }
 
@@ -147,6 +158,7 @@ impl CommitTotals {
         self.nodes += c.nodes_secs;
         self.write += c.write_secs;
         self.evict += c.evict_secs;
+        self.documents += c.documents_secs;
         self.total += c.total_secs;
     }
 
@@ -156,7 +168,7 @@ impl CommitTotals {
         json!({
             "commit_fraction": f(self.total), "sort_fraction": f(self.sort), "trie_fraction": f(self.trie),
             "encode_fraction": f(self.encode), "nodes_fraction": f(self.nodes), "write_fraction": f(self.write),
-            "evict_fraction": f(self.evict), "commits": self.commits,
+            "evict_fraction": f(self.evict), "documents_fraction": f(self.documents), "commits": self.commits,
             "terms_per_commit": self.terms as f64 / self.commits.max(1) as f64,
             "commit_reads_per_doc": self.node_reads as f64 / docs.max(1.0),
             "new_nodes_per_doc": self.new_nodes as f64 / docs.max(1.0),

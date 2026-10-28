@@ -81,12 +81,16 @@ impl IndexBatch<'_> {
     }
 
     /// Nó do cache, lendo do banco na primeira vez.
-    fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
+    pub(super) fn node_mut(&mut self, id: u64, depth: u8) -> Result<&mut CachedNode> {
         let generation = self.generation;
         match self.nodes.entry(id) {
             Entry::Occupied(e) => {
                 let cached = e.into_mut();
                 cached.used = generation;
+                // A limpeza de palavras põe no cache, como fundo, um nó que
+                // ainda não estava nele: a profundidade de verdade vem aqui, ou
+                // o commit deixaria de marcá-lo no cache das buscas.
+                cached.depth = cached.depth.min(depth);
                 Ok(cached)
             }
             Entry::Vacant(e) => {

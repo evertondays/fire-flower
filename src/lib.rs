@@ -33,7 +33,10 @@ mod engine;
 mod error;
 pub mod query;
 
-pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode};
+pub use engine::{
+    CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, Maintenance,
+    MaintenanceOptions,
+};
 pub use error::{Error, Result};
 pub use analysis::stem::{Stemmer, Stemming};
 pub use analysis::stopwords::{Language, Stopwords};
@@ -43,7 +46,9 @@ pub use analysis::stopwords::{Language, Stopwords};
 #[doc(hidden)]
 pub mod internals {
     pub use crate::codec::{
-        NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
+        DeadBits, NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_docs_except, decode_positions,
+        decode_postings,
+        encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
     };
     pub use crate::engine::{intersect, reads_on_this_thread};
 }

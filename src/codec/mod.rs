@@ -1,4 +1,4 @@
-//! Serialização compacta dos valores gravados no RocksDB (formato v5).
+//! Serialização compacta dos valores gravados no RocksDB (formato v7).
 //!
 //! Inteiros usam varint (LEB128): números pequenos ocupam 1–2 bytes em vez de
 //! 8. Listas são ordenadas por documento e gravam a diferença (delta) entre IDs
@@ -24,6 +24,10 @@
 //! tinham tamanho fixo e o merge recalculava a tabela a cada leitura de uma
 //! lista com pedaços pendentes (termo frequente antes de compactar: +43%).
 //! | `norm:<bloco>` | `n`, `n × (Δdeslocamento, tamanho)` dos documentos do bloco |
+//!
+//! **IDs internos (v7):** as listas e os blocos de `norm:` usam o ID interno
+//! da versão do documento (ver `engine::versions`), e não o do usuário. O
+//! formato dos valores é o do v5.
 
 mod list;
 mod merge;
@@ -36,11 +40,14 @@ mod varint;
 #[cfg(test)]
 mod tests;
 
-pub use self::list::{SKIP_BLOCK, list_len};
-pub use self::merge::{merge_positions, merge_postings};
+pub use self::list::{DeadBits, SKIP_BLOCK, list_len};
+pub use self::merge::{ListKind, merge_lists, merge_positions, merge_postings, purge_list};
 pub use self::node_set::{decode_node_set, encode_node_set, merge_node_sets};
 pub use self::norms::{DocLens, NORM_BLOCK_DOCS, NormBlock};
 pub use self::positions::{PositionsCursor, decode_positions, encode_positions_into};
-pub use self::postings::{PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into};
+pub use self::postings::{
+    PostingEntry, PostingsCursor, decode_docs, decode_docs_except, decode_postings, decode_postings_except,
+    encode_postings, encode_postings_into,
+};
 pub use self::trie_node::TrieNode;
 pub use self::varint::{get_varint, put_varint};

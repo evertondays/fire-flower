@@ -1,20 +1,24 @@
 //! Camadas de índice (Trie) e armazenamento (RocksDB).
 //!
-//! Espaços de chave (formato v5; a codificação está em `src/codec/`):
+//! Espaços de chave (formato v7; a codificação está em `src/codec/`):
 //! - `node:<id>`    -> [`TrieNode`] serializado (`node:0` é a raiz)
 //! - `post:<id>`    -> (documento, tf, tf no título) do termo que termina no nó `<id>`
 //! - `pos:<id>`     -> posições do termo em cada documento (só com posições);
 //!   o título vem primeiro, e o texto começa `TITLE_GAP` posições depois
 //! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
+//! - `ver:<id>`     -> ID interno da última versão de um documento que já mudou
 //! - `stem:<radical>` -> nós das palavras com esse radical (só com flexões na consulta)
-//! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas e stemming
+//! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas, stemming e mortos
+//!
+//! Em `post:`, `pos:` e `norm:` o documento é o ID interno da versão (ver
+//! `versions`); a API recebe e devolve o ID do usuário.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options};
+use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch};
 use rustc_hash::FxHashMap;
 
 use crate::{DocId, Error, Hit, IndexStats, Posting, Result, TopHits};
@@ -24,13 +28,15 @@ use crate::analysis::stopwords::{Language, Stopwords};
 use crate::codec::{NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::cache::EpochCache;
 use crate::engine::keys::{
-    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
+    DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_EPOCH, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
 use crate::engine::meta::{
-    merge_operator, previous_merge_operator, read_counter, resolve_format, resolve_languages,
-    resolve_stemming, stored_format_error,
+    previous_merge_operator, read_counter, resolve_format, resolve_languages, resolve_stemming, stored_format_error,
+    varint,
 };
+use crate::engine::purge::{FilterFactory, Purge};
+use crate::engine::versions::Deaths;
 use crate::engine::view::View;
 use crate::engine::writer::{NodeCache, WriterState};
 use crate::query::{Clause, parse_query_stemmed};
@@ -39,13 +45,17 @@ mod cache;
 mod config;
 mod conjunction;
 mod diagnostics;
+mod empty_words;
+mod maintenance;
 mod groups;
 mod keys;
 mod meta;
 mod phrase;
 mod prefix;
+mod purge;
 mod ranking;
 mod search;
+mod versions;
 mod view;
 mod writer;
 #[cfg(test)]
@@ -53,6 +63,8 @@ mod tests;
 
 
 pub use self::config::{Config, InflectionMode};
+pub use self::empty_words::CompactStats;
+pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
 pub use self::view::reads_on_this_thread;
@@ -71,11 +83,25 @@ pub struct Engine {
     inflector: Stemmer,
     /// O banco grava posições (`meta:positions`).
     positions: bool,
-    /// Número do último commit gravado (ver [`EpochCache`]).
-    epoch: AtomicU64,
+    /// `commit << 1 | gravando`: o número do último commit gravado (ver
+    /// [`EpochCache`]) e se um commit está sendo gravado agora (ver
+    /// [`Engine::view`]).
+    clock: AtomicU64,
     norms: EpochCache<NormBlock>,
     /// Nós rasos da Trie (até `Config::reader_cache_depth`).
     nodes: EpochCache<TrieNode>,
+    /// Versões mortas que as buscas filtram.
+    deaths: Deaths,
+    /// Os mortos que a compactação em andamento tira das listas.
+    purge: Arc<Purge>,
+    /// Mortos ainda nas listas, em ordem de commit: (número de sequência do
+    /// RocksDB do commit que os matou, ID interno). O escritor acrescenta; a
+    /// compactação tira os que limpou.
+    dead: Mutex<Vec<(u64, u64)>>,
+    /// Uma compactação por vez.
+    compaction: Mutex<()>,
+    /// Documentos substituídos ou removidos desde a última compactação.
+    pending_edits: AtomicU64,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -102,11 +128,22 @@ impl Engine {
             table.set_pin_top_level_index_and_filter(true);
         }
 
+        let purge = Arc::new(Purge::default());
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&table);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_merge_operator_associative(MERGE_OPERATOR, merge_operator);
+        let (full, partial) = (Arc::clone(&purge), Arc::clone(&purge));
+        opts.set_merge_operator(
+            MERGE_OPERATOR,
+            move |key: &[u8], existing: Option<&[u8]>, operands: &rocksdb::MergeOperands| {
+                purge::merge(&full, key, existing, operands)
+            },
+            move |key: &[u8], existing: Option<&[u8]>, operands: &rocksdb::MergeOperands| {
+                purge::merge(&partial, key, existing, operands)
+            },
+        );
+        opts.set_compaction_filter_factory(FilterFactory { purge: Arc::clone(&purge) });
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         opts.increase_parallelism(cpus as i32);
         if config.statistics {
@@ -151,12 +188,18 @@ impl Engine {
                 inflector.stemming()
             )));
         }
+        let deaths = Deaths::default();
+        let loaded = versions::load(&db, &deaths)?;
+        // Os números de commit continuam os do último `open`: `meta:epoch`
+        // gravado por um commit tem que bater com o relógio (ver `view`).
+        let epoch = read_counter(&db, META_EPOCH)?.unwrap_or(0);
         let writer = Mutex::new(WriterState {
             next_node_id,
             next_doc_id,
             stats,
             cache: NodeCache::default(),
             analyzer: Analyzer::default(),
+            latest: loaded.latest,
         });
         Ok(Self {
             db,
@@ -166,9 +209,15 @@ impl Engine {
             stemmer,
             inflector,
             positions,
-            epoch: AtomicU64::new(0),
+            clock: AtomicU64::new(epoch << 1),
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
+            deaths,
+            purge,
+            // Mortos de antes do `open`: todo snapshot de agora já os vê.
+            dead: Mutex::new(loaded.dead.into_iter().map(|id| (0, id)).collect()),
+            compaction: Mutex::new(()),
+            pending_edits: AtomicU64::new(0),
             opts,
         })
     }
@@ -191,7 +240,9 @@ impl Engine {
             cache_limit: self.config.writer_cache_nodes,
             dirty: Vec::new(),
             pending: FxHashMap::default(),
-            lengths: Vec::new(),
+            ops: Vec::new(),
+            last_op: FxHashMap::default(),
+            repeated: false,
             labels: Vec::new(),
             analyzer,
         }
@@ -202,6 +253,18 @@ impl Engine {
         let mut batch = self.batch();
         batch.add_document(doc_id, text)?;
         batch.commit()
+    }
+
+    /// Atalho para remover um único documento ([`IndexBatch::delete_document`]).
+    pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
+        let mut batch = self.batch();
+        batch.delete_document(doc_id)?;
+        batch.commit()
+    }
+
+    /// O documento está indexado (adicionado e não removido).
+    pub fn contains(&self, doc_id: DocId) -> Result<bool> {
+        Ok(self.doc_len(doc_id)?.is_some())
     }
 
     /// Busca full-text. Termos separados por espaço são combinados com E
@@ -230,7 +293,7 @@ impl Engine {
         let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
-            Some(node) => view.load_docs(node),
+            Some(node) => view.user_docs(node),
             None => Ok(Vec::new()),
         }
     }
@@ -240,7 +303,7 @@ impl Engine {
         let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
         let view = self.view();
         match view.term_node(&term)? {
-            Some(node) => view.load_postings(node),
+            Some(node) => view.user_postings(node),
             None => Ok(Vec::new()),
         }
     }
@@ -267,10 +330,38 @@ impl Engine {
         Ok(words.into_iter().map(|(word, _)| word).collect())
     }
 
-    /// Compacta o banco inteiro: une os pedaços pendentes das listas de
-    /// postagem e descarta versões antigas. Num índice grande leva minutos.
-    pub fn compact(&self) {
-        self.db.compact_range::<&[u8], &[u8]>(None, None);
+    /// Compacta o banco inteiro: une os pedaços pendentes das listas, tira
+    /// delas as versões mortas dos documentos substituídos e removidos, e
+    /// tira da Trie as palavras que ficaram sem documento. Num índice grande
+    /// leva minutos; buscas e lotes continuam durante a compactação. No fim,
+    /// pega a trava do escritor por um instante: espera um lote aberto (não
+    /// chame com um lote aberto na mesma thread).
+    pub fn compact(&self) -> Result<CompactStats> {
+        let _one = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+        // As edições que chegarem durante a compactação podem ficar fora dela.
+        let before = self.pending_edits.load(AtomicOrdering::Acquire);
+        let (purge, cut) = self.purgeable()?;
+        // Com o filtro de compactação instalado, o padrão do RocksDB regrava o
+        // último nível mais uma vez. Sem mortos não há o que filtrar: pula,
+        // como sem filtro. Com mortos, regrava só os arquivos que já estavam lá.
+        let mut opts = rocksdb::CompactOptions::default();
+        if purge.is_empty() {
+            opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Skip);
+        } else {
+            self.purge.start(purge.clone());
+            opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
+        }
+        self.db.compact_range_opt::<&[u8], &[u8]>(None, None, &opts);
+        let stats = if purge.is_empty() { Ok(CompactStats::default()) } else { self.finish_purge(&purge, cut) };
+        self.pending_edits.fetch_sub(before, AtomicOrdering::AcqRel);
+        stats
+    }
+
+    /// Documentos substituídos ou removidos desde a última compactação (ou
+    /// desde o `open`): até a compactação, as listas deles têm pedaços que
+    /// toda leitura une de novo. Ver [`Maintenance`].
+    pub fn pending_edits(&self) -> u64 {
+        self.pending_edits.load(AtomicOrdering::Acquire)
     }
 
     /// Rótulo gravado com [`IndexBatch::add_labeled`] ou [`IndexBatch::set_label`].
@@ -281,11 +372,32 @@ impl Engine {
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     }
 
+    /// Percorre os rótulos de todos os documentos (`f(documento, rótulo)`),
+    /// em ordem de chave. Lê só as chaves `doc:`: serve para achar um
+    /// documento pelo rótulo (o `index --sync` da CLI acha assim os arquivos
+    /// já indexados).
+    pub fn for_each_label(&self, mut f: impl FnMut(DocId, &str)) -> Result<()> {
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_upper_bound(b"doc;".to_vec()); // ';' vem logo depois de ':'
+        let mode = rocksdb::IteratorMode::From(DOC, rocksdb::Direction::Forward);
+        for item in self.db.iterator_opt(mode, opts) {
+            let (key, value) = item?;
+            let doc = key
+                .strip_prefix(DOC)
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .and_then(|d| d.parse().ok())
+                .ok_or_else(|| Error::Corrupt(format!("chave de rótulo inválida: {}", String::from_utf8_lossy(&key))))?;
+            f(doc, &String::from_utf8_lossy(&value));
+        }
+        Ok(())
+    }
+
     /// Tamanho do documento (tokens indexados, sem stopwords), se ele existe.
     pub fn doc_len(&self, doc_id: DocId) -> Result<Option<u32>> {
         let view = self.view();
-        let block = view.norm_block(doc_id / NORM_BLOCK_DOCS)?;
-        Ok(block.and_then(|b| b.get((doc_id % NORM_BLOCK_DOCS) as u16)))
+        let id = view.version_of(doc_id)?;
+        let block = view.norm_block(id / NORM_BLOCK_DOCS)?;
+        Ok(block.and_then(|b| b.get((id % NORM_BLOCK_DOCS) as u16)))
     }
 
     /// Total de documentos e soma dos tamanhos.
@@ -301,10 +413,36 @@ impl Engine {
     /// Uma busca faz várias leituras (um `Get` por caractere, mais as listas).
     /// O snapshot garante que todas vejam o mesmo momento do índice, mesmo que
     /// um commit aconteça no meio.
+    ///
+    /// O relógio é lido antes do snapshot (ver `EpochCache`) e depois. Se não
+    /// mudou e nenhum commit estava sendo gravado, o snapshot é exatamente o
+    /// daquele commit: é o que diz quais mortos a busca filtra (ver
+    /// `versions`). Senão, a busca lê `meta:epoch` do snapshot quando precisar.
     fn view(&self) -> View<'_> {
-        // Antes do snapshot: ver `EpochCache`.
-        let epoch = self.epoch.load(AtomicOrdering::Acquire);
-        View { snap: self.db.snapshot(), epoch, engine: self }
+        let before = self.clock.load(AtomicOrdering::SeqCst);
+        let snap = self.db.snapshot();
+        let after = self.clock.load(AtomicOrdering::SeqCst);
+        // Depois do snapshot: um commit que mata publica os mortos antes de gravar.
+        let deaths = self.deaths.current();
+        let exact = (before == after && before & 1 == 0).then_some(before >> 1);
+        View::new(snap, before >> 1, exact, deaths, self)
+    }
+
+    /// Número do último commit gravado.
+    fn epoch(&self) -> u64 {
+        self.clock.load(AtomicOrdering::Acquire) >> 1
+    }
+
+    /// Grava `wb` como o commit `next` (o seguinte ao último). Quem chama já
+    /// marcou nos caches o que muda (ver `EpochCache`) e publicou os mortos.
+    /// Só o escritor chama (com a trava dele), um commit por vez.
+    fn write_commit(&self, mut wb: WriteBatch, next: u64) -> Result<()> {
+        wb.put(META_EPOCH, varint(next));
+        self.clock.store(((next - 1) << 1) | 1, AtomicOrdering::SeqCst);
+        let written = self.db.write(wb);
+        let done = if written.is_ok() { next } else { next - 1 };
+        self.clock.store(done << 1, AtomicOrdering::SeqCst);
+        Ok(written?)
     }
 
     /// Stopwords deste banco (os idiomas gravados nele).

@@ -1,6 +1,7 @@
 mod jsonl;
 mod tui;
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,6 +36,11 @@ enum Command {
         /// Arquivos ou pastas
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Sincroniza com o que já está no banco: um arquivo já indexado é
+        /// substituído (mesmo ID) e um que sumiu das pastas é removido. Sem a
+        /// opção, cada arquivo vira um documento novo
+        #[arg(long)]
+        sync: bool,
         #[command(flatten)]
         languages: LanguageArgs,
         #[command(flatten)]
@@ -42,7 +48,8 @@ enum Command {
         #[command(flatten)]
         stemming: StemmingArgs,
     },
-    /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
+    /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia).
+    /// Um ID que já existe é substituído; {"op": "delete", "id"} remove
     IndexJsonl {
         /// Pasta do banco (criada se não existir)
         db: PathBuf,
@@ -64,7 +71,15 @@ enum Command {
         #[command(flatten)]
         stemming: StemmingArgs,
     },
-    /// Compacta o banco: une os pedaços pendentes das listas de documentos
+    /// Remove documentos pelo ID
+    Delete {
+        db: PathBuf,
+        #[arg(required = true)]
+        ids: Vec<u64>,
+    },
+    /// Compacta o banco: une os pedaços pendentes das listas de documentos,
+    /// tira delas as versões de documentos substituídos ou removidos, e tira
+    /// da Trie as palavras que ficaram sem documento
     Compact {
         db: PathBuf,
     },
@@ -159,8 +174,8 @@ fn main() -> ExitCode {
         Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
             tui::run(&engine, &db.display().to_string()).map_err(Into::into)
         }),
-        Command::Index { db, paths, languages, positions, stemming } => {
-            index(&db, &paths, languages.languages, positions.config(), stemming)
+        Command::Index { db, paths, sync, languages, positions, stemming } => {
+            index(&db, &paths, sync, languages.languages, positions.config(), stemming)
         }
         Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming } => {
             let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
@@ -173,10 +188,18 @@ fn main() -> ExitCode {
                 jsonl::index(&engine, &file, &opts)
             })
         }
-        Command::Compact { db } => open(&db, None, None, None).map(|engine| {
+        Command::Delete { db, ids } => delete(&db, &ids),
+        Command::Compact { db } => open(&db, None, None, None).and_then(|engine| {
             let started = Instant::now();
-            engine.compact();
+            let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
+            if stats.purged > 0 {
+                println!("{} versão(ões) de documentos substituídos ou removidos saíram das listas", stats.purged);
+            }
+            if stats.emptied_words > 0 {
+                println!("{} palavra(s) sem documento saíram do índice", stats.emptied_words);
+            }
+            Ok(())
         }),
         Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
         Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
@@ -203,14 +226,47 @@ fn open(
     Ok(Engine::open(db, config)?)
 }
 
+fn delete(db: &Path, ids: &[u64]) -> AnyResult {
+    let engine = open(db, None, None, None)?;
+    let mut batch = engine.batch();
+    for &id in ids {
+        batch.delete_document(id)?;
+    }
+    let stats = batch.commit_with_stats()?;
+    println!("{} documento(s) removido(s), {} não existia(m)", stats.deleted, ids.len() - stats.deleted);
+    Ok(())
+}
+
+/// Com `--sync`: os documentos já indexados cujo rótulo é um caminho dentro de
+/// `paths` (o caminho como a CLI o grava), por rótulo.
+fn indexed_files(engine: &Engine, paths: &[PathBuf]) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let roots: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let separator = std::path::MAIN_SEPARATOR;
+    let under = |label: &str| {
+        roots.iter().any(|r| {
+            let inside = |rest: &str| rest.starts_with(separator) || r.ends_with(separator);
+            label == r || label.strip_prefix(r.as_str()).is_some_and(inside)
+        })
+    };
+    let mut found = HashMap::new();
+    engine.for_each_label(|doc, label| {
+        if under(label) {
+            found.insert(label.to_string(), doc);
+        }
+    })?;
+    Ok(found)
+}
+
 fn index(
     db: &Path,
     paths: &[PathBuf],
+    sync: bool,
     languages: Option<LanguageList>,
     positions: Option<bool>,
     stemming: StemmingArgs,
 ) -> AnyResult {
     let engine = open(db, languages, positions, Some(stemming))?;
+    let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
     let started = Instant::now();
@@ -220,7 +276,7 @@ fn index(
     }
 
     let progress = std::io::stderr().is_terminal();
-    let (mut indexed, mut skipped) = (0usize, 0usize);
+    let (mut indexed, mut skipped, mut replaced) = (0usize, 0usize, 0usize);
     let mut batch = engine.batch();
     for (i, path) in files.iter().enumerate() {
         if progress && (i % 64 == 0 || i + 1 == files.len()) {
@@ -246,18 +302,33 @@ fn index(
         }
         // O nome do arquivo (sem extensão) é o título: pesa mais no ranking.
         let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        batch.add_labeled_titled(&path.display().to_string(), &title, &content)?;
+        let label = path.display().to_string();
+        match known.remove(&label) {
+            Some(id) => {
+                batch.add_titled(id, &title, &content)?;
+                replaced += 1;
+            }
+            None => drop(batch.add_labeled_titled(&label, &title, &content)?),
+        }
         indexed += 1;
         if batch.len() >= DOCS_PER_COMMIT {
             batch.commit()?;
             batch = engine.batch();
         }
     }
+    // Com --sync, o que sobrou em `known` sumiu das pastas.
+    let removed = known.len();
+    for (_, id) in known {
+        batch.delete_document(id)?;
+    }
     batch.commit()?;
     if progress {
         eprint!("\r\x1b[2K");
     }
     println!("{indexed} documento(s) indexado(s), {skipped} ignorado(s), em {:.2?}", started.elapsed());
+    if sync {
+        println!("{replaced} substituído(s), {} novo(s), {removed} removido(s)", indexed - replaced);
+    }
     Ok(())
 }
 

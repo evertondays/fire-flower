@@ -38,6 +38,15 @@ pub use engine::{
     MaintenanceOptions,
 };
 pub use error::{Error, Result};
+
+/// O snapshot das métricas ([`Engine::metrics_snapshot`] e o arquivo que a
+/// amostradora grava): o formato que o `fire-flower monitor` lê.
+pub mod metrics {
+    pub use crate::engine::metrics::snapshot::{
+        COMMIT_BOUNDS, COMMIT_PHASES, CacheCounters, FILE_NAME, LAYOUT, OpCounters, QUERY_BOUNDS, RocksdbProps,
+        Snapshot, Writer, default_path, read,
+    };
+}
 pub use analysis::stem::{Stemmer, Stemming};
 pub use analysis::stopwords::{Language, Stopwords};
 
@@ -51,6 +60,7 @@ pub mod internals {
         encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
     };
     pub use crate::engine::{intersect, reads_on_this_thread};
+    pub use crate::engine::metrics::{Metrics, Op};
 }
 
 pub type DocId = u64;

@@ -94,6 +94,12 @@ pub struct Config {
     /// `open` de um caminho errado dá erro em vez de criar um banco vazio.
     /// [`Engine::open_read_only`](crate::Engine::open_read_only) nunca cria.
     pub create_if_missing: bool,
+    /// Conta consultas, commits, edições, remoções e compactações (ver
+    /// `docs/plano-monitoramento.md`). No caminho quente custa só somas
+    /// atômicas num contador da própria thread e duas leituras de relógio
+    /// por consulta. Desligado por padrão; sem a feature `metrics`, ligar dá
+    /// erro no `open`.
+    pub metrics: bool,
 }
 
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
@@ -163,6 +169,7 @@ impl Default for Config {
             title_weight: 50.0,
             title_b: 0.9,
             create_if_missing: true,
+            metrics: false,
         }
     }
 }

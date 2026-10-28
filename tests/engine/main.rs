@@ -7,6 +7,8 @@ mod concurrency;
 mod edit_model;
 mod editing;
 mod indexing;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod phrases;
 mod read_only;
 mod ranking;

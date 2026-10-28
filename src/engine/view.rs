@@ -12,6 +12,7 @@ use crate::codec::{DeadBits, DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
 use crate::engine::keys::{
     Key, META_DOC_COUNT, META_EPOCH, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POS, POST, ROOT_ID, VER,
 };
+use crate::engine::metrics::CacheTally;
 use crate::engine::versions;
 use crate::engine::versions::DeadSet;
 
@@ -34,6 +35,8 @@ pub(super) struct View<'a> {
     /// Os mortos que este snapshot vê, se forem só parte de `deaths`.
     visible: OnceCell<Option<DeadBits>>,
     pub(super) engine: &'a Engine,
+    /// Acertos e faltas nos caches de época, somados às métricas no fim.
+    tally: CacheTally,
 }
 
 impl<'a> View<'a> {
@@ -44,7 +47,15 @@ impl<'a> View<'a> {
         deaths: Option<Arc<DeadSet>>,
         engine: &'a Engine,
     ) -> Self {
-        Self { snap, epoch, exact, deaths, visible: OnceCell::new(), engine }
+        Self { snap, epoch, exact, deaths, visible: OnceCell::new(), engine, tally: CacheTally::default() }
+    }
+}
+
+impl Drop for View<'_> {
+    fn drop(&mut self) {
+        if let Some(m) = self.engine.metrics() {
+            m.record_cache(&self.tally);
+        }
     }
 }
 
@@ -165,7 +176,11 @@ impl View<'_> {
     fn node(&self, id: u64, depth: usize) -> Result<Option<Arc<TrieNode>>> {
         let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
         if cached && let Some(node) = self.engine.nodes.get(id, self.epoch) {
+            CacheTally::add(&self.tally.node_hits);
             return Ok(Some(node));
+        }
+        if cached {
+            CacheTally::add(&self.tally.node_misses);
         }
         let Some(node) = load_node(&self.snap, id)? else { return Ok(None) };
         let node = Arc::new(node);
@@ -212,8 +227,10 @@ impl View<'_> {
 
     pub(super) fn norm_block(&self, block: u64) -> Result<Option<Arc<NormBlock>>> {
         if let Some(cached) = self.engine.norms.get(block, self.epoch) {
+            CacheTally::add(&self.tally.norm_hits);
             return Ok(Some(cached));
         }
+        CacheTally::add(&self.tally.norm_misses);
         let Some(bytes) = self.snap.get_bytes(Key::new(NORM, block).as_ref())? else { return Ok(None) };
         let decoded = Arc::new(NormBlock::decode(&bytes)?);
         self.engine.norms.offer(block, self.epoch, &decoded);

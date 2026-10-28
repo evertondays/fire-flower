@@ -14,9 +14,10 @@
 //! Em `post:`, `pos:` e `norm:` o documento é o ID interno da versão (ver
 //! `versions`); a API recebe e devolve o ID do usuário.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch};
 use rustc_hash::FxHashMap;
@@ -31,6 +32,7 @@ use crate::engine::keys::{
     DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_EPOCH, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE,
     META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
 };
+use crate::engine::metrics::{Metrics, Op};
 use crate::engine::meta::{
     previous_merge_operator, read_counter, resolve_format, resolve_languages, resolve_stemming, stored_format_error,
     varint,
@@ -50,6 +52,7 @@ mod maintenance;
 mod groups;
 mod keys;
 mod meta;
+pub(crate) mod metrics;
 mod phrase;
 mod prefix;
 mod purge;
@@ -106,6 +109,11 @@ pub struct Engine {
     opts: Options,
     /// Aberto com [`Engine::open_read_only`]: lotes e compactação dão erro.
     read_only: bool,
+    /// Com `Config::metrics`.
+    metrics: Option<Arc<Metrics>>,
+    /// A pasta do banco e quando ele foi aberto (Unix, s), para as métricas.
+    path: PathBuf,
+    opened_unix: f64,
 }
 
 impl Engine {
@@ -219,6 +227,17 @@ impl Engine {
         }
         let deaths = Deaths::default();
         let loaded = versions::load(&db, &deaths)?;
+        let metrics = if config.metrics {
+            if !cfg!(feature = "metrics") {
+                return Err(Error::Config("Config::metrics pede a feature `metrics`, desligada nesta compilação".into()));
+            }
+            let m = Metrics::new();
+            m.set_documents(stats.doc_count);
+            m.set_edit_backlog(loaded.dead.len() as u64, 0);
+            Some(Arc::new(m))
+        } else {
+            None
+        };
         // Os números de commit continuam os do último `open`: `meta:epoch`
         // gravado por um commit tem que bater com o relógio (ver `view`).
         let epoch = read_counter(&db, META_EPOCH)?.unwrap_or(0);
@@ -249,7 +268,36 @@ impl Engine {
             pending_edits: AtomicU64::new(0),
             opts,
             read_only,
+            metrics,
+            path: path.to_path_buf(),
+            opened_unix: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()),
         })
+    }
+
+    /// Os contadores das métricas agora, se `Config::metrics` estiver
+    /// ligado (sem as propriedades do RocksDB, que a amostradora lê). Para
+    /// expor as métricas no próprio processo; o `fire-flower monitor` lê o
+    /// arquivo que a amostradora grava.
+    pub fn metrics_snapshot(&self) -> Option<metrics::snapshot::Snapshot> {
+        Some(self.metrics()?.snapshot(&self.path.display().to_string(), self.opened_unix))
+    }
+
+    /// As métricas, se ligadas. Sem a feature `metrics` é sempre `None`, e o
+    /// compilador tira os ganchos.
+    #[inline(always)]
+    fn metrics(&self) -> Option<&Metrics> {
+        if cfg!(feature = "metrics") { self.metrics.as_deref() } else { None }
+    }
+
+    /// Roda uma consulta da API e a conta em `op`.
+    #[inline]
+    fn measured<T>(&self, op: Op, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(m) = self.metrics() else { return f() };
+        let started = Instant::now();
+        let reads = reads_on_this_thread();
+        let result = f();
+        m.record_query(op, started.elapsed(), reads_on_this_thread() - reads, result.is_err());
+        result
     }
 
     /// Aberto com [`Engine::open_read_only`].
@@ -270,7 +318,11 @@ impl Engine {
     pub fn batch(&self) -> IndexBatch<'_> {
         // Os contadores só mudam após um commit bem-sucedido, então o estado
         // continua válido mesmo se outra thread entrou em pânico com o lock.
+        let waiting = self.metrics().map(|_| Instant::now());
         let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(m), Some(t)) = (self.metrics(), waiting) {
+            m.record_lock_wait(t.elapsed());
+        }
         let cache = std::mem::take(&mut state.cache);
         let analyzer = std::mem::take(&mut state.analyzer);
         IndexBatch {
@@ -315,40 +367,44 @@ impl Engine {
     /// `"uma frase"` exige os termos em sequência.
     /// Retorna os IDs dos documentos em ordem crescente.
     pub fn search(&self, query: &str) -> Result<Vec<DocId>> {
-        self.view().search(query)
+        self.measured(Op::Search, || self.view().search(query))
     }
 
     /// Os `k` documentos mais relevantes para a consulta (BM25), da maior
     /// nota para a menor; no empate, o menor ID primeiro. A consulta tem a
     /// mesma sintaxe e os mesmos resultados de [`Engine::search`].
     pub fn search_top(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
-        Ok(self.search_ranked(query, k)?.hits)
+        self.measured(Op::SearchTop, || Ok(self.view().search_ranked(query, k)?.hits))
     }
 
     /// Como [`Engine::search_top`], mais o total de documentos que casaram.
     pub fn search_ranked(&self, query: &str, k: usize) -> Result<TopHits> {
-        self.view().search_ranked(query, k)
+        self.measured(Op::SearchRanked, || self.view().search_ranked(query, k))
     }
 
     /// Documentos que contêm exatamente `term` (normalizado aqui e, com
     /// stemming, reduzido ao radical, como numa busca).
     pub fn postings(&self, term: &str) -> Result<Vec<DocId>> {
         let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
-        let view = self.view();
-        match view.term_node(&term)? {
-            Some(node) => view.user_docs(node),
-            None => Ok(Vec::new()),
-        }
+        self.measured(Op::Postings, || {
+            let view = self.view();
+            match view.term_node(&term)? {
+                Some(node) => view.user_docs(node),
+                None => Ok(Vec::new()),
+            }
+        })
     }
 
     /// Como [`Engine::postings`], com a frequência do termo em cada documento.
     pub fn term_postings(&self, term: &str) -> Result<Vec<Posting>> {
         let Some(term) = self.index_term(term) else { return Ok(Vec::new()) };
-        let view = self.view();
-        match view.term_node(&term)? {
-            Some(node) => view.user_postings(node),
-            None => Ok(Vec::new()),
-        }
+        self.measured(Op::TermPostings, || {
+            let view = self.view();
+            match view.term_node(&term)? {
+                Some(node) => view.user_postings(node),
+                None => Ok(Vec::new()),
+            }
+        })
     }
 
     /// O termo do índice para uma palavra: normalizada e, com stemming,
@@ -369,8 +425,10 @@ impl Engine {
     /// stemming, as palavras indexadas são radicais.
     pub fn suggest(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
         let Some(prefix) = normalize_term(prefix) else { return Ok(Vec::new()) };
-        let words = self.view().words_with_prefix(&prefix, limit)?;
-        Ok(words.into_iter().map(|(word, _)| word).collect())
+        self.measured(Op::Suggest, || {
+            let words = self.view().words_with_prefix(&prefix, limit)?;
+            Ok(words.into_iter().map(|(word, _)| word).collect())
+        })
     }
 
     /// Compacta o banco inteiro: une os pedaços pendentes das listas, tira
@@ -382,6 +440,7 @@ impl Engine {
     pub fn compact(&self) -> Result<CompactStats> {
         self.require_writable()?;
         let _one = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
         // As edições que chegarem durante a compactação podem ficar fora dela.
         let before = self.pending_edits.load(AtomicOrdering::Acquire);
         let (purge, cut) = self.purgeable()?;
@@ -397,7 +456,12 @@ impl Engine {
         }
         self.db.compact_range_opt::<&[u8], &[u8]>(None, None, &opts);
         let stats = if purge.is_empty() { Ok(CompactStats::default()) } else { self.finish_purge(&purge, cut) };
-        self.pending_edits.fetch_sub(before, AtomicOrdering::AcqRel);
+        let pending = self.pending_edits.fetch_sub(before, AtomicOrdering::AcqRel) - before;
+        if let Some(m) = self.metrics() {
+            let done = stats.as_ref().map_or(CompactStats::default(), |s| *s);
+            m.record_compaction(started.elapsed(), done.purged, done.emptied_words);
+            m.set_edit_backlog(self.dead_versions() as u64, pending);
+        }
         stats
     }
 

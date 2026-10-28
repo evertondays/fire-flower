@@ -646,10 +646,22 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "criterion",
- "ratatui",
  "rocksdb",
  "rust-stemmers",
  "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "fire-flower-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fire-flower",
+ "ratatui",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,16 +1,34 @@
-[package]
-name = "fire-flower"
+# O core (esta pasta) e a CLI (crates/fire-flower-cli) num workspace: os
+# bindings (bindings/) dependem só do core, sem clap nem ratatui.
+[workspace]
+members = [".", "crates/fire-flower-cli"]
+# `cargo build` na raiz compila o core e a CLI (o `perf.py` usa
+# `--bin fire-flower --example wiki`).
+default-members = [".", "crates/fire-flower-cli"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[workspace.dependencies]
+fire-flower = { path = ".", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[package]
+name = "fire-flower"
+version.workspace = true
+edition.workspace = true
 description = "Motor de busca full-text embutido: Trie persistida no RocksDB"
 
 [dependencies]
 rocksdb = { version = "0.23", default-features = false, features = ["lz4", "bindgen-runtime"] }
 unicode-normalization = "0.1"
-clap = { version = "4.6", features = ["derive"] }
-ratatui = "0.30"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# O snapshot das métricas (`metrics::Snapshot`) é JSON.
+serde.workspace = true
+serde_json.workspace = true
 rustc-hash = "2.1"
 rust-stemmers = "1.2"
 
@@ -21,7 +39,9 @@ default = ["metrics"]
 metrics = []
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
+# O harness (examples/wiki).
+clap = { version = "4.6", features = ["derive"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

@@ -1,9 +1,45 @@
 # Plano — Edição e remoção de documentos
 
-Status: **proposta (27/10/2026).** Substitui a Parte 2 de
+Status: **implementado (27–28/10/2026, branch `document-editing`).** Substitui a Parte 2 de
 [design-escrita-leitura.md](design-escrita-leitura.md), escrita para o formato
 v2 (merge com tags BASE/DELTA), que já não bate com o formato v5 (listas em
 blocos com tabela de saltos, merge por documento).
+
+**O que mudou em relação à proposta abaixo:**
+
+| Item | Situação |
+|---|---|
+| Fase 0: harness | ✅ `wiki edit`, `wiki oracle --edits`, `wiki load --edits`, `wiki concurrent --edits`, `perf.py edits`. Sem linha de base com `codegen-units = 1`: o A/B seguiu as diretrizes (rodadas completas da `main` e da branch, uma depois da outra) |
+| Fase 1: merge v6 | ✅ Lápides com uma marca no cabeçalho (`s << 1 \| tem lápide`), para o merge saber sem percorrer a lista se pode concatenar. A base do remendo é o maior trecho inicial de pedaços crescentes (a carga grava a lista em vários), não só o primeiro pedaço |
+| Fase 2: `fwd:`, substituir, remover | ✅ `fwd:` na família padrão (sem família própria: custa ~5% na carga). Opcional com `--no-edits` |
+| Fase 3: palavras vazias | ✅ O conjunto de suspeitos respeita os snapshots (o número do commit da limpeza) |
+| Fase 4: leitura depois de muitas edições | ✅ de outro jeito: a meta "≤ +25% antes de compactar" não é alcançável com merge na leitura (ver abaixo). `max_successive_merges` e flush mediram igual; a solução é a `Maintenance`, que compacta em segundo plano |
+| Fase 5: `AsyncWriter` | não feito: o commit de um documento custa ~1 ms, e a escrita não é o que degrada as buscas. O assíncrono que faltava era a compactação (Fase 4) |
+| Fase 6: CLI | ✅ `delete`, `index --sync` (pelo rótulo, com `Engine::for_each_label`, sem chave nova `lbl:`), `op: delete` no `index-jsonl`, `--no-edits`, `compact` limpa as palavras |
+
+**Por que a meta da Fase 4 não fecha.** Antes da compactação, a lista de um
+termo frequente é a base mais os pedaços das edições. Com edições
+espalhadas, quase todo bloco de 128 documentos recebe alguma (uma lista de 25
+mil documentos tem ~200 blocos), e o remendo vira percorrer e regravar a lista
+inteira a cada leitura, ~15 ns por entrada contra ~2 ns da cópia. Só a
+compactação devolve a lista consolidada; a `Maintenance` limita a janela.
+
+**Resultado** (análise completa em
+[ANALISE-edicao.md](https://github.com/evertondays/fire-flower-bench/blob/main/ANALISE-edicao.md)):
+
+| Meta (seção 5) | Resultado |
+|---|---|
+| Oráculo com e sem edições: 0 divergências | ✅ 0 (10k, 100k, reaberto, `pr`, 10k depois do plano); digest do banco editado igual ao da carga direta |
+| Busca sem edições igual à `main` | ✅ 31 conjuntos na Wikipédia inteira: mediana −0,1%, pior +4,5% |
+| Carga com `fwd:` ≤ +10% | ✅ mediana +6% (de +6% a +11%; 120 → 127 s) |
+| Banco compactado ≤ +35% | ✅ +20% (`fwd:`: 311 MB de 1,8 GB) |
+| Carga com `--no-edits` igual à `main` | ✅ fatia de 100k: +4% (dentro do ruído de alinhamento) |
+| Depois de editar, antes de compactar: ≤ +25% | ❌ 1.000 edições de um documento: `t-freq` ~7×, autocompletar ~17×; ver acima e a `Maintenance` |
+| Depois de editar e compactar: igual | ✅ ±1–5% (o autocompletar visita os nós das palavras removidas: +1 µs) |
+| Remover 1 documento (commit próprio) | 0,8 ms (p50), 7 ms (p99) na fatia de 100k |
+| p99 do `mixed` com um editor em paralelo ≤ 5 ms | ✅ 2,3 ms (plano inteiro, lote de 1.000); 1,3 ms (edições de 1 documento) |
+
+O resto deste documento é a proposta original.
 
 Medição: as mesmas regras e ferramentas do
 [plano-performance.md](plano-performance.md) (`perf.py`, oráculo, linhas de
@@ -337,10 +373,10 @@ commit por edição, sem piorar o p99 dos leitores no `concurrent`.
 
 ## 7. Checklist
 
-- [ ] Fase 0: harness de edição, linha de base com `codegen-units = 1`
-- [ ] Fase 1: merge v6 com lápides e remendo
-- [ ] Fase 2: `fwd:`, substituição, `delete_document`, formato v6
-- [ ] Fase 3: palavras vazias fora do autocompletar e do prefixo
-- [ ] Fase 4: leitura depois de muitas edições
-- [ ] Fase 5: `AsyncWriter` (se a Fase 2 pedir)
-- [ ] Fase 6: CLI e docs
+- [x] Fase 0: harness de edição (o A/B seguiu as diretrizes, sem `codegen-units = 1`)
+- [x] Fase 1: merge v6 com lápides e remendo
+- [x] Fase 2: `fwd:`, substituição, `delete_document`, formato v6
+- [x] Fase 3: palavras vazias fora do autocompletar e do prefixo
+- [x] Fase 4: leitura depois de muitas edições (`Maintenance`; a meta antes de compactar não fecha)
+- [ ] Fase 5: `AsyncWriter` (não precisou: o commit de um documento custa ~1 ms)
+- [x] Fase 6: CLI e docs

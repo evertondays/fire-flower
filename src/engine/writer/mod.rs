@@ -399,6 +399,7 @@ impl IndexBatch<'_> {
         engine.db.write(wb)?;
         stats.write_secs = t.elapsed().as_secs_f64();
         engine.epoch.store(next, AtomicOrdering::Release);
+        engine.pending_edits.fetch_add((stats.replaced + stats.deleted) as u64, AtomicOrdering::AcqRel);
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
         for id in std::mem::take(&mut self.dirty) {

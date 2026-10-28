@@ -33,7 +33,9 @@ mod engine;
 mod error;
 pub mod query;
 
-pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode};
+pub use engine::{
+    CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, Maintenance, MaintenanceOptions,
+};
 pub use error::{Error, Result};
 pub use analysis::stem::{Stemmer, Stemming};
 pub use analysis::stopwords::{Language, Stopwords};

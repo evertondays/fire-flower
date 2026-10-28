@@ -251,3 +251,43 @@ pub(crate) fn words_without_documents_leave_suggestions() {
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(engine.suggest("pal", 10).unwrap(), ["palco", "palha", "palma"]);
 }
+
+/// A manutenção compacta sozinha quando as edições passam do limite e limpa
+/// as palavras que ficaram sem documento.
+#[test]
+pub(crate) fn maintenance_compacts_after_enough_edits() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fire_flower::{Maintenance, MaintenanceOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir));
+    let mut batch = engine.batch();
+    for id in 0..20 {
+        batch.add_document(id, &format!("comum unico{id}")).unwrap();
+    }
+    batch.commit().unwrap();
+    let options = MaintenanceOptions { edits_before_compact: Some(5), poll: Duration::from_millis(5) };
+    let maintenance = Maintenance::spawn(Arc::clone(&engine), options);
+    for id in 0..4 {
+        engine.delete_document(id).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(engine.pending_edits(), 4, "abaixo do limite, nada acontece");
+    assert!(engine.term_node("unico0").unwrap().is_some());
+    engine.delete_document(4).unwrap();
+    let started = Instant::now();
+    while engine.pending_edits() > 0 {
+        assert!(started.elapsed() < Duration::from_secs(10), "a manutenção não compactou");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A limpeza vem logo depois da compactação, na mesma rodada.
+    while engine.term_node("unico4").unwrap().is_some() {
+        assert!(started.elapsed() < Duration::from_secs(10), "a manutenção não limpou as palavras");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    maintenance.stop().unwrap();
+    assert_eq!(engine.search("comum").unwrap(), (5..20).collect::<Vec<_>>());
+    assert_eq!(engine.suggest("unico", 50).unwrap().len(), 15);
+}

@@ -41,6 +41,7 @@ mod config;
 mod conjunction;
 mod diagnostics;
 mod empty_words;
+mod maintenance;
 mod groups;
 mod keys;
 mod meta;
@@ -55,6 +56,7 @@ mod tests;
 
 
 pub use self::config::{Config, InflectionMode};
+pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
 pub use self::view::reads_on_this_thread;
@@ -82,6 +84,8 @@ pub struct Engine {
     nodes: EpochCache<TrieNode>,
     /// Palavras que podem ter ficado sem documento.
     maybe_empty: MaybeEmpty,
+    /// Documentos substituídos ou removidos desde a última compactação.
+    pending_edits: AtomicU64,
     /// Guardadas para ler as estatísticas depois do `open`.
     opts: Options,
 }
@@ -181,6 +185,7 @@ impl Engine {
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
             maybe_empty,
+            pending_edits: AtomicU64::new(0),
             opts,
         })
     }
@@ -296,7 +301,17 @@ impl Engine {
     /// Compacta o banco inteiro: une os pedaços pendentes das listas de
     /// postagem e descarta versões antigas. Num índice grande leva minutos.
     pub fn compact(&self) {
+        // As edições que chegarem durante a compactação podem ficar fora dela.
+        let before = self.pending_edits.load(AtomicOrdering::Acquire);
         self.db.compact_range::<&[u8], &[u8]>(None, None);
+        self.pending_edits.fetch_sub(before, AtomicOrdering::AcqRel);
+    }
+
+    /// Documentos substituídos ou removidos desde a última compactação (ou
+    /// desde o `open`): até a compactação, as listas deles têm pedaços que
+    /// toda leitura une de novo. Ver [`Maintenance`].
+    pub fn pending_edits(&self) -> u64 {
+        self.pending_edits.load(AtomicOrdering::Acquire)
     }
 
     /// Rótulo gravado com [`IndexBatch::add_labeled`] ou [`IndexBatch::set_label`].

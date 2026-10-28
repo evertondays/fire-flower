@@ -119,7 +119,14 @@ Busca interativa, com resultados enquanto você digita:
 | `↑` `↓` `PgUp` `PgDn` | escolhe o resultado |
 | `Enter` | abre o documento inteiro (`n`/`N` pulam entre ocorrências) |
 | `Ctrl+W` / `Ctrl+U` | apaga a última palavra / a consulta toda |
+| `Ctrl+R` | reabre o banco para ver o que foi gravado desde a abertura |
 | `Esc` | volta / sai |
+
+A TUI, `search` e `suggest` abrem o banco **só para leitura**: funcionam ao
+lado de um `index` ou de uma aplicação que está gravando no mesmo banco, sem
+travá-lo, com block cache de 32 MB. A visão é a do momento da abertura; a TUI
+reabre sozinha depois de 10 s, na próxima tecla. `delete` e `compact` não
+criam um banco vazio num caminho errado.
 
 Os resultados vêm por relevância (BM25), com a nota ao lado do título, e a
 lista mostra os 1.000 melhores; o cabeçalho mostra o total. A linha
@@ -203,6 +210,38 @@ simples no shell:
 ./target/release/fire-flower suggest /tmp/indice prog 10
 ```
 
+### Monitoramento
+
+O processo que grava o banco pode publicar métricas de custo desprezível
+(`Config::metrics`, ou `--metrics` no `index`, `index-jsonl` e `compact`):
+uma thread grava a cada segundo um snapshot na pasta do banco
+(`fire-flower.metrics.json`). O `monitor` lê esse arquivo, o `/proc` do
+processo e a pasta, sem abrir o banco nem falar com o motor:
+
+```bash
+./target/release/fire-flower index-jsonl --metrics /tmp/wiki ptwiki.jsonl
+```
+
+```bash
+./target/release/fire-flower monitor /tmp/wiki
+```
+
+O painel mostra consultas por segundo, p50 e p99 por tipo de consulta,
+documentos indexados, substituídos e removidos por segundo, versões mortas
+esperando a compactação, RocksDB, memória e disco, com alertas (escrita
+parada, compactação atrasada, disco cheio, muitas versões mortas). Para o
+Prometheus, `--serve` expõe `/metrics` em OpenMetrics; `--json` imprime uma
+leitura e sai:
+
+```bash
+./target/release/fire-flower monitor /tmp/wiki --serve 127.0.0.1:9187
+```
+
+Dashboard do Grafana e regras de alerta em
+[`contrib/monitoring/`](contrib/monitoring/); a lista das métricas, o que
+ficou de fora e por quê estão em
+[docs/plano-monitoramento.md](docs/plano-monitoramento.md).
+
 ### Biblioteca
 
 ```rust
@@ -261,6 +300,20 @@ maintenance.stop()?; // ou só descarte
 Sem ela, chame `Engine::compact` (ou `fire-flower compact`) depois de editar
 muito. A compactação não bloqueia buscas nem lotes, e só tira uma versão morta
 quando nenhuma busca em andamento ainda a vê viva.
+
+Outro processo pode ler o mesmo banco enquanto este grava, sem travá-lo:
+
+```rust
+// Vê o banco como estava na abertura; abra de novo para ver o que veio depois.
+let reader = Engine::open_read_only("/tmp/indice", Config::reader())?;
+```
+
+Métricas (ver [Monitoramento](#monitoramento)): com `Config::metrics`, o
+motor conta consultas, commits, edições, remoções e compactações (somas
+atômicas num contador da própria thread: ~7 ns por consulta) e grava o
+snapshot que o `fire-flower monitor` lê. `Engine::metrics_snapshot` devolve
+os mesmos números no próprio processo. Compilar sem a feature `metrics`
+(`--no-default-features`) tira os ganchos por completo.
 
 ## Arquitetura
 

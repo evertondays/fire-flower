@@ -11,7 +11,6 @@ use fire_flower::analysis::normalize_term;
 use fire_flower::query::{Clause, QueryTerm};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::Color;
 use ratatui::text::Line;
 
 use self::preview::load_preview;
@@ -21,9 +20,6 @@ mod preview;
 #[cfg(test)]
 mod tests;
 
-const ACCENT: Color = Color::Rgb(255, 122, 48);
-const ACCENT_SOFT: Color = Color::Rgb(120, 60, 30);
-const MUTED: Color = Color::DarkGray;
 const MAX_SUGGESTIONS: usize = 8;
 /// A prévia só lê o começo de arquivos grandes.
 const MAX_PREVIEW_BYTES: usize = 2 << 20;
@@ -31,10 +27,21 @@ const MAX_PREVIEW_BYTES: usize = 2 << 20;
 const MAX_LINE_CHARS: usize = 400;
 /// Quantos resultados ranqueados a lista mostra (o total aparece no cabeçalho).
 const MAX_RESULTS: usize = 1000;
+/// A TUI abre o banco só para leitura e vê o momento da abertura: depois
+/// disso, a próxima busca reabre (~30 ms no 100k) para ver o que foi gravado.
+const REOPEN_AFTER: Duration = Duration::from_secs(10);
+/// Prefixo de 1 ou 2 letras é a busca mais cara (`p-1`, `p-2`): espera um
+/// pouco por mais teclas antes de buscar.
+const SHORT_PREFIX_WAIT: Duration = Duration::from_millis(120);
 
-pub fn run(engine: &Engine, db_path: &str) -> io::Result<()> {
+/// Abre o banco de novo (só para leitura).
+pub type Reopen = Box<dyn Fn() -> fire_flower::Result<Engine>>;
+
+pub fn run(engine: Engine, db_path: &str, reopen: Reopen) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, App::new(engine, db_path));
+    let mut app = App::new(engine, db_path);
+    app.reopen = Some(reopen);
+    let result = event_loop(&mut terminal, app);
     ratatui::restore();
     result
 }
@@ -49,6 +56,9 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
         while event::poll(Duration::ZERO)? {
             changed |= app.on_event(event::read()?);
         }
+        while changed && app.short_prefix() && !app.quit && event::poll(SHORT_PREFIX_WAIT)? {
+            app.on_event(event::read()?);
+        }
         if changed {
             app.refresh();
         }
@@ -56,8 +66,11 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
     Ok(())
 }
 
-struct App<'a> {
-    engine: &'a Engine,
+struct App {
+    engine: Engine,
+    /// Quando `engine` foi aberto, e como abri-lo de novo (`None` nos testes).
+    opened: Instant,
+    reopen: Option<Reopen>,
     db_path: String,
     query: String,
     /// O que de fato foi buscado (a última palavra vira prefixo enquanto se digita).
@@ -97,10 +110,12 @@ enum PreviewContent {
     File { lines: Vec<Line<'static>>, matches: Vec<usize> },
 }
 
-impl<'a> App<'a> {
-    fn new(engine: &'a Engine, db_path: &str) -> Self {
+impl App {
+    fn new(engine: Engine, db_path: &str) -> Self {
         Self {
             engine,
+            opened: Instant::now(),
+            reopen: None,
             db_path: db_path.to_string(),
             query: String::new(),
             effective: String::new(),
@@ -124,8 +139,33 @@ impl<'a> App<'a> {
 
     // ---------------------------------------------------------------- estado
 
+    /// Abre o banco de novo para ver o que foi gravado desde a abertura.
+    fn reopen(&mut self) {
+        let Some(reopen) = &self.reopen else { return };
+        match reopen() {
+            Ok(engine) => {
+                self.engine = engine;
+                self.opened = Instant::now();
+                self.labels.clear();
+                self.preview = None;
+            }
+            Err(e) => self.error = Some(format!("ao reabrir: {e}")),
+        }
+    }
+
+    /// A palavra sendo digitada tem 1 ou 2 letras (e vai virar prefixo).
+    fn short_prefix(&self) -> bool {
+        if self.query.ends_with(char::is_whitespace) || self.query.matches('"').count() % 2 == 1 {
+            return false;
+        }
+        self.query.split_whitespace().last().is_some_and(|w| w.chars().count() <= 2)
+    }
+
     /// Recalcula sugestões e resultados depois que a consulta mudou.
     fn refresh(&mut self) {
+        if self.opened.elapsed() >= REOPEN_AFTER {
+            self.reopen();
+        }
         let typing = !self.query.is_empty() && !self.query.ends_with(char::is_whitespace);
         let last = if typing { self.query.split_whitespace().last() } else { None };
         self.current_word = last.and_then(|w| normalize_term(w.trim_end_matches('*')));
@@ -198,6 +238,10 @@ impl<'a> App<'a> {
 
         match key.code {
             KeyCode::Esc => self.quit = true,
+            KeyCode::Char('r') if ctrl => {
+                self.reopen();
+                return true;
+            }
             KeyCode::Char('w') if ctrl => {
                 let trimmed = self.query.trim_end().len();
                 self.query.truncate(trimmed);
@@ -274,7 +318,7 @@ impl<'a> App<'a> {
     }
 
     fn label(&mut self, doc: DocId) -> Option<String> {
-        let engine = self.engine;
+        let engine = &self.engine;
         self.labels.entry(doc).or_insert_with(|| engine.label(doc).ok().flatten()).clone()
     }
 

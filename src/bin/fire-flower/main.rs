@@ -1,4 +1,6 @@
 mod jsonl;
+mod monitor;
+mod style;
 mod tui;
 
 use std::collections::HashMap;
@@ -47,6 +49,8 @@ enum Command {
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia).
     /// Um ID que já existe é substituído; {"op": "delete", "id"} remove
@@ -70,6 +74,8 @@ enum Command {
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Remove documentos pelo ID
     Delete {
@@ -82,6 +88,8 @@ enum Command {
     /// da Trie as palavras que ficaram sem documento
     Compact {
         db: PathBuf,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
     /// Os resultados saem por relevância (BM25), com a nota.
@@ -103,6 +111,21 @@ enum Command {
         #[arg(default_value_t = 10)]
         limit: usize,
     },
+    /// Painel do banco que outro processo está usando: lê o snapshot das
+    /// métricas que ele grava (Config::metrics), o /proc dele e a pasta do
+    /// banco. Nunca abre o banco
+    Monitor {
+        db: PathBuf,
+        /// Serve as métricas em /metrics (OpenMetrics) neste endereço
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9187", value_name = "ENDEREÇO")]
+        serve: Option<String>,
+        /// Imprime uma leitura em JSON e sai
+        #[arg(long)]
+        json: bool,
+        /// O arquivo do snapshot, se o motor grava fora da pasta do banco
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -112,6 +135,24 @@ struct LanguageArgs {
     /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_languages)]
     languages: Option<LanguageList>,
+}
+
+#[derive(clap::Args)]
+struct MetricsArgs {
+    /// Grava o snapshot das métricas na pasta do banco a cada segundo, para o
+    /// `fire-flower monitor` acompanhar o trabalho
+    #[arg(long)]
+    metrics: bool,
+    /// Como --metrics, gravando neste arquivo em vez da pasta do banco
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+}
+
+impl MetricsArgs {
+    fn apply(self, config: Config) -> Config {
+        let metrics = self.metrics || self.metrics_file.is_some();
+        Config { metrics, metrics_file: self.metrics_file, ..config }
+    }
 }
 
 #[derive(clap::Args)]
@@ -171,15 +212,19 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
-            tui::run(&engine, &db.display().to_string()).map_err(Into::into)
+        Command::Tui { db } => open_reader(&db).and_then(|engine| {
+            let path = db.clone();
+            let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, Config::reader()));
+            tui::run(engine, &db.display().to_string(), reopen).map_err(Into::into)
         }),
-        Command::Index { db, paths, sync, languages, positions, stemming } => {
-            index(&db, &paths, sync, languages.languages, positions.config(), stemming)
+        Command::Index { db, paths, sync, languages, positions, stemming, metrics } => {
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            index(&db, &paths, sync, creation, metrics)
         }
-        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming } => {
+        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming, metrics } => {
             let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
-            open(&db, languages.languages, positions.config(), Some(stemming)).and_then(|engine| {
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            open(&db, creation, metrics).and_then(|engine| {
                 if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
@@ -189,7 +234,7 @@ fn main() -> ExitCode {
             })
         }
         Command::Delete { db, ids } => delete(&db, &ids),
-        Command::Compact { db } => open(&db, None, None, None).and_then(|engine| {
+        Command::Compact { db, metrics } => open_existing(&db, metrics).and_then(|engine| {
             let started = Instant::now();
             let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
@@ -203,6 +248,9 @@ fn main() -> ExitCode {
         }),
         Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
         Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
+        Command::Monitor { db, serve, json, metrics_file } => {
+            monitor::run(monitor::Options { db, metrics_file, serve, json })
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -213,21 +261,40 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `languages`, `positions` e `stemming` só importam na
-/// criação; `None` usa o que está gravado.
-fn open(
-    db: &Path,
+/// Abre um banco que já existe só para leitura, ao lado de quem o grava: a
+/// TUI, `search` e `suggest` não travam o banco nem disputam memória com ele.
+fn open_reader(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open_read_only(db, Config::reader())?)
+}
+
+/// Abre um banco que já existe para gravar (`delete`, `compact`): um caminho
+/// errado dá erro em vez de criar um banco vazio.
+fn open_existing(db: &Path, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open(db, metrics.apply(Config { create_if_missing: false, ..Config::default() }))?)
+}
+
+/// Opções que só importam na criação do banco; `None` usa o que está gravado.
+struct Creation {
     languages: Option<LanguageList>,
     positions: Option<bool>,
-    stemming: Option<StemmingArgs>,
-) -> Result<Engine, Box<dyn std::error::Error>> {
-    let (stemming, inflections) = stemming.map_or((None, None), |s| (s.stemming, s.inflections));
-    let config = Config { languages: languages.map(|l| l.0), positions, stemming, inflections, ..Config::default() };
-    Ok(Engine::open(db, config)?)
+    stemming: StemmingArgs,
+}
+
+/// Abre (ou cria) o banco para indexar.
+fn open(db: &Path, creation: Creation, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
+    let Creation { languages, positions, stemming } = creation;
+    let config = Config {
+        languages: languages.map(|l| l.0),
+        positions,
+        stemming: stemming.stemming,
+        inflections: stemming.inflections,
+        ..Config::default()
+    };
+    Ok(Engine::open(db, metrics.apply(config))?)
 }
 
 fn delete(db: &Path, ids: &[u64]) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_existing(db, MetricsArgs { metrics: false, metrics_file: None })?;
     let mut batch = engine.batch();
     for &id in ids {
         batch.delete_document(id)?;
@@ -257,15 +324,8 @@ fn indexed_files(engine: &Engine, paths: &[PathBuf]) -> Result<HashMap<String, u
     Ok(found)
 }
 
-fn index(
-    db: &Path,
-    paths: &[PathBuf],
-    sync: bool,
-    languages: Option<LanguageList>,
-    positions: Option<bool>,
-    stemming: StemmingArgs,
-) -> AnyResult {
-    let engine = open(db, languages, positions, Some(stemming))?;
+fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: MetricsArgs) -> AnyResult {
+    let engine = open(db, creation, metrics)?;
     let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
@@ -333,7 +393,7 @@ fn index(
 }
 
 fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
     let (hits, total) = if by_id {
@@ -362,7 +422,7 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

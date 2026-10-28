@@ -123,7 +123,9 @@ def wiki(*args, capture=False, check=True):
 
 def build():
     step("compilando (release)")
-    run(["cargo", "build", "--release", "--bin", "fire-flower", "--example", "wiki"])
+    # FF_CARGO_ARGS="--no-default-features": a variante sem a feature `metrics`.
+    extra = os.environ.get("FF_CARGO_ARGS", "").split()
+    run(["cargo", "build", "--release", *extra, "--bin", "fire-flower", "--example", "wiki"])
 
 
 def fresh(path):
@@ -305,12 +307,19 @@ def phase_experiments(scale):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def metrics_args():
+    """Com `FF_METRICS_FILE`, a CLI grava as métricas no mesmo arquivo que o
+    harness (ver `examples/wiki/env.rs`)."""
+    file = os.environ.get("FF_METRICS_FILE")
+    return ["--metrics-file", file] if file else []
+
+
 def compact_and_save(path, label):
     """Compacta e grava o tamanho antes e depois: o tamanho logo após a carga
     depende de quanto do WAL já virou SST, o compactado é estável."""
     before = dir_size(path)
     t = time.time()
-    run([FF, "compact", path])
+    run([FF, "compact", path, *metrics_args()])
     save_result("compact", label, {"seconds": time.time() - t, "db_before": before, "db_after": dir_size(path)})
 
 
@@ -348,7 +357,7 @@ def phase_correctness(scale):
     wiki("load", "--db", tmp, "--corpus", corpus(small), "--label", f"idempotence-{small}")
     after = digest(tmp)
     size_twice = dir_size(tmp)
-    run([FF, "compact", tmp])
+    run([FF, "compact", tmp, *metrics_args()])
     checks["idempotence"] = before["digest"] == after["digest"]
     idempotence = {"slice": small, "digest_1st": before, "digest_2nd": after, "db_1st": size_before,
             "db_2nd": size_twice, "db_2nd_compacted": dir_size(tmp)}
@@ -428,7 +437,7 @@ def phase_latency(scale):
     step("compactação")
     size_before = dir_size(path)
     t = time.time()
-    run([FF, "compact", path])
+    run([FF, "compact", path, *metrics_args()])
     compact_s = time.time() - t
     save_result("compact", scale, {"seconds": compact_s, "db_before": size_before, "db_after": dir_size(path),
                                    "open_before": pre_open, "open_after": open_time(path)})
@@ -548,7 +557,7 @@ def phase_phrases(scale):
     pre_open = open_time(path)
     size_before = dir_size(path)
     t = time.time()
-    run([FF, "compact", path])
+    run([FF, "compact", path, *metrics_args()])
     save_result("compact", scale, {"seconds": time.time() - t, "db_before": size_before, "db_after": dir_size(path),
                                    "open_before": pre_open, "open_after": open_time(path)})
     sizes_of(path, f"ptwiki-{scale}-compacted")
@@ -739,7 +748,7 @@ def phase_edits(scale):
     # conteúdo lógico (listas sem os mortos) já tem que ser o mesmo. As notas
     # (o df conta os mortos) e o autocompletar só batem depois dela.
     same_pre = digest(edited)["digest"] == digest(final)["digest"]
-    run([FF, "compact", edited])
+    run([FF, "compact", edited, *metrics_args()])
     ok &= wiki("oracle", "--db", edited, "--corpus", small_src, "--take", docs_in(small), "--edits",
                "--label", f"{small}-edits", check=False) == 0
     same = same_pre and digest(edited)["digest"] == digest(final)["digest"]

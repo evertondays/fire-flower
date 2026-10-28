@@ -1014,6 +1014,63 @@ flowchart LR
   lê do próprio snapshot e não guarda nada. Um teste roda buscas ranqueadas
   enquanto outro thread reindexa documentos do mesmo bloco.
 
+### Outros processos: só leitura
+
+O RocksDB trava a pasta (`LOCK`) para o processo que a abre para escrita: um
+segundo `Engine::open` falha, com uma mensagem que sugere o próximo item.
+`Engine::open_read_only` abre ao lado dele, sem travar nada:
+
+- não cria nem altera arquivos, não roda compactação nem threads extras;
+- lê por snapshot como sempre (a instância *secundária* do RocksDB, que
+  acompanha o primário sozinha, não aceita snapshot, por isso não serve);
+- vê o banco como estava na abertura, inclusive o que ainda está só no WAL; o
+  que for gravado depois só aparece abrindo de novo (~30 ms no 100k);
+- lotes e `compact()` dão `Error::ReadOnly`.
+
+Se o processo que grava apaga um WAL ou SST antigo (fim de um flush ou de uma
+compactação) bem no meio da abertura, ela falha com "arquivo não existe";
+`open_read_only` tenta de novo até 5 vezes. A TUI, `search` e `suggest` da
+CLI abrem assim, com `Config::reader()` (block cache de 32 MB, sem criar
+banco).
+
+### Métricas sem custo
+
+Com `Config::metrics`, o motor conta o que acontece
+([plano](plano-monitoramento.md)). O desafio é não custar nada às buscas,
+que rodam em paralelo em muitas threads:
+
+```mermaid
+flowchart LR
+    Q["search() em N threads"] -->|"fetch_add relaxado<br/>no shard da thread"| SH["shards<br/>(128 B cada)"]
+    C["commit"] -->|"somas, uma vez<br/>por commit"| W["contadores do escritor"]
+    SH --> A["thread amostradora<br/>(a cada 1 s)"]
+    W --> A
+    R[("RocksDB: propriedades<br/>a cada 5 s")] --> A
+    A -->|"grava e renomeia"| F["fire-flower.metrics.json"]
+    F --> M["fire-flower monitor<br/>(outro processo)"]
+    P["/proc/pid, pasta"] --> M
+```
+
+- **Uma consulta** lê o relógio duas vezes e soma, num *shard* da própria
+  thread, a contagem, o balde do histograma (16 baldes de 5 µs a 1 s), o
+  tempo e os `Get`s. Shards alinhados a 128 B: um contador compartilhado
+  faria a linha de cache pular entre os núcleos a cada consulta. Os acertos
+  do cache de época são contados em variáveis da própria busca e somados ao
+  shard uma vez, no fim. Microbench: 6,9 ns por registro (8,0 ns com 12
+  threads registrando juntas).
+- **Um commit** soma o que o `CommitStats` já calculou: documentos
+  indexados, substituídos e removidos, versões mortas, tempo por fase. Nada
+  por documento.
+- **A amostradora** soma os shards, lê as propriedades baratas do RocksDB
+  (nenhuma depende de `enable_statistics`, que custaria 5% a 10% em cada
+  `Get`) e grava o snapshot num arquivo temporário que renomeia por cima do
+  anterior: o monitor nunca vê uma escrita pela metade.
+- **O monitor** (`fire-flower monitor`) é outro processo: lê o snapshot, o
+  `/proc` do processo do motor e a pasta do banco. Nunca abre o RocksDB nem
+  fala com o motor; o scrape do Prometheus (`--serve`) custa só a ele.
+- **Sem a feature `metrics`** (`--no-default-features`), os ganchos somem na
+  compilação.
+
 ---
 
 ## 8. A CLI interativa
@@ -1077,6 +1134,25 @@ Detalhes que mantêm a interface rápida:
   casam com a consulta, usando a mesma normalização. Documentos cujo rótulo
   não é um arquivo, como os artigos da Wikipédia que guardarão o título,
   ficam sem prévia.
+- **Prefixo curto espera:** quando a última palavra tem 1 ou 2 letras (o
+  prefixo mais caro), a TUI espera 120 ms por mais teclas antes de buscar.
+- **Só leitura:** a TUI abre o banco com `open_read_only` e não atrapalha uma
+  carga no mesmo banco. Reabre com `Ctrl+R`, e sozinha na primeira tecla
+  depois de 10 s.
+
+### O painel do monitor
+
+`fire-flower monitor <banco>` (código em `src/bin/fire-flower/monitor/`)
+mostra o snapshot das métricas com taxas do último intervalo: consultas/s,
+p50 e p99 por tipo de consulta (estimados pelos baldes, como o
+`histogram_quantile` do Prometheus), Gets por consulta, acerto dos caches,
+documentos/s, commits, **edição e remoção** (substituídos/s, removidos/s,
+versões mortas, edições pendentes, o que as compactações limparam), RocksDB,
+memória e disco. As sparklines ficam no próprio painel: o motor não guarda
+histórico. Alertas: snapshot velho (motor parado), escrita parada, erros do
+RocksDB, L0 cheio, compactação pendente que só cresce, disco quase cheio,
+versões mortas acima de 10% dos documentos. `--serve` expõe o mesmo em
+`/metrics` (OpenMetrics) e `--json` imprime uma leitura.
 
 ---
 
@@ -1122,13 +1198,18 @@ src/
 │   ├── phrase.rs       frases: conferência das posições
 │   ├── groups.rs       grupos de flexões na consulta
 │   ├── diagnostics.rs  medições para o harness de performance
+│   ├── metrics/        métricas: shards e somas (mod.rs), snapshot gravado (snapshot.rs),
+│   │                   thread amostradora (sampler.rs)
 │   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
 │   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); versões,
 │                       tamanhos e rótulos (documents.rs)
 └── bin/fire-flower/    a CLI
-    ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest
+    ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest, monitor
     ├── jsonl.rs        index-jsonl
-    └── tui/            busca interativa: estado (mod.rs), desenho, prévia
+    ├── style.rs        cores e molduras comuns às duas telas
+    ├── tui/            busca interativa: estado (mod.rs), desenho, prévia
+    └── monitor/        monitor: leitura (mod.rs), /proc, disco, OpenMetrics, HTTP, painel/
+contrib/monitoring/     dashboard do Grafana e alertas do Prometheus
 tests/engine/           testes de ponta a ponta, um arquivo por tema
 examples/wiki/          harness de performance, um arquivo por subcomando
 benches/micro.rs        microbenchmarks (criterion)
@@ -1166,6 +1247,8 @@ engine.suggest("cor", 10)?;        // Vec<String>
 | Indexar um lote | tokenizar + 1 caminho na Trie por termo distinto do lote + os blocos de `norm:` tocados | nós no cache do escritor não são relidos |
 | Substituir ou remover | o mesmo que indexar (as entradas novas entram no fim das listas) + 1 `put ver:` | a versão antiga fica nas listas até a compactação; a busca a pula com um teste por entrada |
 | Commit | 1 `WriteBatch` | escrita sequencial no WAL |
+| Métricas (`Config::metrics`) | ~7 ns por consulta, ~26 ns por commit | somas num contador da própria thread; a amostradora grava 1 arquivo por segundo |
+| Abrir só para leitura | ~30 ms no 100k | relê o MANIFEST e o WAL; a visão é a da abertura |
 
 **Espaço:** as posições são a maior parte do banco. Na fatia de 10k da
 Wikipédia, os valores de `pos:` somam 26 MB, os de `post:` (com tf) 11 MB e a

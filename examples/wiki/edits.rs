@@ -198,7 +198,8 @@ pub(crate) fn edit(
     maintenance: Option<u64>,
     label: Option<String>,
 ) -> AnyResult {
-    let engine = Arc::new(Engine::open(db, Config { statistics: true, ..Config::default() })?);
+    let config = crate::env::with_metrics(Config { statistics: true, ..Config::default() });
+    let engine = Arc::new(Engine::open(db, config)?);
     let worker = maintenance.map(|n| spawn_maintenance(&engine, n));
     let prepared = prepare(corpus, take, &args, max_ops)?;
     let ops = &prepared.ops;

@@ -15,14 +15,15 @@ use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSI
 pub const FORMAT_VERSION: u64 = 7;
 
 /// Confere a versão do formato e se o banco grava posições. Num banco novo,
-/// grava as duas coisas.
-pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<bool> {
+/// grava as duas coisas (`writable`; aberto só para leitura, é erro).
+pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>, writable: bool) -> Result<bool> {
     match read_counter(db, META_FORMAT)? {
         Some(FORMAT_VERSION) => stored_flag(db, META_POSITIONS, wanted_positions, "posições"),
         Some(v) => Err(Error::Config(format!(
             "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
         ))),
         None if read_counter(db, META_NEXT_NODE)?.is_some() => Err(old_format()),
+        None if !writable => Err(Error::Config("o banco está vazio (nunca foi aberto para escrita)".into())),
         None => {
             let positions = wanted_positions.unwrap_or(true);
             let mut wb = WriteBatch::default();
@@ -85,8 +86,8 @@ pub(super) fn stored_format_error(path: &Path) -> Option<Error> {
 }
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
-/// (ou o padrão).
-pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
+/// (ou o padrão), se `writable`.
+pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>, writable: bool) -> Result<Vec<Language>> {
     let normalize = |langs: &[Language]| Stopwords::new(langs).languages().to_vec();
     let stored = match db.get_pinned(META_LANGUAGES)? {
         Some(v) => Some(parse_languages(&String::from_utf8_lossy(&v))?),
@@ -103,7 +104,7 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
         (Some(stored), _) => stored,
         (None, wanted) => normalize(wanted.unwrap_or(Language::DEFAULT)),
     };
-    if db.get_pinned(META_LANGUAGES)?.is_none() {
+    if writable && db.get_pinned(META_LANGUAGES)?.is_none() {
         let codes: Vec<&str> = languages.iter().map(|l| l.code()).collect();
         db.put(META_LANGUAGES, codes.join(","))?;
     }
@@ -112,8 +113,8 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
 
 /// Stemming do banco (`key` = `meta:stemming` ou `meta:inflections`). Num
 /// banco sem a chave, grava o da config (ou `Off`); um banco que já tem dados
-/// e não tem a chave é de antes dela: `Off`.
-pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
+/// e não tem a chave é de antes dela: `Off`. Só grava se `writable`.
+pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>, writable: bool) -> Result<Stemming> {
     let what = if key == META_STEMMING { "stemming" } else { "flexões na consulta" };
     let stored = match db.get_pinned(key)? {
         Some(v) => {
@@ -132,7 +133,7 @@ pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) ->
         (Some(stored), _) => stored,
         (None, wanted) => wanted.unwrap_or_default(),
     };
-    if db.get_pinned(key)?.is_none() {
+    if writable && db.get_pinned(key)?.is_none() {
         db.put(key, stemming.code())?;
     }
     Ok(stemming)

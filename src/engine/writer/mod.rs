@@ -311,7 +311,19 @@ impl IndexBatch<'_> {
 
     /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
     /// Usado pelo harness de performance para achar o gargalo da carga.
-    pub fn commit_with_stats(mut self) -> Result<CommitStats> {
+    pub fn commit_with_stats(self) -> Result<CommitStats> {
+        let engine = self.engine;
+        let result = self.write();
+        if result.is_err()
+            && let Some(m) = engine.metrics()
+        {
+            m.record_commit_error();
+        }
+        result
+    }
+
+    fn write(mut self) -> Result<CommitStats> {
+        self.engine.require_writable()?;
         let started = Instant::now();
         let mut stats = CommitStats::default();
         let positions = self.engine.positions;
@@ -418,13 +430,17 @@ impl IndexBatch<'_> {
             return Err(e);
         }
         stats.write_secs = t.elapsed().as_secs_f64();
+        let mut dead_versions = None;
         if !versions.kills.is_empty() {
             // O commit inteiro tem números de sequência até este: um snapshot
             // vê as mortes dele se e só se o número dele chega aqui.
             let seq = engine.db.latest_sequence_number();
-            engine.dead.lock().unwrap_or_else(|e| e.into_inner()).extend(versions.kills.iter().map(|&id| (seq, id)));
+            let mut dead = engine.dead.lock().unwrap_or_else(|e| e.into_inner());
+            dead.extend(versions.kills.iter().map(|&id| (seq, id)));
+            dead_versions = Some(dead.len() as u64);
         }
-        engine.pending_edits.fetch_add((stats.replaced + stats.deleted) as u64, AtomicOrdering::AcqRel);
+        let edits = (stats.replaced + stats.deleted) as u64;
+        let pending_edits = engine.pending_edits.fetch_add(edits, AtomicOrdering::AcqRel) + edits;
         self.state.latest.extend(versions.changed.iter().copied());
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
@@ -444,6 +460,12 @@ impl IndexBatch<'_> {
         self.state.next_doc_id = self.next_doc_id;
         self.state.stats = index;
         stats.total_secs = started.elapsed().as_secs_f64();
+        if let Some(m) = engine.metrics() {
+            m.record_commit(&stats, index.doc_count);
+            if let Some(dead) = dead_versions {
+                m.set_edit_backlog(dead, pending_edits);
+            }
+        }
         Ok(stats)
     }
 }

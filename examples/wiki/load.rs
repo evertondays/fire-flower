@@ -25,7 +25,7 @@ pub(crate) fn load(
     edits: Option<EditPlanArgs>,
     label: Option<String>,
 ) -> AnyResult {
-    let engine = Engine::open(db, config.clone())?;
+    let engine = Engine::open(db, crate::env::with_metrics(config.clone()))?;
     // Com `edits`: o estado final da fatia depois do plano, para comparar
     // (pelo `digest`) com um banco que passou pelas edições.
     let corpus: Box<dyn Iterator<Item = AnyResult<Doc>>> = match &edits {

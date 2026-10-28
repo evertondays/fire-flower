@@ -9,7 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_normalization::char::is_combining_mark;
 
-use super::{ACCENT, MAX_LINE_CHARS, MAX_PREVIEW_BYTES, MUTED, PreviewContent};
+use super::{MAX_LINE_CHARS, MAX_PREVIEW_BYTES, PreviewContent};
+use crate::style::{ACCENT, MUTED};
 
 
 

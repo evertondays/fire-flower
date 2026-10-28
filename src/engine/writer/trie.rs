@@ -94,7 +94,7 @@ impl IndexBatch<'_> {
                 Ok(cached)
             }
             Entry::Vacant(e) => {
-                let (node, dirty) = match load_node(&self.engine.db, id)? {
+                let (node, dirty) = match load_node(&*self.engine.db, id)? {
                     Some(node) => (node, false),
                     // Banco novo: a raiz nasce no primeiro commit.
                     None if id == ROOT_ID => (TrieNode::default(), true),

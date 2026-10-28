@@ -146,3 +146,24 @@ mesmo banco do `examples/wiki`, e grava JSON no formato do `perf.py`.
    e o pico de memória durante a troca de instância.
 5. ~~Remoção e atualização antes do 1.0?~~ Já existem.
 6. Navegador é caso de uso real? Pede a maior mudança no core.
+
+## Resultado da Fase 0 (28/10/2026)
+
+A/B completo (`perf.py all --scale full` e `edits --scale 100k`) contra a
+`v0.2-release`, uma variante depois da outra: zero divergências nos cinco
+oráculos.
+
+| Medida | `v0.2-release` | `bindings-core` |
+|---|---|---|
+| Carga da Wikipédia inteira | 9.204 docs/s | 9.174 (−0,3%) |
+| Carga de 100k | 6.299 docs/s | 6.401 (+1,6%) |
+| Carga de 1 documento por commit (alternando os binários) | 355 docs/s | 356 |
+| Edições, lote de 10 mil / de 1 | 7.209 / 1.046 ops/s | 7.228 / 1.050 |
+| p99 de `mixed` com indexação (4 leitores) | 4.293 µs | 4.290 µs |
+| Compactação da Wikipédia inteira | 4,98 s | 5,12 s (+2,7%) |
+
+O `t-freq` apareceu de +7% a +10% em todos os estágios, e alternando os
+binários continuou em +8,6% (301,6 → 327,6 µs; `and-freq` +3,6%). Com builds
+de alinhamento fixo (`-align-all-functions=6 -align-all-nofallthru-blocks=6`)
+a diferença some: 315,7 → 318,0 µs (+0,7%), `and-freq` +0,3%. É alinhamento
+do código, como no A/B do monitoramento; a Fase 0 não perde nada.

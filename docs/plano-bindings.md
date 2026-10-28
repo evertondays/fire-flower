@@ -209,3 +209,29 @@ O caminho até aí:
   a 3,8 µs nas consultas curtas) inclui o trabalho JS entre as buscas
   disputando o cache; a diferença para o `wiki` varia de rodada para rodada
   em ±5 µs.
+
+## Resultado da Fase 2 (28/10/2026)
+
+- **`Reader` no core:** a instância só leitura atual num `ArcSwap` (pegá-la
+  não tem trava) e `refresh()`, que lista a pasta no máximo a cada
+  `min_interval` e reabre se o nome ou o tamanho do WAL, do MANIFEST ou do
+  `CURRENT` mudaram. O escritor não paga nada. `refresh_now()` confere sem
+  esperar o intervalo.
+- **Teste entre processos:** o próprio binário de teste, chamado de novo
+  como escritor, grava 60 commits com compactações enquanto o `Reader` reabre
+  e busca: nenhum commit pela metade, nenhuma volta no tempo. O mesmo no Node
+  (`readOnly` com `refreshMs`, o escritor num processo filho).
+- **Node:** `{ readOnly: true, refreshMs }` confere a pasta no pool de
+  threads a cada `refreshMs` (o timer não segura o processo) e
+  `engine.refresh()` confere na hora.
+- **Custo de reabrir (`wiki reopen`, 100k em lotes de 5.000):** ~12 ms por MB
+  de WAL, que a instância só leitura repete na memória. Com o WAL cheio da
+  carga (até 91 MB), de 0,1 a 1,1 s (média 0,6 s); com `Config::max_wal_bytes`
+  de 16 MB no escritor, média 0,36 s (o lote em si já escreve ~25 MB). Com
+  commits pequenos, o WAL tem KB. No Node a reabertura roda no pool de
+  threads; um leitor síncrono (o PHP no começo do request) sentiria esse
+  tempo, e é o ponto a decidir na Fase 3.
+- **Primeira busca depois de reabrir:** ~1,6 ms contra 0,12 ms da segunda,
+  mesmo com o block cache compartilhado entre as instâncias: os caches de
+  nós e de tamanhos do motor nascem vazios.
+

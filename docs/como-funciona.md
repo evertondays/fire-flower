@@ -1038,6 +1038,30 @@ compactação) bem no meio da abertura, ela falha com "arquivo não existe";
 CLI abrem assim, com `Config::reader()` (block cache de 32 MB, sem criar
 banco).
 
+O `Reader` faz isso sozinho para quem lê sem parar (workers do PHP-FPM, um
+cluster do Node):
+
+- guarda a instância só leitura atual (`ArcSwap`: pegá-la não tem trava);
+- `refresh()` lista a pasta, no máximo a cada intervalo, e compara o nome e
+  o tamanho do WAL, do MANIFEST e do `CURRENT`. Todo commit acrescenta ao WAL
+  e todo flush ou compactação troca o MANIFEST: se nada mudou, não abre nada.
+  O processo que grava não paga nada (um contador publicado por ele custaria
+  uma escrita por commit);
+- se mudou, abre uma instância nova e a põe no lugar; buscas em andamento
+  terminam na antiga, que fecha quando a última solta. O block cache é o
+  mesmo em todas as instâncias; os caches de nós e de tamanhos nascem vazios
+  (nada de nós ou tamanhos velhos de outro processo), e a primeira busca
+  depois de reabrir leva ~1,5 ms em vez de ~0,1 ms;
+- **reabrir custa ~12 ms por MB de WAL**, que a instância só leitura repete
+  na memória. Com commits pequenos e esporádicos, o WAL tem KB e reabrir leva
+  dezenas de ms; durante uma carga com lotes de 5.000 artigos, de 0,1 a 1,1 s
+  (cada lote escreve ~25 MB de WAL). `Config::max_wal_bytes` no processo que
+  grava encolhe a memtable e o WAL (16 MB: média de 0,6 para 0,36 s).
+
+Um teste roda o escritor em outro processo, com commits e compactações,
+enquanto o `Reader` reabre e busca: nenhum commit pela metade, nenhuma volta
+no tempo.
+
 ### Métricas sem custo
 
 Com `Config::metrics`, o motor conta o que acontece
@@ -1189,6 +1213,7 @@ src/
 ├── engine/             índice e armazenamento
 │   ├── mod.rs          Engine: batch, try_batch, owned_batch, search, search_top/search_ranked, suggest, labels
 │   ├── open.rs         abrir para leitura e escrita ou só leitura; opções do RocksDB
+│   ├── reader.rs       Reader: só leitura que reabre quando o banco muda
 │   ├── config.rs       Config
 │   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, ver:, stem:, meta:)
 │   ├── meta.rs         formato, idiomas e stemming gravados

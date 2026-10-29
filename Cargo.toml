@@ -1,9 +1,9 @@
 # O core (esta pasta) e a CLI (crates/fire-flower-cli) num workspace: os
 # bindings (bindings/) dependem só do core, sem clap nem ratatui.
 [workspace]
-members = [".", "crates/fire-flower-cli"]
+members = [".", "crates/fire-flower-cli", "bindings/node"]
 # `cargo build` na raiz compila o core e a CLI (o `perf.py` usa
-# `--bin fire-flower --example wiki`).
+# `--bin fire-flower --example wiki`); os bindings, só com `-p`.
 default-members = [".", "crates/fire-flower-cli"]
 resolver = "3"
 

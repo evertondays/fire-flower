@@ -17,7 +17,7 @@
 //! cargo run --release --example wiki -- concurrent --db D --corpus F --skip K --queries Q [--threads T]
 //! ```
 
-use crate::bench::bench;
+use crate::bench::{Mode, bench};
 use crate::concurrent::concurrent;
 use crate::corpus::parse_languages;
 use crate::digest::digest;
@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use fire_flower::{Stemming, Stopwords};
 use fire_flower::Config;
+use rocksdb::perf::PerfStatsLevel;
 
 mod bench;
 mod concurrent;
@@ -106,6 +107,10 @@ enum Cmd {
         /// colapso da carga quando o filtro passa de uma parte do block cache
         #[arg(long)]
         whole_filter: bool,
+        /// Como uma aplicação: sem as estatísticas do RocksDB (a base de
+        /// comparação dos bindings, que não as ligam)
+        #[arg(long)]
+        plain: bool,
         /// Carrega o estado final da fatia depois do plano de edições (precisa de --take)
         #[arg(long)]
         edits: bool,
@@ -258,6 +263,13 @@ enum Cmd {
         /// Mede também tempos no PerfContext (mais preciso, mas pesa na latência)
         #[arg(long)]
         perf_time: bool,
+        /// Sem PerfContext: mede como uma aplicação, a base de comparação dos
+        /// bindings
+        #[arg(long)]
+        plain: bool,
+        /// Mede todo conjunto com a mesma operação: search, suggest ou top10
+        #[arg(long)]
+        mode: Option<String>,
         /// Profundidade do cache de nós das buscas ("none" desliga)
         #[arg(long)]
         reader_cache: Option<String>,
@@ -313,7 +325,10 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, edits, plan, label } => {
+        Cmd::Load {
+            db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions,
+            stemming, inflections, whole_filter, plain, edits, plan, label,
+        } => {
             let languages = languages.as_deref().map(parse_languages).transpose()?;
             let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou none)"));
             let stemming = stemming.map(code).transpose()?;
@@ -326,7 +341,7 @@ fn main() -> AnyResult {
                 stemming,
                 inflections,
                 partition_filters: !whole_filter,
-                statistics: true,
+                statistics: !plain,
                 ..Config::default()
             };
             load(&db, &corpus, batch, skip, take, remap_ids, streaming, config, edits.then_some(plan), label)
@@ -353,12 +368,23 @@ fn main() -> AnyResult {
             })?;
             run_relevance(&db, &corpus, &sets, &manual, take, seed, per_set, generate, config, brief, label)
         }
-        Cmd::Bench { db, queries, threads, passes, cold, perf_time, reader_cache, cache_mb, inflections, label } => {
+        Cmd::Bench {
+            db, queries, threads, passes, cold, perf_time, plain, mode, reader_cache, cache_mb, inflections, label,
+        } => {
+            let mode = mode.map(|m| Mode::parse(&m).ok_or(format!("modo desconhecido {m:?}: search, suggest ou top10")))
+                .transpose()?;
             let mut config = inflections.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = reader_cache {
                 config.reader_cache_depth = if depth == "none" { None } else { Some(depth.parse()?) };
             }
-            bench(&db, &queries, threads.max(1), passes.max(1), cold, perf_time, config, label)
+            let level = if plain {
+                PerfStatsLevel::Disable
+            } else if perf_time {
+                PerfStatsLevel::EnableTime
+            } else {
+                PerfStatsLevel::EnableCount
+            };
+            bench(&db, &queries, threads.max(1), passes.max(1), cold, level, mode, config, label)
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),

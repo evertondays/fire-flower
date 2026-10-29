@@ -978,7 +978,7 @@ além, é preciso não decodificar a lista inteira (ver "Possíveis evoluções"
 ```mermaid
 flowchart LR
     subgraph Escrita
-        B1["engine.batch()"] -->|"trava o Mutex"| W["IndexBatch<br/>(só um por vez)"]
+        B1["engine.batch()"] -->|"pega o estado<br/>do escritor"| W["IndexBatch<br/>(só um por vez)"]
         W -->|"commit atômico"| DB[("RocksDB")]
     end
     subgraph Leitura
@@ -988,9 +988,14 @@ flowchart LR
     end
 ```
 
-- **Escrita:** `engine.batch()` pega um `Mutex`. Um segundo `batch()` espera
-  o primeiro terminar, inclusive na mesma thread: abrir um lote com outro
-  aberto trava o programa.
+- **Escrita:** só um lote existe por vez. O lote pega para si o estado do
+  escritor (contadores, cache de nós da Trie) e o devolve ao terminar, com ou
+  sem commit, inclusive se a thread entrar em pânico. Um segundo `batch()`
+  espera, inclusive na mesma thread: abrir um lote com outro aberto trava o
+  programa. `try_batch()` dá `Error::Busy` em vez de esperar. Como o lote não
+  guarda uma trava, `owned_batch()` (dono de um `Arc<Engine>`) pode ir para
+  outra thread: é o que os bindings usam para fazer commit fora do event
+  loop.
 - **Leitura:** buscas não pegam trava nenhuma. Cada uma cria um snapshot e lê
   por ele.
 - **Por que nunca se vê um lote pela metade:** o commit é um único
@@ -1075,7 +1080,7 @@ flowchart LR
 
 ## 8. A CLI interativa
 
-`fire-flower tui <banco>` (código em `src/bin/fire-flower/tui/`, interface feita com
+`fire-flower tui <banco>` (código em `crates/fire-flower-cli/src/tui/`, interface feita com
 [ratatui](https://ratatui.rs)).
 
 ```text
@@ -1142,7 +1147,7 @@ Detalhes que mantêm a interface rápida:
 
 ### O painel do monitor
 
-`fire-flower monitor <banco>` (código em `src/bin/fire-flower/monitor/`)
+`fire-flower monitor <banco>` (código em `crates/fire-flower-cli/src/monitor/`)
 mostra o snapshot das métricas com taxas do último intervalo: consultas/s,
 p50 e p99 por tipo de consulta (estimados pelos baldes, como o
 `histogram_quantile` do Prometheus), Gets por consulta, acerto dos caches,
@@ -1182,7 +1187,8 @@ src/
 │   ├── merge.rs        merge por documento com remendo, e a limpeza dos mortos (merge_lists, purge_list)
 │   └── varint.rs       varint e leitor de bytes
 ├── engine/             índice e armazenamento
-│   ├── mod.rs          Engine: open, batch, search, search_top/search_ranked, suggest, label
+│   ├── mod.rs          Engine: batch, try_batch, owned_batch, search, search_top/search_ranked, suggest, labels
+│   ├── open.rs         abrir para leitura e escrita ou só leitura; opções do RocksDB
 │   ├── config.rs       Config
 │   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, ver:, stem:, meta:)
 │   ├── meta.rs         formato, idiomas e stemming gravados
@@ -1203,7 +1209,8 @@ src/
 │   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
 │   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); versões,
 │                       tamanhos e rótulos (documents.rs)
-└── bin/fire-flower/    a CLI
+crates/fire-flower-cli/ a CLI (outro crate do workspace: só ela depende de clap e ratatui)
+└── src/
     ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest, monitor
     ├── jsonl.rs        index-jsonl
     ├── style.rs        cores e molduras comuns às duas telas

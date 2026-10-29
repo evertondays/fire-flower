@@ -301,6 +301,22 @@ Sem ela, chame `Engine::compact` (ou `fire-flower compact`) depois de editar
 muito. A compactação não bloqueia buscas nem lotes, e só tira uma versão morta
 quando nenhuma busca em andamento ainda a vê viva.
 
+Para quem não pode bloquear (um event loop, um binding), `try_batch` dá
+`Error::Busy` em vez de esperar o lote aberto; `owned_batch` devolve um lote
+dono de um `Arc<Engine>` (`OwnedBatch`, `Send + 'static`), que pode ser
+guardado num objeto e fazer commit em outra thread. `labels(&ids)` lê os
+rótulos de vários documentos num só `MultiGet`. Todo erro tem um código
+estável (`Error::code()`: `FF_BUSY`, `FF_OPEN`, `FF_READ_ONLY`…).
+
+```rust
+use std::sync::Arc;
+
+let engine = Arc::new(engine);
+let mut batch = engine.try_owned_batch()?; // Error::Busy se houver outro lote
+batch.add_document(3, "em outra thread")?;
+std::thread::spawn(move || batch.commit()).join().unwrap()?;
+```
+
 Outro processo pode ler o mesmo banco enquanto este grava, sem travá-lo:
 
 ```rust
@@ -322,7 +338,7 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 | Camada | Onde | Responsabilidade |
 |---|---|---|
-| Interface | `src/bin/fire-flower/` | subcomandos (clap), `index-jsonl` e busca interativa (`tui/`, ratatui) |
+| Interface | `crates/fire-flower-cli/` | subcomandos (clap), `index-jsonl`, busca interativa (`tui/`, ratatui) e `monitor/` |
 | Texto | `src/analysis/` | remove HTML, acentos (NFKD), pontuação; minúsculas; tokens > 64 caracteres são descartados; stopwords e stemming |
 | Consulta | `src/query/` | separa a consulta em termos, prefixos (`termo*`) e frases (`"..."`) |
 | Índice (Trie) | `src/engine/` | indexação (`writer/`), busca, prefixo, frases, ranking (`ranking/`), autocompletar |
@@ -460,3 +476,8 @@ alguns minutos.
 ```bash
 cargo test
 ```
+
+É um workspace: o core (a biblioteca) fica na raiz e a CLI em
+`crates/fire-flower-cli` (só ela depende de clap e ratatui). Na raiz,
+`cargo build --release` compila os dois, e o binário sai em
+`target/release/fire-flower`.

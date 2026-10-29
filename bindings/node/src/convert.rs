@@ -20,6 +20,9 @@ pub struct OpenOptions {
     pub inflections: Option<String>,
     pub block_cache_bytes: Option<f64>,
     pub read_only: Option<bool>,
+    /// Com `read_only`: confere a pasta e reabre se o banco mudou, no mínimo
+    /// a cada `refresh_ms` (ver `fire_flower::Reader`).
+    pub refresh_ms: Option<u32>,
     pub create_if_missing: Option<bool>,
     pub metrics: Option<bool>,
 }
@@ -34,9 +37,24 @@ pub struct Doc {
     pub label: Option<String>,
 }
 
-/// As opções viram a `Config` do core (e se o banco abre só para leitura).
-pub(crate) fn config(o: OpenOptions) -> Result<(Config, bool)> {
+/// Como o banco abre.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Mode {
+    Write,
+    ReadOnly,
+    /// Só leitura, reaberto quando o banco muda (intervalo mínimo em ms).
+    Refreshing(u32),
+}
+
+/// As opções viram a `Config` do core e o modo de abrir.
+pub(crate) fn config(o: OpenOptions) -> Result<(Config, Mode)> {
     let read_only = o.read_only.unwrap_or(false);
+    let mode = match (read_only, o.refresh_ms) {
+        (false, None) => Mode::Write,
+        (false, Some(_)) => return Err(binding_error("FF_ARGUMENT", "refreshMs só vale com readOnly")),
+        (true, None) => Mode::ReadOnly,
+        (true, Some(ms)) => Mode::Refreshing(ms),
+    };
     let mut config = if read_only { Config::reader() } else { Config::default() };
     if let Some(codes) = o.languages {
         let langs = codes
@@ -55,7 +73,7 @@ pub(crate) fn config(o: OpenOptions) -> Result<(Config, bool)> {
         config.create_if_missing = create;
     }
     config.metrics = o.metrics.unwrap_or(false);
-    Ok((config, read_only))
+    Ok((config, mode))
 }
 
 fn stemming(code: &str) -> Result<Stemming> {

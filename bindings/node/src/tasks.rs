@@ -5,12 +5,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fire_flower::{Config, DocId, Engine};
+use fire_flower::{Config, DocId, Engine, Reader};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::convert::{self, Doc, Doubles};
-use crate::handle::NewHandle;
+use crate::convert::{self, Doc, Doubles, Mode};
+use crate::handle::{Backend, NewHandle};
 use crate::{binding_error, js_error, open_shared};
 
 /// Roda `f` pegando um pânico: sem isso, ele atravessaria a fronteira e
@@ -29,15 +29,15 @@ fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 pub struct OpenTask {
     pub(crate) path: PathBuf,
     pub(crate) config: Config,
-    pub(crate) read_only: bool,
+    pub(crate) mode: Mode,
 }
 
 impl Task for OpenTask {
-    type Output = Arc<Engine>;
+    type Output = Backend;
     type JsValue = NewHandle;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        guarded(|| open_shared(&self.path, self.config.clone(), self.read_only).map_err(js_error))
+        guarded(|| open_shared(&self.path, self.config.clone(), self.mode).map_err(js_error))
     }
 
     fn resolve(&mut self, _: Env, engine: Self::Output) -> Result<Self::JsValue> {
@@ -164,6 +164,31 @@ impl Task for CompactTask {
         guarded(|| {
             let stats = self.engine.compact().map_err(js_error)?;
             Ok(CompactResult { purged: stats.purged as u32, emptied_words: stats.emptied_words as u32 })
+        })
+    }
+
+    fn resolve(&mut self, _: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(out)
+    }
+}
+
+/// Reabre a instância só leitura se o banco mudou (no pool de threads: abrir
+/// leva dezenas de ms).
+pub struct RefreshTask {
+    pub(crate) reader: Option<Arc<Reader>>,
+    /// Pedido explícito: confere sem esperar o intervalo mínimo.
+    pub(crate) force: bool,
+}
+
+impl Task for RefreshTask {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        guarded(|| match &self.reader {
+            Some(reader) if self.force => reader.refresh_now().map_err(js_error),
+            Some(reader) => reader.refresh().map_err(js_error),
+            None => Ok(false),
         })
     }
 

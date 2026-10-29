@@ -33,7 +33,7 @@ impl Engine {
     /// e escrita. Só um processo por vez abre um banco assim: o RocksDB trava
     /// a pasta (`LOCK`).
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        Self::open_with(path.as_ref(), config, false)
+        Self::open_with(path.as_ref(), config, false, None)
     }
 
     /// Abre um banco que já existe só para leitura, ao lado do processo que o
@@ -41,10 +41,17 @@ impl Engine {
     /// roda compactação. A visão é a do momento da abertura: o que for gravado
     /// depois só aparece abrindo de novo. Lotes e [`Engine::compact`] dão erro.
     pub fn open_read_only(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        Self::open_with(path.as_ref(), config, true)
+        Self::open_with(path.as_ref(), config, true, None)
     }
 
-    fn open_with(path: &Path, config: Config, read_only: bool) -> Result<Self> {
+    /// Como [`Engine::open_read_only`], com um block cache de quem chama: o
+    /// `Reader` passa o mesmo a cada reabertura, e a instância nova já nasce
+    /// com os blocos quentes.
+    pub(super) fn open_read_only_with_cache(path: &Path, config: Config, cache: &Cache) -> Result<Self> {
+        Self::open_with(path, config, true, Some(cache))
+    }
+
+    fn open_with(path: &Path, config: Config, read_only: bool, cache: Option<&Cache>) -> Result<Self> {
         config.validate()?;
         // Antes do RocksDB: ele cria a pasta mesmo sem `create_if_missing`.
         if (read_only || !config.create_if_missing) && !path.join("CURRENT").is_file() {
@@ -52,7 +59,10 @@ impl Engine {
         }
         let mut table = BlockBasedOptions::default();
         table.set_bloom_filter(config.bloom_bits_per_key, false);
-        table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes));
+        match cache {
+            Some(cache) => table.set_block_cache(cache),
+            None => table.set_block_cache(&Cache::new_lru_cache(config.block_cache_bytes)),
+        }
         table.set_cache_index_and_filter_blocks(true);
         table.set_pin_l0_filter_and_index_blocks_in_cache(true);
         // Filtro e índice em partições de 4 KB, com um índice de topo fixo no
@@ -83,6 +93,12 @@ impl Engine {
                 purge::merge(&partial, key, existing, operands)
             },
         );
+        if let (false, Some(bytes)) = (read_only, config.max_wal_bytes) {
+            // Ver `Config::max_wal_bytes`. Com uma column family só, o WAL
+            // acompanha a memtable (`max_total_wal_size` só vale com várias):
+            // memtables menores, flushes mais cedo, WAL menor.
+            opts.set_write_buffer_size(bytes as usize);
+        }
         if !read_only {
             // Só leitura: sem compactação nem threads extras do RocksDB.
             opts.set_compaction_filter_factory(FilterFactory { purge: Arc::clone(&purge) });

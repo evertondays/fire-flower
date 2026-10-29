@@ -8,7 +8,7 @@ use napi_derive::napi;
 use crate::convert::{self, Doc, Doubles};
 use crate::handle::{F64Slice, Handle};
 use crate::js_error;
-use crate::tasks::{self, CompactTask, IndexResult, Op, SearchTask, SearchTopTask, WriteTask};
+use crate::tasks::{self, CompactTask, IndexResult, Op, RefreshTask, SearchTask, SearchTopTask, WriteTask};
 
 /// Estatísticas do índice (as do BM25).
 #[napi(object)]
@@ -146,6 +146,13 @@ pub fn metrics_json(h: Handle) -> Result<Option<String>> {
 #[napi(catch_unwind)]
 pub fn is_read_only(h: Handle) -> Result<bool> {
     h.with(|e| Ok(Engine::is_read_only(e)))
+}
+
+/// Reabre se o banco mudou (só com `refreshMs`); resolve se reabriu. `force`:
+/// confere sem esperar o intervalo mínimo.
+#[napi(catch_unwind)]
+pub fn refresh(h: Handle, force: bool) -> Result<AsyncTask<RefreshTask>> {
+    Ok(AsyncTask::new(RefreshTask { reader: h.reader()?, force }))
 }
 
 #[napi]

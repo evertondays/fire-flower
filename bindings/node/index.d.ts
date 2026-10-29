@@ -13,6 +13,11 @@ export interface OpenOptions {
   blockCacheBytes?: number;
   /** Abre só para leitura, ao lado do processo que grava. */
   readOnly?: boolean;
+  /**
+   * Com readOnly: confere a pasta a cada `refreshMs` e reabre se o banco
+   * mudou (outro processo gravou), no pool de threads.
+   */
+  refreshMs?: number;
   /** Cria o banco se a pasta não tiver um (padrão: sim; nunca com readOnly). */
   createIfMissing?: boolean;
   /** Liga as métricas do motor (ver `engine.metrics()`). */
@@ -104,6 +109,8 @@ export declare class Engine implements Disposable {
   deleteSync(ids: Iterable<number>): IndexResult;
   writer(options?: { batchSize?: number }): Writer;
   compact(): Promise<CompactResult>;
+  /** Reabre já se o banco mudou (readOnly com refreshMs); resolve se reabriu. */
+  refresh(): Promise<boolean>;
 
   contains(id: number): boolean;
   stats(): IndexStats;

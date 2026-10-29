@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
-use fire_flower::{Config, Engine};
+use fire_flower::{Config, Engine, Reader};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::convert::OpenOptions;
-use crate::handle::NewHandle;
+use crate::convert::{Mode, OpenOptions};
+use crate::handle::{Backend, NewHandle};
 use crate::tasks::OpenTask;
 
 mod convert;
@@ -26,36 +27,63 @@ mod tasks;
 /// Abre o banco fora do event loop (dezenas de ms num banco grande).
 #[napi(catch_unwind)]
 pub fn open_engine(path: String, options: Option<OpenOptions>) -> Result<AsyncTask<OpenTask>> {
-    let (config, read_only) = convert::config(options.unwrap_or_default())?;
-    Ok(AsyncTask::new(OpenTask { path: PathBuf::from(path), config, read_only }))
+    let (config, mode) = convert::config(options.unwrap_or_default())?;
+    Ok(AsyncTask::new(OpenTask { path: PathBuf::from(path), config, mode }))
 }
 
 /// Como [`open_engine`], na hora (scripts, testes).
 #[napi(catch_unwind)]
 pub fn open_engine_sync(path: String, options: Option<OpenOptions>) -> Result<NewHandle> {
-    let (config, read_only) = convert::config(options.unwrap_or_default())?;
-    Ok(NewHandle(open_shared(Path::new(&path), config, read_only).map_err(js_error)?))
+    let (config, mode) = convert::config(options.unwrap_or_default())?;
+    Ok(NewHandle(open_shared(Path::new(&path), config, mode).map_err(js_error)?))
 }
 
-/// Os bancos abertos neste processo, por (caminho, só leitura). Abrir de novo
-/// o mesmo caminho devolve o mesmo `Engine`: as `worker_threads` compartilham
-/// o índice e o block cache (o addon é carregado uma vez por processo), e o
-/// segundo `open` para escrita não esbarra no `LOCK` do primeiro. A config da
-/// primeira abertura vale para as seguintes.
+/// Os bancos abertos neste processo, por (caminho, modo). Abrir de novo o
+/// mesmo caminho devolve o mesmo `Engine` (ou `Reader`): as `worker_threads`
+/// compartilham o índice e o block cache (o addon é carregado uma vez por
+/// processo), e o segundo `open` para escrita não esbarra no `LOCK` do
+/// primeiro. A config da primeira abertura vale para as seguintes.
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
-type Registry = Mutex<HashMap<(PathBuf, bool), Weak<Engine>>>;
+type Registry = Mutex<HashMap<(PathBuf, Mode), Shared>>;
 
-pub(crate) fn open_shared(path: &Path, config: Config, read_only: bool) -> fire_flower::Result<Arc<Engine>> {
-    let key = (std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()), read_only);
-    let mut open = REGISTRY.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(engine) = open.get(&key).and_then(Weak::upgrade) {
-        return Ok(engine);
+enum Shared {
+    Engine(Weak<Engine>),
+    Reader(Weak<Reader>),
+}
+
+impl Shared {
+    fn upgrade(&self) -> Option<Backend> {
+        match self {
+            Shared::Engine(e) => e.upgrade().map(Backend::Engine),
+            Shared::Reader(r) => r.upgrade().map(Backend::Reader),
+        }
     }
-    let engine = Arc::new(if read_only { Engine::open_read_only(path, config)? } else { Engine::open(path, config)? });
-    open.retain(|_, e| e.strong_count() > 0);
-    open.insert(key, Arc::downgrade(&engine));
-    Ok(engine)
+}
+
+pub(crate) fn open_shared(path: &Path, config: Config, mode: Mode) -> fire_flower::Result<Backend> {
+    let key = (std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()), mode);
+    let mut open = REGISTRY.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(backend) = open.get(&key).and_then(Shared::upgrade) {
+        return Ok(backend);
+    }
+    let (backend, shared) = match mode {
+        Mode::Write => {
+            let e = Arc::new(Engine::open(path, config)?);
+            (Backend::Engine(Arc::clone(&e)), Shared::Engine(Arc::downgrade(&e)))
+        }
+        Mode::ReadOnly => {
+            let e = Arc::new(Engine::open_read_only(path, config)?);
+            (Backend::Engine(Arc::clone(&e)), Shared::Engine(Arc::downgrade(&e)))
+        }
+        Mode::Refreshing(ms) => {
+            let r = Arc::new(Reader::open(path, config, Duration::from_millis(u64::from(ms)))?);
+            (Backend::Reader(Arc::clone(&r)), Shared::Reader(Arc::downgrade(&r)))
+        }
+    };
+    open.retain(|_, s| s.upgrade().is_some());
+    open.insert(key, shared);
+    Ok(backend)
 }
 
 /// Um erro do core para o JS: a mensagem começa pelo código estável

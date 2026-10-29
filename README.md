@@ -339,6 +339,20 @@ Outro processo pode ler o mesmo banco enquanto este grava, sem travá-lo:
 let reader = Engine::open_read_only("/tmp/indice", Config::reader())?;
 ```
 
+Para acompanhar quem grava (vários workers do PHP-FPM, um cluster do Node, um
+serviço de busca ao lado do indexador), o `Reader` reabre sozinho quando o
+banco muda. Ele percebe a mudança pelo WAL e pelo MANIFEST do RocksDB, uma
+listagem da pasta no máximo a cada intervalo, sem custo para quem grava.
+
+```rust
+use std::time::Duration;
+use fire_flower::Reader;
+
+let reader = Reader::open("/tmp/indice", Config::reader(), Duration::from_secs(1))?;
+reader.refresh()?;                        // reabre se o banco mudou (no máximo 1×/s)
+let hits = reader.engine().search_top("coração", 10)?;
+```
+
 Métricas (ver [Monitoramento](#monitoramento)): com `Config::metrics`, o
 motor conta consultas, commits, edições, remoções e compactações (somas
 atômicas num contador da própria thread: ~7 ns por consulta) e grava o

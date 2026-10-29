@@ -80,11 +80,18 @@ function toQuery(query) {
 
 class Engine {
   /** @param {object} handle o handle nativo (External) */
-  constructor(handle) {
+  constructor(handle, options) {
     this.#h = handle;
+    const ms = options?.readOnly ? options.refreshMs : undefined;
+    if (ms !== undefined) {
+      // Confere a pasta no pool de threads; não segura o processo vivo.
+      this.#timer = setInterval(() => native.refresh(this.#h, false).catch(() => {}), ms);
+      this.#timer.unref?.();
+    }
   }
 
   #h;
+  #timer;
   /** O buffer de trabalho da busca síncrona e dos rótulos (cresce com k). */
   #scratch = new Float64Array(1 + 2 * DEFAULT_K);
 
@@ -95,19 +102,23 @@ class Engine {
 
   /** Abre fora do event loop. O mesmo caminho devolve o mesmo banco nativo. */
   static async open(path, options) {
+    let handle;
     try {
-      return new Engine(await native.openEngine(path, options));
+      handle = await native.openEngine(path, options);
     } catch (e) {
       rethrow(e);
     }
+    return new Engine(handle, options);
   }
 
   static openSync(path, options) {
+    let handle;
     try {
-      return new Engine(native.openEngineSync(path, options));
+      handle = native.openEngineSync(path, options);
     } catch (e) {
       rethrow(e);
     }
+    return new Engine(handle, options);
   }
 
   /** Busca ranqueada (BM25) na hora: o caminho rápido. */
@@ -270,8 +281,18 @@ class Engine {
     return native.isClosed(this.#h);
   }
 
+  /** Reabre já, se o banco mudou (com `readOnly` e `refreshMs`). */
+  async refresh() {
+    try {
+      return await native.refresh(this.#h, true);
+    } catch (e) {
+      rethrow(e);
+    }
+  }
+
   /** Solta o handle; o banco fecha quando o último handle do processo soltar. */
   close() {
+    if (this.#timer !== undefined) clearInterval(this.#timer);
     native.close(this.#h);
   }
 

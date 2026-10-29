@@ -31,6 +31,8 @@ serde.workspace = true
 serde_json.workspace = true
 rustc-hash = "2.1"
 rust-stemmers = "1.2"
+# O `Reader` troca a instância só leitura sem trava na leitura.
+arc-swap = "1"
 
 [features]
 default = ["metrics"]

@@ -24,12 +24,18 @@ pub enum Error {
     /// O banco foi fechado (usado pelos bindings, onde um handle fechado
     /// ainda pode ser chamado).
     Closed,
+    /// O ID externo já pertence a outro documento
+    /// ([`IndexBatch::set_external_id`](crate::IndexBatch::set_external_id)).
+    Duplicate(String),
+    /// ID externo vazio ou longo demais (mais de
+    /// [`MAX_EXTERNAL_ID_BYTES`](crate::MAX_EXTERNAL_ID_BYTES) bytes).
+    InvalidId(String),
 }
 
 impl Error {
     /// Código estável do erro, para os bindings e para quem decide pelo tipo:
     /// `FF_DB`, `FF_CORRUPT`, `FF_CONFIG`, `FF_OPEN`, `FF_READ_ONLY`,
-    /// `FF_BUSY` ou `FF_CLOSED`.
+    /// `FF_BUSY`, `FF_CLOSED`, `FF_DUPLICATE` ou `FF_INVALID_ID`.
     pub fn code(&self) -> &'static str {
         match self {
             Error::Db(_) => "FF_DB",
@@ -39,6 +45,8 @@ impl Error {
             Error::ReadOnly => "FF_READ_ONLY",
             Error::Busy => "FF_BUSY",
             Error::Closed => "FF_CLOSED",
+            Error::Duplicate(_) => "FF_DUPLICATE",
+            Error::InvalidId(_) => "FF_INVALID_ID",
         }
     }
 }
@@ -53,6 +61,8 @@ impl std::fmt::Display for Error {
             Error::ReadOnly => write!(f, "banco aberto só para leitura: abra com Engine::open para gravar"),
             Error::Busy => write!(f, "outro lote está aberto: faça commit dele ou tente de novo"),
             Error::Closed => write!(f, "o banco foi fechado"),
+            Error::Duplicate(msg) => write!(f, "ID externo repetido: {msg}"),
+            Error::InvalidId(msg) => write!(f, "ID externo inválido: {msg}"),
         }
     }
 }

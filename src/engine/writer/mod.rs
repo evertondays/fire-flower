@@ -21,7 +21,10 @@ use crate::engine::writer::documents::Norms;
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
 mod documents;
+mod external;
 pub(super) mod trie;
+
+pub(super) use self::external::ExternalIds;
 
 #[derive(Default)]
 pub(crate) struct WriterState {
@@ -38,6 +41,9 @@ pub(crate) struct WriterState {
     /// Documento → ID interno da última versão, para os que já mudaram
     /// (`ver:`; ver `versions`).
     pub(super) latest: FxHashMap<DocId, u64>,
+    /// O banco tem algum ID externo (`xid:`). Sem nenhum, remover não
+    /// precisa procurar o ID externo do documento.
+    pub(super) has_external_ids: bool,
 }
 
 /// O estado do único escritor. O lote o pega para si ([`WriterSlot::take`]) e
@@ -145,6 +151,8 @@ pub struct IndexBatch<'a> {
     /// Algum documento apareceu em mais de uma operação do lote.
     pub(super) repeated: bool,
     pub(super) labels: Vec<(DocId, String)>,
+    /// IDs externos mudados no lote (ver `external`).
+    pub(super) external: ExternalIds,
     pub(super) analyzer: Analyzer,
 }
 
@@ -486,6 +494,7 @@ impl IndexBatch<'_> {
         self.write_versions(&mut wb, &versions, &mut stats);
         let (index, blocks) = self.write_lengths(&mut wb, &finals, &versions, &mut norms, &mut stats)?;
         self.write_labels(&mut wb, &finals);
+        self.write_external_ids(&mut wb, &finals)?;
         documents_secs += t.elapsed();
         stats.documents_secs = documents_secs.as_secs_f64();
 

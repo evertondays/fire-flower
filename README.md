@@ -166,6 +166,17 @@ como rótulo. Um `id` que já existe é substituído, e uma linha
 `{"op": "delete", "id": 42}` remove o documento. No `index` de arquivos, o
 título é o nome do arquivo sem a extensão.
 
+Cada linha pode trazer também um **ID externo** (`"external_id"`, texto ou
+número): a chave do seu sistema para aquele documento (um link, um número, um
+UUID). Ele volta nas buscas e é único: sem `id`, a linha é achada pelo ID
+externo (substitui o documento dele, ou cria um novo com ID automático), e
+`{"op": "delete", "external_id": "…"}` remove por ele. Para usar outro campo
+da linha, `--external-id-field url` (na Wikipédia, o link do artigo):
+
+```bash
+./target/release/fire-flower index-jsonl --external-id-field url ~/bench-db/ptwiki-full ~/datasets/ptwiki/ptwiki.jsonl
+```
+
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
 usa. Com `--no-positions` (em `index`, `index-jsonl` e
 `scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
@@ -198,7 +209,8 @@ Busca e autocompletar sem interface, para scripts:
 ./target/release/fire-flower search /tmp/indice "coração bras*"
 ```
 
-A saída é `nota  id  rótulo`, da nota maior para a menor. `--by-id` lista
+A saída é `nota  id  rótulo  ID externo` (separados por tab; o ID externo
+só aparece em quem tem), da nota maior para a menor. `--by-id` lista
 todos os documentos em ordem de ID, sem ranking. Frases vão entre aspas
 simples no shell:
 
@@ -208,6 +220,16 @@ simples no shell:
 
 ```bash
 ./target/release/fire-flower suggest /tmp/indice prog 10
+```
+
+Remover pelo ID ou pelo ID externo:
+
+```bash
+./target/release/fire-flower delete /tmp/indice 42 43
+```
+
+```bash
+./target/release/fire-flower delete /tmp/indice --external-ids https://exemplo.com/a 550e8400-e29b-41d4-a716-446655440000
 ```
 
 ### Monitoramento
@@ -308,6 +330,32 @@ guardado num objeto e fazer commit em outra thread. `labels(&ids)` lê os
 rótulos de vários documentos num só `MultiGet`. Todo erro tem um código
 estável (`Error::code()`: `FF_BUSY`, `FF_OPEN`, `FF_READ_ONLY`…).
 
+**IDs externos:** cada documento pode ter a chave do seu sistema (um link,
+um número, um UUID; até 512 bytes). Ela é única no banco, volta com os
+resultados e acha o documento para substituir ou remover:
+
+```rust
+let mut batch = engine.batch();
+// Substitui o documento desse ID, ou cria um novo com DocId automático.
+let doc = batch.add_with_external_id("https://exemplo.com/a", "Título", "texto")?;
+batch.set_external_id(7, "550e8400-e29b-41d4-a716-446655440000")?; // num DocId seu
+batch.commit()?;
+
+let hits = engine.search_top("texto", 10)?;
+let docs: Vec<u64> = hits.iter().map(|h| h.doc).collect();
+let ids = engine.external_ids(&docs)?; // Vec<Option<String>>, num só MultiGet
+assert_eq!(engine.doc_by_external_id("https://exemplo.com/a")?, Some(doc));
+
+let mut batch = engine.batch();
+batch.delete_by_external_id("https://exemplo.com/a")?; // também libera o ID
+batch.commit()?;
+```
+
+Dar a um documento um ID que já é de outro é `Error::Duplicate`
+(`FF_DUPLICATE`); um ID vazio ou longo demais, `Error::InvalidId`
+(`FF_INVALID_ID`). Remover um documento libera o ID dele (vale a última
+operação do lote, como o rótulo), e substituir pelo `DocId` mantém o ID.
+
 ```rust
 use std::sync::Arc;
 
@@ -364,6 +412,8 @@ substituição ou readição (a busca devolve o ID do usuário).
 | `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições); o título vem primeiro e o texto começa 100 posições depois |
 | `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco`, e o do título |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
+| `ext:<id>` | ID externo do documento (a chave do usuário: link, número, UUID) |
+| `xid:<ID externo>` | o documento dono do ID externo (o índice reverso, para achar e remover por ele) |
 | `ver:<id>` | ID interno da última versão do documento, só para os que já foram substituídos ou removidos |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |

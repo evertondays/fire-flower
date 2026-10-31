@@ -174,10 +174,17 @@ impl App {
             .into_iter()
             .map(|hit| {
                 let label = self.label(hit.doc).unwrap_or_else(|| "(sem rótulo)".into());
+                // O ID externo vai no fim, apagado e curto: o rótulo é o que se lê.
+                let external = self
+                    .external_id(hit.doc)
+                    .map(|e| format!("  {}", truncate_left(&e, (label_width / 3).max(12))))
+                    .unwrap_or_default();
+                let rest = label_width.saturating_sub(external.chars().count());
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{:>id_width$} ", hit.doc), Style::new().fg(MUTED)),
                     Span::styled(format!("{:>6.2} ", hit.score), Style::new().fg(ACCENT)),
-                    Span::raw(truncate_left(&label, label_width)),
+                    Span::raw(truncate_left(&label, rest)),
+                    Span::styled(external, Style::new().fg(MUTED)),
                 ]))
             })
             .collect();
@@ -211,7 +218,10 @@ impl App {
 
     fn draw_reader(&mut self, frame: &mut Frame, area: Rect) {
         let doc = self.results.get(self.selected).map(|h| h.doc);
-        let label = doc.and_then(|d| self.label(d)).unwrap_or_default();
+        let mut label = doc.and_then(|d| self.label(d)).unwrap_or_default();
+        if let Some(external) = doc.and_then(|d| self.external_id(d)) {
+            label = format!("{label} · {external}");
+        }
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(ACCENT))

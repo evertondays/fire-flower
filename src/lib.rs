@@ -34,8 +34,8 @@ mod error;
 pub mod query;
 
 pub use engine::{
-    CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, Maintenance,
-    MaintenanceOptions, OwnedBatch,
+    CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, MAX_EXTERNAL_ID_BYTES,
+    Maintenance, MaintenanceOptions, OwnedBatch,
 };
 pub use error::{Error, Result};
 

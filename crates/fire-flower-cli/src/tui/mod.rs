@@ -92,6 +92,8 @@ struct App {
     elapsed: Duration,
     error: Option<String>,
     labels: HashMap<DocId, Option<String>>,
+    /// IDs externos já lidos, como os rótulos.
+    external_ids: HashMap<DocId, Option<String>>,
     preview: Option<Preview>,
     /// `Some(rolagem)` quando o documento está aberto em tela cheia.
     reader: Option<usize>,
@@ -131,6 +133,7 @@ impl App {
             elapsed: Duration::ZERO,
             error: None,
             labels: HashMap::new(),
+            external_ids: HashMap::new(),
             preview: None,
             reader: None,
             quit: false,
@@ -147,6 +150,7 @@ impl App {
                 self.engine = engine;
                 self.opened = Instant::now();
                 self.labels.clear();
+                self.external_ids.clear();
                 self.preview = None;
             }
             Err(e) => self.error = Some(format!("ao reabrir: {e}")),
@@ -320,6 +324,11 @@ impl App {
     fn label(&mut self, doc: DocId) -> Option<String> {
         let engine = &self.engine;
         self.labels.entry(doc).or_insert_with(|| engine.label(doc).ok().flatten()).clone()
+    }
+
+    fn external_id(&mut self, doc: DocId) -> Option<String> {
+        let engine = &self.engine;
+        self.external_ids.entry(doc).or_insert_with(|| engine.external_id(doc).ok().flatten()).clone()
     }
 
     fn ensure_preview(&mut self) {

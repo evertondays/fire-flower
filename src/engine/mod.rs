@@ -8,6 +8,8 @@
 //! - `norm:<bloco>` -> tamanho de cada documento (e do título) com `id ÷ 1024 = bloco`
 //! - `doc:<id>`     -> rótulo opcional do documento (ex.: caminho do arquivo)
 //! - `ver:<id>`     -> ID interno da última versão de um documento que já mudou
+//! - `ext:<id>`     -> ID externo do documento (a chave do usuário; ver `external`)
+//! - `xid:<ID externo>` -> o documento dono do ID externo
 //! - `stem:<radical>` -> nós das palavras com esse radical (só com flexões na consulta)
 //! - `meta:*`       -> formato, contadores de ID, estatísticas, idiomas, stemming e mortos
 //!
@@ -35,7 +37,7 @@ use crate::engine::metrics::sampler::Sampler;
 use crate::engine::purge::Purge;
 use crate::engine::versions::Deaths;
 use crate::engine::view::View;
-use crate::engine::writer::{EngineRef, WriterSlot, WriterState};
+use crate::engine::writer::{EngineRef, ExternalIds, WriterSlot, WriterState};
 use crate::query::{Clause, parse_query_stemmed};
 
 mod cache;
@@ -43,6 +45,7 @@ mod config;
 mod conjunction;
 mod diagnostics;
 mod empty_words;
+mod external;
 mod maintenance;
 mod groups;
 mod keys;
@@ -64,6 +67,7 @@ mod tests;
 
 pub use self::config::{Config, InflectionMode};
 pub use self::empty_words::CompactStats;
+pub use self::external::MAX_EXTERNAL_ID_BYTES;
 pub use self::maintenance::{Maintenance, MaintenanceOptions};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
@@ -211,6 +215,7 @@ impl Engine {
             last_op: FxHashMap::default(),
             repeated: false,
             labels: Vec::new(),
+            external: ExternalIds::default(),
             analyzer,
         }
     }
@@ -356,19 +361,7 @@ impl Engine {
     /// não tem), num único `MultiGet`: mostrar os 10 primeiros resultados de
     /// uma busca custa uma leitura em lote, não 10.
     pub fn labels(&self, docs: &[DocId]) -> Result<Vec<Option<String>>> {
-        if docs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let cf = self
-            .db
-            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
-            .ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
-        let keys: Vec<Key> = docs.iter().map(|&doc| Key::new(DOC, doc)).collect();
-        self.db
-            .batched_multi_get_cf(cf, keys.iter().map(|k| k.as_ref()), false)
-            .into_iter()
-            .map(|value| Ok(value?.map(|v| String::from_utf8_lossy(&v).into_owned())))
-            .collect()
+        self.multi_get_strings(DOC, docs)
     }
 
     /// Percorre os rótulos de todos os documentos (`f(documento, rótulo)`),

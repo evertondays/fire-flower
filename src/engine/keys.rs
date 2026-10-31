@@ -52,6 +52,12 @@ pub(super) const DOC: &[u8] = b"doc:";
 /// `ver:<doc>`: o ID interno da última versão do documento, se ele já mudou.
 pub(super) const VER: &[u8] = b"ver:";
 
+/// `ext:<doc>`: o ID externo do documento (ver `external`).
+pub(super) const EXT: &[u8] = b"ext:";
+
+/// `xid:<ID externo>`: o documento dono do ID externo (o índice reverso).
+pub(super) const XID: &[u8] = b"xid:";
+
 /// Chave `<prefixo><número>` montada na pilha: o laço do commit monta uma
 /// por termo, e `format!` alocaria uma `String` a cada vez.
 pub(super) struct Key {
@@ -87,4 +93,9 @@ impl AsRef<[u8]> for Key {
 /// `stem:<radical>`.
 pub(super) fn stem_key(stem: &str) -> Vec<u8> {
     [STEM, stem.as_bytes()].concat()
+}
+
+/// `xid:<ID externo>`.
+pub(super) fn xid_key(external_id: &str) -> Vec<u8> {
+    [XID, external_id.as_bytes()].concat()
 }

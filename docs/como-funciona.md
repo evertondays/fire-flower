@@ -244,6 +244,8 @@ prefixo na chave:
 | `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco, e o do título | `norm:0` = documentos 0 a 1023 |
 | `doc:<id>` | rótulo do documento (a CLI grava o caminho do arquivo) | `doc:42` → `/home/.../notas.txt` |
 | `ver:<id>` | o ID interno da última versão do documento, só para os que já foram substituídos ou removidos (seção 5.6) | `ver:2` → 2^63 + 2 |
+| `ext:<id>` | o ID externo do documento: a chave do usuário (seção 5.7) | `ext:42` → `https://exemplo.com/a` |
+| `xid:<ID externo>` | o documento dono do ID externo, o índice reverso (seção 5.7) | `xid:https://exemplo.com/a` → 42 |
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
@@ -652,6 +654,7 @@ Um único `WriteBatch` com:
 | cada documento que mudou de versão | `put ver:<id>` | só substituições e remoções (seção 5.6) |
 | versões que morreram | `merge meta:dead` | idem |
 | cada rótulo | `put doc:<id>` | `delete` numa remoção |
+| cada ID externo que mudou | `put`/`delete` `ext:<id>` e `xid:<ID>` | só com IDs externos (seção 5.7) |
 | contadores e estatísticas | `put meta:*` | `doc_count`, `total_len` e o número do commit incluídos |
 
 Os blocos de `norm:` são lidos no começo do commit (com IDs crescentes, um ou
@@ -774,6 +777,39 @@ compactação serve para recuperar espaço e acertar o df e o autocompletar.
 
 No mesmo lote, a última operação de cada documento vence: adicionar e remover
 não grava nada, e reindexar duas vezes vale o segundo texto inteiro.
+
+### 5.7 IDs externos
+
+Quem indexa um texto quase sempre já tem um identificador para ele: o link
+do artigo, o número de uma linha numa tabela, um UUID. O `DocId` é um número
+do motor (até 2^40 − 1); o **ID externo** é a chave do usuário, qualquer texto
+de até 512 bytes, guardada em duas chaves:
+
+- `ext:<doc>` → o ID externo, para devolver junto com os resultados
+  (`Engine::external_ids(&docs)`, um `MultiGet` para os *k* primeiros);
+- `xid:<ID externo>` → o `DocId`, para achar o documento pelo ID do usuário
+  (`doc_by_external_id`, `add_with_external_id`, `delete_by_external_id`).
+
+O ID é **único**: dar a um documento o ID de outro é `Error::Duplicate`. O lote
+guarda as mudanças por cima do banco (ID → dono, documento → ID) e as resolve
+no commit, no mesmo `WriteBatch` das listas: buscas nunca veem um documento
+sem o ID que o lote deu a ele, nem um ID apontando para um documento que o
+mesmo commit removeu.
+
+As regras seguem as do rótulo e as da seção 5.6:
+
+- `add_with_external_id` substitui o documento dono do ID (mesmo `DocId`), ou
+  cria um novo com o próximo `DocId` livre;
+- remover o documento (pelo `DocId` ou pelo ID externo) libera o ID dele, se
+  a última operação do documento no lote for a remoção; um dono removido
+  antes no mesmo lote já não segura o ID, e quem o pega depois é outro
+  documento;
+- substituir pelo `DocId` (`add_titled`) mantém o ID; as versões internas
+  não mexem nos IDs externos, que apontam para o `DocId` do usuário.
+
+Num banco sem nenhum ID externo, nada disso custa: o escritor sabe na
+abertura se existe alguma chave `xid:`, e só então o commit procura o ID dos
+documentos removidos.
 
 ---
 
@@ -1215,7 +1251,8 @@ src/
 │   ├── open.rs         abrir para leitura e escrita ou só leitura; opções do RocksDB
 │   ├── reader.rs       Reader: só leitura que reabre quando o banco muda
 │   ├── config.rs       Config
-│   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, ver:, stem:, meta:)
+│   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, ver:, ext:, xid:, stem:, meta:)
+│   ├── external.rs     IDs externos: leitura (external_ids, doc_by_external_id) e validação
 │   ├── meta.rs         formato, idiomas e stemming gravados
 │   ├── cache.rs        EpochCache: nós e blocos de tamanhos compartilhados entre buscas
 │   ├── versions.rs     IDs internos de versão: mortos (Deaths) e tradução para o ID do usuário
@@ -1233,7 +1270,7 @@ src/
 │   │                   thread amostradora (sampler.rs)
 │   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
 │   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); versões,
-│                       tamanhos e rótulos (documents.rs)
+│                       tamanhos e rótulos (documents.rs); IDs externos (external.rs)
 crates/fire-flower-cli/ a CLI (outro crate do workspace: só ela depende de clap e ratatui)
 └── src/
     ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest, monitor

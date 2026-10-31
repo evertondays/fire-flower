@@ -53,7 +53,9 @@ enum Command {
         metrics: MetricsArgs,
     },
     /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia).
-    /// Um ID que já existe é substituído; {"op": "delete", "id"} remove
+    /// Um ID que já existe é substituído; {"op": "delete", "id"} remove. O
+    /// campo "external_id" (texto ou número) é o ID do usuário, devolvido nas
+    /// buscas; sem "id", o documento é achado ou criado por ele
     IndexJsonl {
         /// Pasta do banco (criada se não existir)
         db: PathBuf,
@@ -68,6 +70,9 @@ enum Command {
         /// Emite o progresso como JSON na saída padrão
         #[arg(long)]
         progress_json: bool,
+        /// Campo da linha com o ID externo, se não for "external_id" (ex.: url)
+        #[arg(long)]
+        external_id_field: Option<String>,
         #[command(flatten)]
         languages: LanguageArgs,
         #[command(flatten)]
@@ -77,11 +82,14 @@ enum Command {
         #[command(flatten)]
         metrics: MetricsArgs,
     },
-    /// Remove documentos pelo ID
+    /// Remove documentos pelo ID (ou pelo ID externo, com --external-ids)
     Delete {
         db: PathBuf,
-        #[arg(required = true)]
+        #[arg(required_unless_present = "external_ids")]
         ids: Vec<u64>,
+        /// IDs externos dos documentos a remover
+        #[arg(long, num_args = 1..)]
+        external_ids: Vec<String>,
     },
     /// Compacta o banco: une os pedaços pendentes das listas de documentos,
     /// tira delas as versões de documentos substituídos ou removidos, e tira
@@ -221,8 +229,19 @@ fn main() -> ExitCode {
             let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
             index(&db, &paths, sync, creation, metrics)
         }
-        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming, metrics } => {
-            let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
+        Command::IndexJsonl {
+            db,
+            file,
+            batch,
+            skip,
+            progress_json,
+            external_id_field,
+            languages,
+            positions,
+            stemming,
+            metrics,
+        } => {
+            let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json, external_id_field };
             let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
             open(&db, creation, metrics).and_then(|engine| {
                 if !progress_json {
@@ -233,7 +252,7 @@ fn main() -> ExitCode {
                 jsonl::index(&engine, &file, &opts)
             })
         }
-        Command::Delete { db, ids } => delete(&db, &ids),
+        Command::Delete { db, ids, external_ids } => delete(&db, &ids, &external_ids),
         Command::Compact { db, metrics } => open_existing(&db, metrics).and_then(|engine| {
             let started = Instant::now();
             let stats = engine.compact()?;
@@ -293,14 +312,19 @@ fn open(db: &Path, creation: Creation, metrics: MetricsArgs) -> Result<Engine, B
     Ok(Engine::open(db, metrics.apply(config))?)
 }
 
-fn delete(db: &Path, ids: &[u64]) -> AnyResult {
+fn delete(db: &Path, ids: &[u64], external_ids: &[String]) -> AnyResult {
     let engine = open_existing(db, MetricsArgs { metrics: false, metrics_file: None })?;
     let mut batch = engine.batch();
     for &id in ids {
         batch.delete_document(id)?;
     }
+    // Um ID externo sem documento conta como "não existia".
+    for external in external_ids {
+        batch.delete_by_external_id(external)?;
+    }
     let stats = batch.commit_with_stats()?;
-    println!("{} documento(s) removido(s), {} não existia(m)", stats.deleted, ids.len() - stats.deleted);
+    let asked = ids.len() + external_ids.len();
+    println!("{} documento(s) removido(s), {} não existia(m)", stats.deleted, asked.saturating_sub(stats.deleted));
     Ok(())
 }
 
@@ -406,12 +430,18 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
     };
     let elapsed = started.elapsed();
 
+    // Rótulo e ID externo de todos os resultados: dois MultiGet.
     let docs: Vec<u64> = hits.iter().map(|(doc, _)| *doc).collect();
-    for ((doc, score), label) in hits.iter().zip(engine.labels(&docs)?) {
+    let labels = engine.labels(&docs)?;
+    let external_ids = engine.external_ids(&docs)?;
+    for (((doc, score), label), external) in hits.iter().zip(labels).zip(external_ids) {
         let score = score.map(|s| format!("{s:.3}\t")).unwrap_or_default();
-        match label {
-            Some(label) => println!("{score}{doc}\t{label}"),
-            None => println!("{score}{doc}"),
+        // Colunas: [nota] documento [rótulo] [ID externo]; o rótulo fica vazio se só houver o ID.
+        match (label, external) {
+            (Some(label), Some(external)) => println!("{score}{doc}\t{label}\t{external}"),
+            (None, Some(external)) => println!("{score}{doc}\t\t{external}"),
+            (Some(label), None) => println!("{score}{doc}\t{label}"),
+            (None, None) => println!("{score}{doc}"),
         }
     }
     if total > hits.len() {

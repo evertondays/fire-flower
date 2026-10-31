@@ -6,6 +6,7 @@ use fire_flower::{Config, Engine, Posting};
 mod concurrency;
 mod edit_model;
 mod editing;
+mod external_ids;
 mod indexing;
 #[cfg(feature = "metrics")]
 mod metrics;

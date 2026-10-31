@@ -14,6 +14,7 @@ use crate::analysis::stem::Stemmer;
 use crate::analysis::stopwords::Stopwords;
 use crate::engine::cache::EpochCache;
 use crate::engine::config::Config;
+use crate::engine::external;
 use crate::engine::keys::{
     MERGE_OPERATOR, META_DOC_COUNT, META_EPOCH, META_INFLECTIONS, META_NEXT_DOC, META_NEXT_NODE, META_STEMMING,
     META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
@@ -176,6 +177,7 @@ impl Engine {
             cache: NodeCache::default(),
             analyzer: Analyzer::default(),
             latest: loaded.latest,
+            has_external_ids: external::any_external_ids(&db)?,
         });
         let db = Arc::new(db);
         let opened_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());

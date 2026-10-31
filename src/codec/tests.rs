@@ -1,13 +1,15 @@
 //! Testes dos formatos.
 
 use crate::{DocId, Posting};
+use std::collections::BTreeMap;
+
 use crate::codec::{
-    DocLens, NormBlock, PositionsCursor, PostingsCursor, SKIP_BLOCK, TrieNode, decode_docs,
-    decode_node_set, decode_positions, decode_postings, encode_node_set, encode_positions_into,
-    encode_postings, get_varint, list_len, merge_node_sets, merge_positions, merge_postings,
+    DeadBits, DocLens, ListKind, NormBlock, PositionsCursor, PostingsCursor, SKIP_BLOCK, TrieNode, decode_docs,
+    decode_docs_except, decode_node_set, decode_positions, decode_postings, decode_postings_except, encode_node_set,
+    encode_positions_into, encode_postings, get_varint, list_len, merge_lists, merge_node_sets, merge_positions,
+    merge_postings, purge_list,
 };
 use crate::codec::list::ListHeader;
-use crate::codec::merge::merge_lists;
 use crate::codec::positions::encode_positions_with;
 
 #[test]
@@ -210,11 +212,11 @@ fn merge_is_associative() {
         assert_eq!(decode_positions(&all_pos).unwrap(), want_pos);
         // Agrupando em dois: primeiro os `split` mais antigos, depois o resto.
         let split = next(pieces.len() as u64 + 1) as usize;
-        for (lists, full, positions) in [(&post, &all_post, false), (&pos, &all_pos, true)] {
+        for (lists, full, kind) in [(&post, &all_post, ListKind::Postings), (&pos, &all_pos, ListKind::Positions)] {
             let slices: Vec<&[u8]> = lists.iter().map(Vec::as_slice).collect();
-            let left = merge_lists(slices[..split].iter().copied(), positions).unwrap();
-            let right = merge_lists(slices[split..].iter().copied(), positions).unwrap();
-            let again = merge_lists([left.as_slice(), right.as_slice()].into_iter(), positions).unwrap();
+            let left = merge_lists(slices[..split].iter().copied(), kind, &[]).unwrap();
+            let right = merge_lists(slices[split..].iter().copied(), kind, &[]).unwrap();
+            let again = merge_lists([left.as_slice(), right.as_slice()].into_iter(), kind, &[]).unwrap();
             assert_eq!(&again, full);
         }
     }
@@ -363,7 +365,13 @@ fn merging_large_lists_rebuilds_the_skip_table() {
     let mut want = full.clone();
     want[500..520].copy_from_slice(&newer);
     assert_eq!(decode_postings(&merged2).unwrap(), want);
-    assert_eq!(merged2, encode_postings(&want));
+    // Por remendo: os blocos que o pedaço novo não toca são copiados, e o
+    // tamanho fica praticamente o da lista original.
+    assert!(merged2.len() <= merged.len() + 16, "{} vs {}", merged2.len(), merged.len());
+    let mut cursor = PostingsCursor::new(&merged2).unwrap();
+    for p in want.iter().step_by(11) {
+        assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p));
+    }
     // Posições também.
     let entries: Vec<(DocId, Vec<u32>)> = full.iter().map(|p| (p.doc, vec![1, 5])).collect();
     let pieces: Vec<Vec<u8>> = [&entries[..300], &entries[300..]]
@@ -423,4 +431,193 @@ fn norm_block_roundtrip_and_updates() {
     assert_eq!(decoded.get(1023), None, "depois do último deslocamento");
     assert_eq!(decoded.len(), 3);
     assert!(NormBlock::decode(&NormBlock::default().encode()).unwrap().is_empty());
+    // Remover devolve os tamanhos e deixa o bloco igual ao decodificado.
+    let mut block = decoded;
+    assert_eq!(block.remove(900), Some(l(7, 0, 0)));
+    assert_eq!(block.remove(900), None, "já removido");
+    assert_eq!(block.remove(3), None, "nunca existiu");
+    assert_eq!(block.len(), 2);
+    assert_eq!(NormBlock::decode(&block.encode()).unwrap(), block);
+    assert_eq!(block.remove(2), Some(l(0, 0, 0)));
+    assert_eq!(block.remove(5), Some(l(40, 2, 5)));
+    assert!(block.is_empty());
+    assert_eq!(block, NormBlock::default());
+}
+
+#[test]
+fn decoding_skips_dead_documents() {
+    let list = sample_list(3000, 5);
+    let bytes = encode_postings(&list);
+    let dead: Vec<DocId> = [0, 1, 777, 2999].iter().map(|&i| list[i].doc).chain([list[2999].doc + 5]).collect();
+    let live: Vec<Posting> = list.iter().copied().filter(|p| !dead.contains(&p.doc)).collect();
+    let bits = |ids: &[DocId]| DeadBits::new(ids);
+    assert_eq!(decode_postings_except(&bytes, &bits(&dead)).unwrap(), live);
+    assert_eq!(decode_docs_except(&bytes, &bits(&dead)).unwrap(), live.iter().map(|p| p.doc).collect::<Vec<_>>());
+    assert_eq!(decode_postings_except(&bytes, &bits(&[])).unwrap(), list);
+    // Mortos que não estão na lista (e da faixa alta) não mudam nada.
+    let mut absent: Vec<DocId> = (0..50).filter(|d| list.iter().all(|p| p.doc != *d)).collect();
+    absent.extend([1 << 63, (1 << 63) + 1000]);
+    assert_eq!(decode_docs_except(&bytes, &bits(&absent)).unwrap(), decode_docs(&bytes).unwrap());
+    // Mapa de bits e lista dos esparsos juntos, consultados em ordem.
+    let mixed = DeadBits::new(&[(1 << 63) + 3, 5, DeadBits::BITMAP_IDS + 7, 64]);
+    let mut cursor = mixed.cursor();
+    let probe = [3, 5, 64, 65, DeadBits::BITMAP_IDS + 7, (1 << 63) + 3, (1 << 63) + 5, u64::MAX];
+    let found: Vec<bool> = probe.iter().map(|&d| cursor.is_dead(d)).collect();
+    assert_eq!(found, [false, true, true, false, true, true, false, false]);
+}
+
+/// O que cada documento tem no termo: tf, tf do título e posições.
+type Model = BTreeMap<DocId, (u32, u32, Vec<u32>)>;
+
+fn encode_model(m: &Model, kind: ListKind) -> Vec<u8> {
+    match kind {
+        ListKind::Postings => {
+            encode_postings(&m.iter().map(|(&d, &(tf, title, _))| pt(d, tf, title)).collect::<Vec<_>>())
+        }
+        ListKind::Positions => pos_bytes(&m.iter().map(|(&d, (_, _, ps))| (d, ps.as_slice())).collect::<Vec<_>>()),
+    }
+}
+
+/// Une `lists` em grupos aleatórios, tirando `purge` em alguns deles e no
+/// fim, como o RocksDB pode fazer entre leituras e compactações (tirar um
+/// morto vale em qualquer merge: o ID não volta).
+fn merge_in_random_groups(
+    lists: &[Vec<u8>],
+    kind: ListKind,
+    purge: &[DocId],
+    next: &mut impl FnMut(u64) -> u64,
+) -> Vec<u8> {
+    let mut level: Vec<Vec<u8>> = lists.to_vec();
+    while level.len() > 1 && next(3) > 0 {
+        let start = next(level.len() as u64) as usize;
+        let end = start + 1 + next((level.len() - start) as u64) as usize;
+        let cut: &[DocId] = if next(2) == 0 { purge } else { &[] };
+        let group = merge_lists(level[start..end].iter().map(Vec::as_slice), kind, cut).unwrap();
+        level.splice(start..end, [group]);
+    }
+    merge_lists(level.iter().map(Vec::as_slice), kind, purge).unwrap()
+}
+
+/// Pedaços aleatórios (bases grandes, pedaços depois do fim e IDs fora de
+/// ordem) e um conjunto de mortos: o merge direto, o merge em grupos e a
+/// limpeza de uma lista já unida dão o mesmo que um `BTreeMap` de referência.
+#[test]
+fn merges_with_purge_match_a_reference_model() {
+    let mut next = rng(0x9E37_79B9_7F4A_7C15);
+    for round in 0..250 {
+        let universe = [20, 300, 3000][round % 3];
+        let mut model = Model::new();
+        let mut pieces = Vec::new();
+        let mut top = 0;
+        for i in 0..1 + next(6) {
+            // O primeiro pedaço costuma ser grande: a base de um termo
+            // frequente. Os outros, quase sempre depois do fim (edições).
+            let size = if i == 0 { next(universe) + 1 } else { next(universe / 10 + 2) + 1 };
+            let from = if i > 0 && next(4) > 0 { top + 1 } else { 0 };
+            let mut docs: Vec<DocId> = (0..size).map(|_| from + next(universe)).collect();
+            docs.sort_unstable();
+            docs.dedup();
+            let piece: Model = docs
+                .into_iter()
+                .map(|d| {
+                    let tf = 1 + next(3) as u32;
+                    let title = if next(4) == 0 { 1 } else { 0 };
+                    (d, (tf, title, (0..tf).map(|k| k * 7 + next(5) as u32).collect()))
+                })
+                .collect();
+            top = top.max(piece.keys().last().copied().unwrap_or(0));
+            model.extend(piece.iter().map(|(&d, v)| (d, v.clone())));
+            pieces.push(piece);
+        }
+        let mut purge: Vec<DocId> = (0..next(universe / 4 + 1)).map(|_| next(top + 2)).collect();
+        purge.sort_unstable();
+        purge.dedup();
+        let live: Model =
+            model.iter().filter(|(d, _)| purge.binary_search(d).is_err()).map(|(&d, v)| (d, v.clone())).collect();
+        let want_post: Vec<Posting> = live.iter().map(|(&d, &(tf, title, _))| pt(d, tf, title)).collect();
+        let want_pos: Vec<(DocId, Vec<u32>)> = live.iter().map(|(&d, (_, _, ps))| (d, ps.clone())).collect();
+        for kind in [ListKind::Postings, ListKind::Positions] {
+            let lists: Vec<Vec<u8>> = pieces.iter().map(|p| encode_model(p, kind)).collect();
+            let direct = merge_lists(lists.iter().map(Vec::as_slice), kind, &purge).unwrap();
+            let grouped = merge_in_random_groups(&lists, kind, &purge, &mut next);
+            let whole = merge_lists(lists.iter().map(Vec::as_slice), kind, &[]).unwrap();
+            let purged = purge_list(&whole, kind, &purge).unwrap().unwrap_or(whole);
+            for list in [&direct, &grouped, &purged] {
+                match kind {
+                    ListKind::Postings => {
+                        assert_eq!(decode_postings(list).unwrap(), want_post, "rodada {round}");
+                        let mut cursor = PostingsCursor::new(list).unwrap();
+                        for p in want_post.iter().step_by(5) {
+                            assert_eq!(cursor.seek(p.doc).unwrap(), Some(*p), "rodada {round}");
+                        }
+                    }
+                    ListKind::Positions => {
+                        assert_eq!(decode_positions(list).unwrap(), want_pos, "rodada {round}");
+                        let mut cursor = PositionsCursor::new(list).unwrap();
+                        let mut out = Vec::new();
+                        for (d, ps) in want_pos.iter().step_by(5) {
+                            assert!(cursor.seek(*d, &mut out).unwrap(), "rodada {round}");
+                            assert_eq!(&out, ps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A limpeza só regrava os blocos que têm um morto: tirar um documento do
+/// meio de uma lista grande mantém os outros blocos iguais, e uma lista sem
+/// nenhum morto fica como está.
+#[test]
+fn purge_copies_untouched_blocks() {
+    let full = sample_list(3000, 21);
+    let base = encode_postings(&full);
+    let gone = full[1500].doc;
+    let purged = purge_list(&base, ListKind::Postings, &[gone]).unwrap().unwrap();
+    let want: Vec<Posting> = full.iter().copied().filter(|p| p.doc != gone).collect();
+    assert_eq!(decode_postings(&purged).unwrap(), want);
+    assert_eq!(merge_lists([base.as_slice()].into_iter(), ListKind::Postings, &[gone]).unwrap(), purged);
+    let before = ListHeader::parse(&base, true).unwrap();
+    let after = ListHeader::parse(&purged, true).unwrap();
+    let untouched = |h: &ListHeader| h.entries.iter().filter(|e| e.count == SKIP_BLOCK as u64).count();
+    assert_eq!(untouched(&after), untouched(&before) - 1, "só o bloco do documento removido muda");
+    assert!(purged.len() < base.len());
+    // Mortos fora da lista (antes, no meio de um vão e depois): nada muda.
+    let absent = [full[0].doc.saturating_sub(1), full[10].doc + 1, full[2999].doc + 100];
+    let absent: Vec<DocId> = absent.into_iter().filter(|d| full.iter().all(|p| p.doc != *d)).collect();
+    assert_eq!(purge_list(&base, ListKind::Postings, &absent).unwrap(), None);
+    assert_eq!(purge_list(&base, ListKind::Postings, &[]).unwrap(), None);
+    // Lista que cai para 256 entradas ou menos perde a tabela.
+    let small = encode_postings(&full[..300]);
+    let docs: Vec<DocId> = full[..60].iter().map(|p| p.doc).collect();
+    let shrunk = purge_list(&small, ListKind::Postings, &docs).unwrap().unwrap();
+    assert!(ListHeader::parse(&shrunk, true).unwrap().blocks.is_empty());
+    assert_eq!(decode_postings(&shrunk).unwrap(), full[60..300]);
+    // Todos mortos: lista vazia (2 bytes), não ausente.
+    let all: Vec<DocId> = full[..3].iter().map(|p| p.doc).collect();
+    assert_eq!(purge_list(&encode_postings(&full[..3]), ListKind::Postings, &all).unwrap(), Some(vec![0, 0]));
+}
+
+/// Uma edição grava a versão nova depois do fim da lista: o merge só
+/// concatena, e a limpeza depois tira a versão velha regravando um bloco.
+#[test]
+fn edits_append_and_purge_rewrites_one_block() {
+    let full = sample_list(3000, 33);
+    let mut pieces: Vec<Vec<u8>> = full.chunks(300).map(encode_postings).collect();
+    let concat = merge_postings(pieces.iter().map(Vec::as_slice)).unwrap();
+    let old = full[1234].doc;
+    let new = Posting { doc: (1 << 63) + 7, ..full[1234] };
+    pieces.push(encode_postings(&[new]));
+    let edited = merge_postings(pieces.iter().map(Vec::as_slice)).unwrap();
+    let mut want = full.clone();
+    want.push(new);
+    assert_eq!(decode_postings(&edited).unwrap(), want);
+    let purged = merge_lists(pieces.iter().map(Vec::as_slice), ListKind::Postings, &[old]).unwrap();
+    want.retain(|p| p.doc != old);
+    assert_eq!(decode_postings(&purged).unwrap(), want);
+    let blocks = |b: &[u8]| ListHeader::parse(b, true).unwrap().entries;
+    let (before, after) = (blocks(&concat), blocks(&purged));
+    assert_eq!(before.len() + 1, after.len(), "a versão nova é um bloco a mais");
+    assert_eq!(before.iter().zip(&after).filter(|(a, b)| a != b).count(), 1, "só o bloco da versão velha muda");
 }

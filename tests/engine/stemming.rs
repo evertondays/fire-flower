@@ -104,12 +104,12 @@ pub(crate) fn database_from_before_stemming_is_off() {
     {
         let engine = open(&dir);
         stem_sample(&engine);
-        engine.compact(); // sem merges pendentes para o RocksDB puro abaixo
+        engine.compact().unwrap(); // sem merges pendentes para o RocksDB puro abaixo
     }
     // Um banco com dados e sem `meta:stemming` é de antes do stemming.
     {
         let mut opts = rocksdb::Options::default();
-        opts.set_merge_operator_associative("fire_flower_v5", |_, _, _| None);
+        opts.set_merge_operator_associative("fire_flower_v7", |_, _, _| None);
         let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
         assert_eq!(db.get(b"meta:stemming").unwrap().as_deref(), Some(&b"none"[..]));
         db.delete(b"meta:stemming").unwrap();
@@ -221,7 +221,7 @@ pub(crate) fn inflections_are_stored_on_creation_and_exclude_stemming() {
     {
         let engine = Engine::open(dir.path(), inflected(InflectionMode::Always)).unwrap();
         inflection_sample(&engine);
-        engine.compact(); // o merge de `stem:` também passa pela compactação
+        engine.compact().unwrap(); // o merge de `stem:` também passa pela compactação
     }
     let engine = Engine::open(dir.path(), Config::default()).unwrap();
     assert!(engine.inflector().is_on());

@@ -40,7 +40,7 @@ pub(crate) fn phrase_search() {
     // Persistem ao reabrir e depois de compactar.
     drop(engine);
     let engine = open(&dir);
-    engine.compact();
+    engine.compact().unwrap();
     assert_eq!(engine.search("\"casa de papel\"").unwrap(), [1, 3]);
 }
 

@@ -9,7 +9,8 @@
 //! cargo run --release --example wiki -- load    --db D --corpus F [--batch N] [--skip K] [--take N] [--remap-ids]
 //! cargo run --release --example wiki -- vocab   --corpus F [--out V]
 //! cargo run --release --example wiki -- queries --vocab V --corpus F [--seed 42]
-//! cargo run --release --example wiki -- oracle  --db D --corpus F [--take N] [--sample-terms N]
+//! cargo run --release --example wiki -- edit    --db D --corpus F --take N [--batch B] [--max-ops M]
+//! cargo run --release --example wiki -- oracle  --db D --corpus F [--take N] [--sample-terms N] [--edits]
 //! cargo run --release --example wiki -- bench   --db D --queries Q... [--threads T] [--cold]
 //! cargo run --release --example wiki -- sizes   --db D
 //! cargo run --release --example wiki -- digest  --db D
@@ -20,6 +21,7 @@ use crate::bench::bench;
 use crate::concurrent::concurrent;
 use crate::corpus::parse_languages;
 use crate::digest::digest;
+use crate::edits::{EditPlanArgs, edit};
 use crate::env::project_dir;
 use crate::load::load;
 use crate::oracle::{OracleArgs, oracle};
@@ -39,6 +41,7 @@ mod bench;
 mod concurrent;
 mod corpus;
 mod digest;
+mod edits;
 mod env;
 mod load;
 mod oracle;
@@ -103,6 +106,35 @@ enum Cmd {
         /// colapso da carga quando o filtro passa de uma parte do block cache
         #[arg(long)]
         whole_filter: bool,
+        /// Carrega o estado final da fatia depois do plano de edições (precisa de --take)
+        #[arg(long)]
+        edits: bool,
+        #[command(flatten)]
+        plan: EditPlanArgs,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Aplica um plano de edições (substituir, remover, readicionar) num banco já carregado
+    Edit {
+        #[arg(long)]
+        db: PathBuf,
+        /// O corpus da carga; os textos novos são os artigos depois da fatia
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Tamanho da fatia carregada (os primeiros N artigos do corpus)
+        #[arg(long)]
+        take: u64,
+        /// Operações por commit
+        #[arg(long, default_value_t = 10000)]
+        batch: usize,
+        /// Aplica só as M primeiras operações do plano (para medir vazão)
+        #[arg(long)]
+        max_ops: Option<usize>,
+        /// Manutenção em segundo plano que compacta a cada N edições
+        #[arg(long)]
+        maintenance: Option<u64>,
+        #[command(flatten)]
+        plan: EditPlanArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -164,6 +196,11 @@ enum Cmd {
         seed: u64,
         #[command(flatten)]
         inflections: InflectionArgs,
+        /// Compara com o estado depois do plano de edições (rode `wiki edit` antes, com o mesmo plano)
+        #[arg(long)]
+        edits: bool,
+        #[command(flatten)]
+        plan: EditPlanArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -260,6 +297,15 @@ enum Cmd {
         /// Segundos de buscas sem escrita, para a linha de base
         #[arg(long, default_value_t = 15)]
         baseline_secs: u64,
+        /// A escrita é o plano de edições sobre os --skip primeiros artigos (o
+        /// que o banco tem); --take limita as operações
+        #[arg(long)]
+        edits: bool,
+        /// Manutenção em segundo plano que compacta a cada N edições
+        #[arg(long)]
+        maintenance: Option<u64>,
+        #[command(flatten)]
+        plan: EditPlanArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -267,7 +313,7 @@ enum Cmd {
 
 fn main() -> AnyResult {
     match Cli::parse().command {
-        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, label } => {
+        Cmd::Load { db, corpus, batch, skip, take, remap_ids, cache_mb, streaming, node_cache, languages, no_positions, stemming, inflections, whole_filter, edits, plan, label } => {
             let languages = languages.as_deref().map(parse_languages).transpose()?;
             let code = |s: String| Stemming::from_code(&s).ok_or_else(|| format!("stemming desconhecido: {s:?} (use pt, pt-plural, en ou none)"));
             let stemming = stemming.map(code).transpose()?;
@@ -283,15 +329,19 @@ fn main() -> AnyResult {
                 statistics: true,
                 ..Config::default()
             };
-            load(&db, &corpus, batch, skip, take, remap_ids, streaming, config, label)
+            load(&db, &corpus, batch, skip, take, remap_ids, streaming, config, edits.then_some(plan), label)
         }
         Cmd::Vocab { corpus, languages, take, out } => vocab(&corpus, &Stopwords::new(&parse_languages(&languages)?), take, out),
         Cmd::Queries { vocab, corpus, languages, seed, per_set, out } => {
             queries(&vocab, &corpus, &Stopwords::new(&parse_languages(&languages)?), seed, per_set, out)
         }
-        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, label } => {
+        Cmd::Edit { db, corpus, take, batch, max_ops, maintenance, plan, label } => {
+            edit(&db, &corpus, take, batch.max(1), max_ops, plan, maintenance, label)
+        }
+        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, edits, plan, label } => {
             let config = inflections.apply(Config::default())?;
-            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, label })
+            let edits = edits.then_some(plan);
+            oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, edits, label })
         }
         Cmd::Relevance { db, corpus, sets, manual, take, seed, per_set, generate, title_weight, title_b, brief, inflections, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevance").join("manual.tsv"));
@@ -312,8 +362,8 @@ fn main() -> AnyResult {
         }
         Cmd::Sizes { db } => sizes(&db),
         Cmd::Digest { db } => digest(&db),
-        Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, label } => {
-            concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, label)
+        Cmd::Concurrent { db, corpus, skip, take, queries, threads, batch, baseline_secs, edits, maintenance, plan, label } => {
+            concurrent(&db, &corpus, skip, take, &queries, threads.max(1), batch, baseline_secs, edits.then_some(plan), maintenance, label)
         }
     }
 }

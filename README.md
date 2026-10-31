@@ -24,7 +24,11 @@ Suporta:
   título como campo de peso próprio (`add_titled`; `k1 = 1,2`, `b = 0,75`,
   peso do título 50); `search` continua devolvendo todos os IDs em ordem;
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
-- indexação em lotes atômicos, com buscas rodando em paralelo.
+- indexação em lotes atômicos, com buscas rodando em paralelo;
+- **edição e remoção** de documentos: indexar um ID que já existe o
+  substitui, e `delete_document` o remove, no mesmo commit atômico. Editar
+  só acrescenta (a versão antiga sai na compactação), então a busca continua
+  rápida mesmo com edições pendentes.
 
 ## Uso
 
@@ -47,6 +51,9 @@ docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower search meu-banco
 
 # busca interativa (precisa do -it)
 docker run --rm -it -v "$PWD:/data" ghcr.io/evertondays/fire-flower tui meu-banco
+
+# reindexa a pasta: arquivos alterados são substituídos e os que sumiram, removidos
+docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower index --sync meu-banco documentos/
 ```
 
 Com um alias, fica igual ao binário:
@@ -83,6 +90,21 @@ Indexar arquivos e pastas (recursivo; ignora arquivos ocultos e binários;
 ./target/release/fire-flower index /tmp/indice ~/documentos
 ```
 
+Rodar `index` de novo cria documentos novos para os mesmos arquivos. Para
+manter o banco igual à pasta, use `--sync`: um arquivo já indexado (achado
+pelo caminho) é substituído com o mesmo ID, e um que sumiu da pasta é
+removido.
+
+```bash
+./target/release/fire-flower index --sync /tmp/indice ~/documentos
+```
+
+Remover documentos pelo ID:
+
+```bash
+./target/release/fire-flower delete /tmp/indice 42 43
+```
+
 Busca interativa, com resultados enquanto você digita:
 
 ```bash
@@ -97,7 +119,14 @@ Busca interativa, com resultados enquanto você digita:
 | `↑` `↓` `PgUp` `PgDn` | escolhe o resultado |
 | `Enter` | abre o documento inteiro (`n`/`N` pulam entre ocorrências) |
 | `Ctrl+W` / `Ctrl+U` | apaga a última palavra / a consulta toda |
+| `Ctrl+R` | reabre o banco para ver o que foi gravado desde a abertura |
 | `Esc` | volta / sai |
+
+A TUI, `search` e `suggest` abrem o banco **só para leitura**: funcionam ao
+lado de um `index` ou de uma aplicação que está gravando no mesmo banco, sem
+travá-lo, com block cache de 32 MB. A visão é a do momento da abertura; a TUI
+reabre sozinha depois de 10 s, na próxima tecla. `delete` e `compact` não
+criam um banco vazio num caminho errado.
 
 Os resultados vêm por relevância (BM25), com a nota ao lado do título, e a
 lista mostra os 1.000 melhores; o cabeçalho mostra o total. A linha
@@ -133,8 +162,20 @@ Por baixo, o script chama:
 
 Cada linha do JSONL é `{"id", "title", "text"}`: indexa o texto e o título
 (como campo próprio, que pesa mais no ranking) sob o `id`, e guarda o título
-como rótulo. No `index` de arquivos, o título é o nome do arquivo sem a
-extensão.
+como rótulo. Um `id` que já existe é substituído, e uma linha
+`{"op": "delete", "id": 42}` remove o documento. No `index` de arquivos, o
+título é o nome do arquivo sem a extensão.
+
+Cada linha pode trazer também um **ID externo** (`"external_id"`, texto ou
+número): a chave do seu sistema para aquele documento (um link, um número, um
+UUID). Ele volta nas buscas e é único: sem `id`, a linha é achada pelo ID
+externo (substitui o documento dele, ou cria um novo com ID automático), e
+`{"op": "delete", "external_id": "…"}` remove por ele. Para usar outro campo
+da linha, `--external-id-field url` (na Wikipédia, o link do artigo):
+
+```bash
+./target/release/fire-flower index-jsonl --external-id-field url ~/bench-db/ptwiki-full ~/datasets/ptwiki/ptwiki.jsonl
+```
 
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
 usa. Com `--no-positions` (em `index`, `index-jsonl` e
@@ -168,7 +209,8 @@ Busca e autocompletar sem interface, para scripts:
 ./target/release/fire-flower search /tmp/indice "coração bras*"
 ```
 
-A saída é `nota  id  rótulo`, da nota maior para a menor. `--by-id` lista
+A saída é `nota  id  rótulo  ID externo` (separados por tab; o ID externo
+só aparece em quem tem), da nota maior para a menor. `--by-id` lista
 todos os documentos em ordem de ID, sem ranking. Frases vão entre aspas
 simples no shell:
 
@@ -179,6 +221,48 @@ simples no shell:
 ```bash
 ./target/release/fire-flower suggest /tmp/indice prog 10
 ```
+
+Remover pelo ID ou pelo ID externo:
+
+```bash
+./target/release/fire-flower delete /tmp/indice 42 43
+```
+
+```bash
+./target/release/fire-flower delete /tmp/indice --external-ids https://exemplo.com/a 550e8400-e29b-41d4-a716-446655440000
+```
+
+### Monitoramento
+
+O processo que grava o banco pode publicar métricas de custo desprezível
+(`Config::metrics`, ou `--metrics` no `index`, `index-jsonl` e `compact`):
+uma thread grava a cada segundo um snapshot na pasta do banco
+(`fire-flower.metrics.json`). O `monitor` lê esse arquivo, o `/proc` do
+processo e a pasta, sem abrir o banco nem falar com o motor:
+
+```bash
+./target/release/fire-flower index-jsonl --metrics /tmp/wiki ptwiki.jsonl
+```
+
+```bash
+./target/release/fire-flower monitor /tmp/wiki
+```
+
+O painel mostra consultas por segundo, p50 e p99 por tipo de consulta,
+documentos indexados, substituídos e removidos por segundo, versões mortas
+esperando a compactação, RocksDB, memória e disco, com alertas (escrita
+parada, compactação atrasada, disco cheio, muitas versões mortas). Para o
+Prometheus, `--serve` expõe `/metrics` em OpenMetrics; `--json` imprime uma
+leitura e sai:
+
+```bash
+./target/release/fire-flower monitor /tmp/wiki --serve 127.0.0.1:9187
+```
+
+Dashboard do Grafana e regras de alerta em
+[`contrib/monitoring/`](contrib/monitoring/); a lista das métricas, o que
+ficou de fora e por quê estão em
+[docs/plano-monitoramento.md](docs/plano-monitoramento.md).
 
 ### Biblioteca
 
@@ -201,11 +285,99 @@ assert_eq!(engine.suggest("es", 5)?, ["estudante"]);
 let top = engine.search_top("coração", 10)?;
 // Com o total de documentos que casaram.
 let ranked = engine.search_ranked("coração", 10)?; // TopHits { hits, total }
+
+// Editar e remover: o mesmo ID substitui o documento inteiro.
+let mut batch = engine.batch();
+batch.add_document(1, "O coração de Minas")?;
+batch.delete_document(2)?;
+batch.commit()?;
+assert!(engine.search("brasil")?.is_empty());
+assert_eq!(engine.search("coração")?, [1]);
 ```
 
 `Engine` é `Sync`: compartilhe com `Arc<Engine>`. Só um lote de indexação
 existe por vez (os outros esperam); buscas nunca esperam e nunca veem um lote
-pela metade.
+pela metade, nem uma edição pela metade. No mesmo lote, a última operação de
+cada documento vence.
+
+IDs de documento vão até 2^40 − 1 (~1,1 trilhão). Substituir um documento dá
+a ele um ID interno novo, depois dos documentos sem edição nas listas, e a
+versão antiga vira **morta**: a
+busca a pula, e a compactação a tira das listas. Até lá, a versão morta ainda
+ocupa espaço, conta no df (o idf muda um pouco) e uma palavra que ficou sem
+documento ainda aparece no autocompletar. Numa aplicação que edita aos
+poucos, ligue a manutenção em segundo plano: ela compacta quando as edições
+acumuladas passam de 1% dos documentos (no mínimo 1.000).
+
+```rust
+use std::sync::Arc;
+use fire_flower::{Maintenance, MaintenanceOptions};
+
+let engine = Arc::new(engine);
+let maintenance = Maintenance::spawn(Arc::clone(&engine), MaintenanceOptions::default());
+// ... edições e buscas ...
+maintenance.stop()?; // ou só descarte
+```
+
+Sem ela, chame `Engine::compact` (ou `fire-flower compact`) depois de editar
+muito. A compactação não bloqueia buscas nem lotes, e só tira uma versão morta
+quando nenhuma busca em andamento ainda a vê viva.
+
+Para quem não pode bloquear (um event loop, um binding), `try_batch` dá
+`Error::Busy` em vez de esperar o lote aberto; `owned_batch` devolve um lote
+dono de um `Arc<Engine>` (`OwnedBatch`, `Send + 'static`), que pode ser
+guardado num objeto e fazer commit em outra thread. `labels(&ids)` lê os
+rótulos de vários documentos num só `MultiGet`. Todo erro tem um código
+estável (`Error::code()`: `FF_BUSY`, `FF_OPEN`, `FF_READ_ONLY`…).
+
+**IDs externos:** cada documento pode ter a chave do seu sistema (um link,
+um número, um UUID; até 512 bytes). Ela é única no banco, volta com os
+resultados e acha o documento para substituir ou remover:
+
+```rust
+let mut batch = engine.batch();
+// Substitui o documento desse ID, ou cria um novo com DocId automático.
+let doc = batch.add_with_external_id("https://exemplo.com/a", "Título", "texto")?;
+batch.set_external_id(7, "550e8400-e29b-41d4-a716-446655440000")?; // num DocId seu
+batch.commit()?;
+
+let hits = engine.search_top("texto", 10)?;
+let docs: Vec<u64> = hits.iter().map(|h| h.doc).collect();
+let ids = engine.external_ids(&docs)?; // Vec<Option<String>>, num só MultiGet
+assert_eq!(engine.doc_by_external_id("https://exemplo.com/a")?, Some(doc));
+
+let mut batch = engine.batch();
+batch.delete_by_external_id("https://exemplo.com/a")?; // também libera o ID
+batch.commit()?;
+```
+
+Dar a um documento um ID que já é de outro é `Error::Duplicate`
+(`FF_DUPLICATE`); um ID vazio ou longo demais, `Error::InvalidId`
+(`FF_INVALID_ID`). Remover um documento libera o ID dele (vale a última
+operação do lote, como o rótulo), e substituir pelo `DocId` mantém o ID.
+
+```rust
+use std::sync::Arc;
+
+let engine = Arc::new(engine);
+let mut batch = engine.try_owned_batch()?; // Error::Busy se houver outro lote
+batch.add_document(3, "em outra thread")?;
+std::thread::spawn(move || batch.commit()).join().unwrap()?;
+```
+
+Outro processo pode ler o mesmo banco enquanto este grava, sem travá-lo:
+
+```rust
+// Vê o banco como estava na abertura; abra de novo para ver o que veio depois.
+let reader = Engine::open_read_only("/tmp/indice", Config::reader())?;
+```
+
+Métricas (ver [Monitoramento](#monitoramento)): com `Config::metrics`, o
+motor conta consultas, commits, edições, remoções e compactações (somas
+atômicas num contador da própria thread: ~7 ns por consulta) e grava o
+snapshot que o `fire-flower monitor` lê. `Engine::metrics_snapshot` devolve
+os mesmos números no próprio processo. Compilar sem a feature `metrics`
+(`--no-default-features`) tira os ganchos por completo.
 
 ## Arquitetura
 
@@ -214,7 +386,7 @@ fluxos de indexação e busca: [docs/como-funciona.md](docs/como-funciona.md).
 
 | Camada | Onde | Responsabilidade |
 |---|---|---|
-| Interface | `src/bin/fire-flower/` | subcomandos (clap), `index-jsonl` e busca interativa (`tui/`, ratatui) |
+| Interface | `crates/fire-flower-cli/` | subcomandos (clap), `index-jsonl`, busca interativa (`tui/`, ratatui) e `monitor/` |
 | Texto | `src/analysis/` | remove HTML, acentos (NFKD), pontuação; minúsculas; tokens > 64 caracteres são descartados; stopwords e stemming |
 | Consulta | `src/query/` | separa a consulta em termos, prefixos (`termo*`) e frases (`"..."`) |
 | Índice (Trie) | `src/engine/` | indexação (`writer/`), busca, prefixo, frases, ranking (`ranking/`), autocompletar |
@@ -226,8 +398,12 @@ imports, erros, performance, git): [docs/diretrizes-de-codigo.md](docs/diretrize
 
 ### Chaves no RocksDB
 
-Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
+Formato v7 (`meta:format = 7`). Um banco de formato anterior não abre: o
 `open` diz em que formato ele está e pede para recarregar.
+
+Em `post:`, `pos:` e `norm:` o documento é o **ID interno** da versão: o
+próprio ID na primeira versão, e `2^63 + (versão << 40) + ID` numa
+substituição ou readição (a busca devolve o ID do usuário).
 
 | Chave | Valor |
 |---|---|
@@ -236,9 +412,14 @@ Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 | `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições); o título vem primeiro e o texto começa 100 posições depois |
 | `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco`, e o do título |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
+| `ext:<id>` | ID externo do documento (a chave do usuário: link, número, UUID) |
+| `xid:<ID externo>` | o documento dono do ID externo (o índice reverso, para achar e remover por ele) |
+| `ver:<id>` | ID interno da última versão do documento, só para os que já foram substituídos ou removidos |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
 | `stem:<radical>` | nós das palavras com esse radical (só com `--inflections`) |
+| `meta:dead` | as versões mortas que ainda estão nas listas (até a compactação) |
+| `meta:epoch` | número do último commit (as buscas sabem quais mortes já veem) |
 | `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | formato, se grava posições, idiomas das stopwords, stemming e flexões |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
@@ -248,6 +429,13 @@ de 256 documentos têm, antes das entradas, uma tabela de saltos (último
 documento, tamanho e quantidade de entradas de cada bloco, 128 na gravação):
 o E e as frases vão direto ao bloco de um documento, sem decodificar a lista
 inteira, e o merge só concatena as tabelas dos pedaços.
+
+Editar não regrava listas: a versão nova entra no fim delas (o merge só
+concatena, como na carga), e a antiga sai de `norm:` e entra em `meta:dead`.
+A busca pula os mortos ao decodificar a lista que conduz o E (um teste por
+documento, só enquanto há mortos). A compactação os tira das listas pelo
+merge operator e por um filtro de compactação, e tira da Trie as palavras que
+ficaram sem documento.
 
 ### Configuração do RocksDB
 
@@ -294,9 +482,12 @@ python3 scripts/perf.py all --scale 10k
 
 ## Limitações conhecidas
 
-- **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID troca o
-  tf, as posições e o tamanho dele (e não conta o documento duas vezes), mas
-  termos que saíram do texto continuam apontando para ele.
+- **Até a compactação, as edições ficam aproximadas em três pontos.** As
+  versões mortas ocupam espaço nas listas, contam no df (o idf de um termo
+  editado fica um pouco menor, então as notas mudam um pouco), e uma palavra
+  cujos documentos foram todos substituídos ou removidos continua no
+  autocompletar (a busca por ela já não acha nada). A compactação acerta os
+  três; use a `Maintenance` (biblioteca) ou `fire-flower compact`.
 - **Peso do título ajustado para a Wikipédia.** O peso 50 saiu de consultas
   com resposta conhecida na Wikipédia, onde o título descreve o artigo; em
   outro tipo de corpus, ajuste `Config::title_weight`. Páginas de
@@ -335,3 +526,8 @@ alguns minutos.
 ```bash
 cargo test
 ```
+
+É um workspace: o core (a biblioteca) fica na raiz e a CLI em
+`crates/fire-flower-cli` (só ela depende de clap e ratatui). Na raiz,
+`cargo build --release` compila os dois, e o binário sai em
+`target/release/fire-flower`.

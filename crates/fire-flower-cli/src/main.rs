@@ -1,6 +1,9 @@
 mod jsonl;
+mod monitor;
+mod style;
 mod tui;
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,14 +38,24 @@ enum Command {
         /// Arquivos ou pastas
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Sincroniza com o que já está no banco: um arquivo já indexado é
+        /// substituído (mesmo ID) e um que sumiu das pastas é removido. Sem a
+        /// opção, cada arquivo vira um documento novo
+        #[arg(long)]
+        sync: bool,
         #[command(flatten)]
         languages: LanguageArgs,
         #[command(flatten)]
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
-    /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia)
+    /// Indexa um JSONL com {"id", "title", "text"} por linha (ex.: Wikipédia).
+    /// Um ID que já existe é substituído; {"op": "delete", "id"} remove. O
+    /// campo "external_id" (texto ou número) é o ID do usuário, devolvido nas
+    /// buscas; sem "id", o documento é achado ou criado por ele
     IndexJsonl {
         /// Pasta do banco (criada se não existir)
         db: PathBuf,
@@ -57,16 +70,34 @@ enum Command {
         /// Emite o progresso como JSON na saída padrão
         #[arg(long)]
         progress_json: bool,
+        /// Campo da linha com o ID externo, se não for "external_id" (ex.: url)
+        #[arg(long)]
+        external_id_field: Option<String>,
         #[command(flatten)]
         languages: LanguageArgs,
         #[command(flatten)]
         positions: PositionArgs,
         #[command(flatten)]
         stemming: StemmingArgs,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
-    /// Compacta o banco: une os pedaços pendentes das listas de documentos
+    /// Remove documentos pelo ID (ou pelo ID externo, com --external-ids)
+    Delete {
+        db: PathBuf,
+        #[arg(required_unless_present = "external_ids")]
+        ids: Vec<u64>,
+        /// IDs externos dos documentos a remover
+        #[arg(long, num_args = 1..)]
+        external_ids: Vec<String>,
+    },
+    /// Compacta o banco: une os pedaços pendentes das listas de documentos,
+    /// tira delas as versões de documentos substituídos ou removidos, e tira
+    /// da Trie as palavras que ficaram sem documento
     Compact {
         db: PathBuf,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Busca: termos combinados com E; termo* casa por prefixo; "frase" exata.
     /// Os resultados saem por relevância (BM25), com a nota.
@@ -88,6 +119,21 @@ enum Command {
         #[arg(default_value_t = 10)]
         limit: usize,
     },
+    /// Painel do banco que outro processo está usando: lê o snapshot das
+    /// métricas que ele grava (Config::metrics), o /proc dele e a pasta do
+    /// banco. Nunca abre o banco
+    Monitor {
+        db: PathBuf,
+        /// Serve as métricas em /metrics (OpenMetrics) neste endereço
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9187", value_name = "ENDEREÇO")]
+        serve: Option<String>,
+        /// Imprime uma leitura em JSON e sai
+        #[arg(long)]
+        json: bool,
+        /// O arquivo do snapshot, se o motor grava fora da pasta do banco
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -97,6 +143,24 @@ struct LanguageArgs {
     /// combinar com o que foi gravado na criação.
     #[arg(long, value_parser = parse_languages)]
     languages: Option<LanguageList>,
+}
+
+#[derive(clap::Args)]
+struct MetricsArgs {
+    /// Grava o snapshot das métricas na pasta do banco a cada segundo, para o
+    /// `fire-flower monitor` acompanhar o trabalho
+    #[arg(long)]
+    metrics: bool,
+    /// Como --metrics, gravando neste arquivo em vez da pasta do banco
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+}
+
+impl MetricsArgs {
+    fn apply(self, config: Config) -> Config {
+        let metrics = self.metrics || self.metrics_file.is_some();
+        Config { metrics, metrics_file: self.metrics_file, ..config }
+    }
 }
 
 #[derive(clap::Args)]
@@ -156,15 +220,30 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { db } => open(&db, None, None, None).and_then(|engine| {
-            tui::run(&engine, &db.display().to_string()).map_err(Into::into)
+        Command::Tui { db } => open_reader(&db).and_then(|engine| {
+            let path = db.clone();
+            let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, Config::reader()));
+            tui::run(engine, &db.display().to_string(), reopen).map_err(Into::into)
         }),
-        Command::Index { db, paths, languages, positions, stemming } => {
-            index(&db, &paths, languages.languages, positions.config(), stemming)
+        Command::Index { db, paths, sync, languages, positions, stemming, metrics } => {
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            index(&db, &paths, sync, creation, metrics)
         }
-        Command::IndexJsonl { db, file, batch, skip, progress_json, languages, positions, stemming } => {
-            let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json };
-            open(&db, languages.languages, positions.config(), Some(stemming)).and_then(|engine| {
+        Command::IndexJsonl {
+            db,
+            file,
+            batch,
+            skip,
+            progress_json,
+            external_id_field,
+            languages,
+            positions,
+            stemming,
+            metrics,
+        } => {
+            let opts = jsonl::Options { batch_size: batch.max(1), skip, json: progress_json, external_id_field };
+            let creation = Creation { languages: languages.languages, positions: positions.config(), stemming };
+            open(&db, creation, metrics).and_then(|engine| {
                 if !progress_json {
                     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
                     eprintln!("posições: {}", if engine.has_positions() { "sim" } else { "não" });
@@ -173,13 +252,24 @@ fn main() -> ExitCode {
                 jsonl::index(&engine, &file, &opts)
             })
         }
-        Command::Compact { db } => open(&db, None, None, None).map(|engine| {
+        Command::Delete { db, ids, external_ids } => delete(&db, &ids, &external_ids),
+        Command::Compact { db, metrics } => open_existing(&db, metrics).and_then(|engine| {
             let started = Instant::now();
-            engine.compact();
+            let stats = engine.compact()?;
             println!("compactado em {:.2?}", started.elapsed());
+            if stats.purged > 0 {
+                println!("{} versão(ões) de documentos substituídos ou removidos saíram das listas", stats.purged);
+            }
+            if stats.emptied_words > 0 {
+                println!("{} palavra(s) sem documento saíram do índice", stats.emptied_words);
+            }
+            Ok(())
         }),
         Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
         Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
+        Command::Monitor { db, serve, json, metrics_file } => {
+            monitor::run(monitor::Options { db, metrics_file, serve, json })
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -190,27 +280,77 @@ fn main() -> ExitCode {
     }
 }
 
-/// Abre o banco. `languages`, `positions` e `stemming` só importam na
-/// criação; `None` usa o que está gravado.
-fn open(
-    db: &Path,
-    languages: Option<LanguageList>,
-    positions: Option<bool>,
-    stemming: Option<StemmingArgs>,
-) -> Result<Engine, Box<dyn std::error::Error>> {
-    let (stemming, inflections) = stemming.map_or((None, None), |s| (s.stemming, s.inflections));
-    let config = Config { languages: languages.map(|l| l.0), positions, stemming, inflections, ..Config::default() };
-    Ok(Engine::open(db, config)?)
+/// Abre um banco que já existe só para leitura, ao lado de quem o grava: a
+/// TUI, `search` e `suggest` não travam o banco nem disputam memória com ele.
+fn open_reader(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open_read_only(db, Config::reader())?)
 }
 
-fn index(
-    db: &Path,
-    paths: &[PathBuf],
+/// Abre um banco que já existe para gravar (`delete`, `compact`): um caminho
+/// errado dá erro em vez de criar um banco vazio.
+fn open_existing(db: &Path, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open(db, metrics.apply(Config { create_if_missing: false, ..Config::default() }))?)
+}
+
+/// Opções que só importam na criação do banco; `None` usa o que está gravado.
+struct Creation {
     languages: Option<LanguageList>,
     positions: Option<bool>,
     stemming: StemmingArgs,
-) -> AnyResult {
-    let engine = open(db, languages, positions, Some(stemming))?;
+}
+
+/// Abre (ou cria) o banco para indexar.
+fn open(db: &Path, creation: Creation, metrics: MetricsArgs) -> Result<Engine, Box<dyn std::error::Error>> {
+    let Creation { languages, positions, stemming } = creation;
+    let config = Config {
+        languages: languages.map(|l| l.0),
+        positions,
+        stemming: stemming.stemming,
+        inflections: stemming.inflections,
+        ..Config::default()
+    };
+    Ok(Engine::open(db, metrics.apply(config))?)
+}
+
+fn delete(db: &Path, ids: &[u64], external_ids: &[String]) -> AnyResult {
+    let engine = open_existing(db, MetricsArgs { metrics: false, metrics_file: None })?;
+    let mut batch = engine.batch();
+    for &id in ids {
+        batch.delete_document(id)?;
+    }
+    // Um ID externo sem documento conta como "não existia".
+    for external in external_ids {
+        batch.delete_by_external_id(external)?;
+    }
+    let stats = batch.commit_with_stats()?;
+    let asked = ids.len() + external_ids.len();
+    println!("{} documento(s) removido(s), {} não existia(m)", stats.deleted, asked.saturating_sub(stats.deleted));
+    Ok(())
+}
+
+/// Com `--sync`: os documentos já indexados cujo rótulo é um caminho dentro de
+/// `paths` (o caminho como a CLI o grava), por rótulo.
+fn indexed_files(engine: &Engine, paths: &[PathBuf]) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let roots: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let separator = std::path::MAIN_SEPARATOR;
+    let under = |label: &str| {
+        roots.iter().any(|r| {
+            let inside = |rest: &str| rest.starts_with(separator) || r.ends_with(separator);
+            label == r || label.strip_prefix(r.as_str()).is_some_and(inside)
+        })
+    };
+    let mut found = HashMap::new();
+    engine.for_each_label(|doc, label| {
+        if under(label) {
+            found.insert(label.to_string(), doc);
+        }
+    })?;
+    Ok(found)
+}
+
+fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: MetricsArgs) -> AnyResult {
+    let engine = open(db, creation, metrics)?;
+    let mut known = if sync { indexed_files(&engine, paths)? } else { HashMap::new() };
     eprintln!("stopwords: {}", stopwords::describe(engine.languages()));
     eprintln!("stemming: {}, flexões: {}", engine.stemmer().stemming(), engine.inflector().stemming());
     let started = Instant::now();
@@ -220,7 +360,7 @@ fn index(
     }
 
     let progress = std::io::stderr().is_terminal();
-    let (mut indexed, mut skipped) = (0usize, 0usize);
+    let (mut indexed, mut skipped, mut replaced) = (0usize, 0usize, 0usize);
     let mut batch = engine.batch();
     for (i, path) in files.iter().enumerate() {
         if progress && (i % 64 == 0 || i + 1 == files.len()) {
@@ -246,23 +386,38 @@ fn index(
         }
         // O nome do arquivo (sem extensão) é o título: pesa mais no ranking.
         let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        batch.add_labeled_titled(&path.display().to_string(), &title, &content)?;
+        let label = path.display().to_string();
+        match known.remove(&label) {
+            Some(id) => {
+                batch.add_titled(id, &title, &content)?;
+                replaced += 1;
+            }
+            None => drop(batch.add_labeled_titled(&label, &title, &content)?),
+        }
         indexed += 1;
         if batch.len() >= DOCS_PER_COMMIT {
             batch.commit()?;
             batch = engine.batch();
         }
     }
+    // Com --sync, o que sobrou em `known` sumiu das pastas.
+    let removed = known.len();
+    for (_, id) in known {
+        batch.delete_document(id)?;
+    }
     batch.commit()?;
     if progress {
         eprint!("\r\x1b[2K");
     }
     println!("{indexed} documento(s) indexado(s), {skipped} ignorado(s), em {:.2?}", started.elapsed());
+    if sync {
+        println!("{replaced} substituído(s), {} novo(s), {removed} removido(s)", indexed - replaced);
+    }
     Ok(())
 }
 
 fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
     let (hits, total) = if by_id {
@@ -275,12 +430,18 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
     };
     let elapsed = started.elapsed();
 
-    for (doc, score) in &hits {
-        let label = engine.label(*doc)?;
+    // Rótulo e ID externo de todos os resultados: dois MultiGet.
+    let docs: Vec<u64> = hits.iter().map(|(doc, _)| *doc).collect();
+    let labels = engine.labels(&docs)?;
+    let external_ids = engine.external_ids(&docs)?;
+    for (((doc, score), label), external) in hits.iter().zip(labels).zip(external_ids) {
         let score = score.map(|s| format!("{s:.3}\t")).unwrap_or_default();
-        match label {
-            Some(label) => println!("{score}{doc}\t{label}"),
-            None => println!("{score}{doc}"),
+        // Colunas: [nota] documento [rótulo] [ID externo]; o rótulo fica vazio se só houver o ID.
+        match (label, external) {
+            (Some(label), Some(external)) => println!("{score}{doc}\t{label}\t{external}"),
+            (None, Some(external)) => println!("{score}{doc}\t\t{external}"),
+            (Some(label), None) => println!("{score}{doc}\t{label}"),
+            (None, None) => println!("{score}{doc}"),
         }
     }
     if total > hits.len() {
@@ -291,7 +452,7 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open(db, None, None, None)?;
+    let engine = open_reader(db)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

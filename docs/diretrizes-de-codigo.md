@@ -26,7 +26,9 @@ Palavras usadas como **dado** nos testes e benchmarks (`"coração"`,
 - **Uma pasta por parte da busca**, um arquivo por responsabilidade:
   `analysis/` (texto → termos), `query/` (consulta → partes), `codec/`
   (formatos gravados), `engine/` (índice e armazenamento, com `ranking/` e
-  `writer/`), `bin/fire-flower/` (CLI).
+  `writer/`). O core fica na raiz; a CLI é o crate `crates/fire-flower-cli/`
+  do workspace (só ela depende de clap e ratatui) e os bindings ficam em
+  `bindings/`.
 - **Arquivos com até ~600 linhas.** Passou disso ou juntou duas
   responsabilidades: vira pasta, com um `mod.rs` que guarda o tipo principal
   e declara os submódulos.

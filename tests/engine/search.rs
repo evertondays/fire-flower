@@ -114,11 +114,8 @@ pub(crate) fn skip_lists_give_the_same_results() {
     for id in (0..3600u64).step_by(37) {
         let text = make(&mut next);
         batch.add_document(id * 3, &text.join(" ")).unwrap();
-        // Termos que saíram do texto continuam apontando para o documento.
-        let old = docs.remove(&(id * 3)).unwrap();
-        let mut merged: Vec<&str> = text.clone();
-        merged.extend(old.iter().filter(|w| !text.contains(w)));
-        docs.insert(id * 3, merged);
+        // O texto novo substitui o antigo: termos que saíram não acham mais o documento.
+        docs.insert(id * 3, text);
     }
     batch.commit().unwrap();
 
@@ -145,7 +142,7 @@ pub(crate) fn skip_lists_give_the_same_results() {
     };
     check(&engine, "antes de compactar");
     let before: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
-    engine.compact();
+    engine.compact().unwrap();
     check(&engine, "depois de compactar");
     let after: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
     assert_eq!(before, after);

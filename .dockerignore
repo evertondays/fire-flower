@@ -1,6 +1,7 @@
-# Só Cargo.toml, Cargo.lock, src/ e benches/ entram na imagem.
+# Só os manifestos, src/, benches/ e crates/ entram na imagem.
 *
 !Cargo.toml
 !Cargo.lock
 !src/
 !benches/
+!crates/

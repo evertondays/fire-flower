@@ -12,7 +12,7 @@ use crate::corpus::stem;
 use crate::env::{mb, save_result};
 
 pub(crate) fn sizes(db: &Path) -> AnyResult {
-    let engine = Engine::open(db, Config::default())?;
+    let engine = Engine::open(db, crate::env::with_metrics(Config::default()))?;
     let watched: Vec<(&str, Option<u64>)> = ["area", "populacao", "historia", "anos", "parte"].iter().map(|t| Ok((*t, engine.term_node(t)?))).collect::<AnyResult<_>>()?;
 
     #[derive(Default)]

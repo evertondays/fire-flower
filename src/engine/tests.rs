@@ -122,3 +122,70 @@ fn epoch_cache_respects_snapshots() {
     cache.offer(8, 0, &a);
     assert!(cache.get(8, 5).is_some());
 }
+
+/// Uma busca aberta antes de uma edição continua vendo a versão antiga, mesmo
+/// que uma compactação rode no meio: a limpeza não tira das listas um morto
+/// que um snapshot aberto ainda vê vivo, e só o tira na compactação seguinte.
+#[test]
+fn compaction_keeps_versions_that_an_open_snapshot_sees() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = crate::Engine::open(dir.path(), crate::Config::default()).unwrap();
+    engine.index_document(7, "velho comum").unwrap();
+    let before = engine.view();
+    engine.index_document(7, "novo comum").unwrap();
+    assert_eq!(engine.compact().unwrap().purged, 0, "o snapshot aberto ainda vê a versão 7");
+    assert_eq!(before.search("velho").unwrap(), [7]);
+    assert_eq!(before.search("comum").unwrap(), [7]);
+    assert!(before.search("novo").unwrap().is_empty());
+    let during = engine.view();
+    assert_eq!(during.search("comum").unwrap(), [7], "a versão nova, uma vez só");
+    drop((before, during));
+    assert_eq!(engine.compact().unwrap().purged, 1);
+    assert!(engine.search("velho").unwrap().is_empty());
+    assert_eq!(engine.search("novo comum").unwrap(), [7]);
+}
+
+/// Uma busca que começou antes de um commit que mata não filtra essas mortes,
+/// mesmo pegando o conjunto de mortos depois do commit.
+#[test]
+fn deaths_after_the_snapshot_are_not_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = crate::Engine::open(dir.path(), crate::Config::default()).unwrap();
+    engine.index_document(3, "alfa").unwrap();
+    engine.index_document(4, "alfa").unwrap();
+    engine.delete_document(4).unwrap();
+    let snap = engine.db.snapshot();
+    let epoch = engine.epoch();
+    engine.delete_document(3).unwrap();
+    // O snapshot é do commit `epoch`, mas os mortos já incluem o 3.
+    let view = super::View::new(snap, epoch, Some(epoch), engine.deaths.current(), &engine);
+    assert_eq!(view.search("alfa").unwrap(), [3]);
+    // Sem saber o commit exato, a busca o lê de `meta:epoch` no snapshot.
+    let view = super::View::new(engine.db.snapshot(), epoch, None, engine.deaths.current(), &engine);
+    assert!(view.search("alfa").unwrap().is_empty());
+}
+
+#[test]
+fn translated_ids_merge_in_order() {
+    use super::versions::{first_high, next_high, user_of, users_sorted};
+    let (h1, h5, h7, h100) = (first_high(1), next_high(first_high(5)).unwrap(), first_high(7), first_high(100));
+    assert_eq!((user_of(h1), user_of(h5), user_of(3)), (1, 5, 3));
+    assert!(h1 < h7 && h7 < h100 && h100 < h5, "a faixa alta fica em ordem de versão e depois de documento");
+    assert_eq!(users_sorted(vec![2, 6, 50, h1, h7, h100, h5]), [1, 2, 5, 6, 7, 50, 100]);
+    assert_eq!(users_sorted(vec![h100]), [100]);
+    assert_eq!(users_sorted(vec![3, 4]), [3, 4]);
+    assert_eq!(users_sorted(vec![3, 4, h7]), [3, 4, 7]);
+    // Poucos traduzidos numa lista grande: inserção por busca binária.
+    let mut ids: Vec<u64> = (0..1000).map(|d| d * 2).collect();
+    ids.extend([first_high(1), first_high(999), first_high(5000)]);
+    let mut want: Vec<u64> = (0..1000).map(|d| d * 2).chain([1, 999, 5000]).collect();
+    want.sort_unstable();
+    assert_eq!(users_sorted(ids), want);
+    let last = u64::MAX; // a última versão do maior documento
+    assert_eq!(next_high(last), None, "versões esgotadas");
+    assert_eq!(user_of(last), super::versions::MAX_DOC);
+    // Versões diferentes formam trechos: a junção continua em ordem.
+    let (a, b) = (next_high(first_high(2)).unwrap(), next_high(first_high(9)).unwrap());
+    assert!(first_high(100) < a && a < b);
+    assert_eq!(users_sorted(vec![4, first_high(1), first_high(100), a, b]), [1, 2, 4, 9, 100]);
+}

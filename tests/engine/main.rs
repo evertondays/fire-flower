@@ -4,12 +4,19 @@
 use fire_flower::{Config, Engine, Posting};
 
 mod concurrency;
+mod edit_model;
+mod editing;
+mod external_ids;
 mod indexing;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod phrases;
+mod read_only;
 mod ranking;
 mod search;
 mod stemming;
 mod storage;
+mod writer;
 
 pub(crate) fn open(dir: &tempfile::TempDir) -> Engine {
     Engine::open(dir.path(), Config::default()).unwrap()

@@ -1,40 +1,29 @@
 //! Formato do banco e metadados gravados na criação (posições, idiomas,
-//! stemming), e o merge operator das listas.
+//! stemming).
 
 use std::path::Path;
 
-use rocksdb::{DB, MergeOperands, Options, WriteBatch};
+use rocksdb::{DB, Options, WriteBatch};
 
 use crate::{Error, Result, codec};
 use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
-use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING, POS, POST, STEM};
+use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING};
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 5;
+pub const FORMAT_VERSION: u64 = 7;
 
-/// Confere a versão do formato e se o banco tem posições. Num banco novo,
-/// grava as duas coisas.
-pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<bool> {
+/// Confere a versão do formato e se o banco grava posições. Num banco novo,
+/// grava as duas coisas (`writable`; aberto só para leitura, é erro).
+pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>, writable: bool) -> Result<bool> {
     match read_counter(db, META_FORMAT)? {
-        Some(FORMAT_VERSION) => {
-            let stored = read_counter(db, META_POSITIONS)?
-                .ok_or_else(|| Error::Corrupt("meta:positions ausente".into()))?
-                != 0;
-            match wanted_positions {
-                Some(wanted) if wanted != stored => Err(Error::Config(format!(
-                    "o banco foi criado {} posições, mas a config pede {}",
-                    if stored { "com" } else { "sem" },
-                    if wanted { "com" } else { "sem" }
-                ))),
-                _ => Ok(stored),
-            }
-        }
+        Some(FORMAT_VERSION) => stored_flag(db, META_POSITIONS, wanted_positions, "posições"),
         Some(v) => Err(Error::Config(format!(
             "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
         ))),
         None if read_counter(db, META_NEXT_NODE)?.is_some() => Err(old_format()),
+        None if !writable => Err(Error::Config("o banco está vazio (nunca foi aberto para escrita)".into())),
         None => {
             let positions = wanted_positions.unwrap_or(true);
             let mut wb = WriteBatch::default();
@@ -43,6 +32,21 @@ pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>) -> Result<
             db.write(wb)?;
             Ok(positions)
         }
+    }
+}
+
+/// Uma opção ligada ou desligada na criação: a config pode repetir o que está
+/// gravado, mas não pedir o contrário.
+fn stored_flag(db: &DB, key: &[u8], wanted: Option<bool>, what: &str) -> Result<bool> {
+    let name = String::from_utf8_lossy(key);
+    let stored = read_counter(db, key)?.ok_or_else(|| Error::Corrupt(format!("{name} ausente")))? != 0;
+    match wanted {
+        Some(wanted) if wanted != stored => Err(Error::Config(format!(
+            "o banco foi criado {} {what}, mas a config pede {}",
+            if stored { "com" } else { "sem" },
+            if wanted { "com" } else { "sem" }
+        ))),
+        _ => Ok(stored),
     }
 }
 
@@ -82,8 +86,8 @@ pub(super) fn stored_format_error(path: &Path) -> Option<Error> {
 }
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
-/// (ou o padrão).
-pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
+/// (ou o padrão), se `writable`.
+pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>, writable: bool) -> Result<Vec<Language>> {
     let normalize = |langs: &[Language]| Stopwords::new(langs).languages().to_vec();
     let stored = match db.get_pinned(META_LANGUAGES)? {
         Some(v) => Some(parse_languages(&String::from_utf8_lossy(&v))?),
@@ -100,7 +104,7 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
         (Some(stored), _) => stored,
         (None, wanted) => normalize(wanted.unwrap_or(Language::DEFAULT)),
     };
-    if db.get_pinned(META_LANGUAGES)?.is_none() {
+    if writable && db.get_pinned(META_LANGUAGES)?.is_none() {
         let codes: Vec<&str> = languages.iter().map(|l| l.code()).collect();
         db.put(META_LANGUAGES, codes.join(","))?;
     }
@@ -109,8 +113,8 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
 
 /// Stemming do banco (`key` = `meta:stemming` ou `meta:inflections`). Num
 /// banco sem a chave, grava o da config (ou `Off`); um banco que já tem dados
-/// e não tem a chave é de antes dela: `Off`.
-pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
+/// e não tem a chave é de antes dela: `Off`. Só grava se `writable`.
+pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>, writable: bool) -> Result<Stemming> {
     let what = if key == META_STEMMING { "stemming" } else { "flexões na consulta" };
     let stored = match db.get_pinned(key)? {
         Some(v) => {
@@ -129,7 +133,7 @@ pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) ->
         (Some(stored), _) => stored,
         (None, wanted) => wanted.unwrap_or_default(),
     };
-    if db.get_pinned(key)?.is_none() {
+    if writable && db.get_pinned(key)?.is_none() {
         db.put(key, stemming.code())?;
     }
     Ok(stemming)
@@ -151,21 +155,4 @@ pub(super) fn varint(v: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     codec::put_varint(&mut buf, v);
     buf
-}
-
-/// Merge operator de `post:` e `pos:`: une as listas por documento, com a
-/// gravação mais nova vencendo (ver `codec::merge_postings`). É associativo,
-/// então o RocksDB pode combinar pedaços consecutivos em qualquer agrupamento.
-/// Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
-pub(super) fn merge_operator(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
-    let inputs = existing.into_iter().chain(operands.iter());
-    if key.starts_with(POST) {
-        codec::merge_postings(inputs)
-    } else if key.starts_with(POS) {
-        codec::merge_positions(inputs)
-    } else if key.starts_with(STEM) {
-        codec::merge_node_sets(inputs)
-    } else {
-        None
-    }
 }

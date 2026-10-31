@@ -33,8 +33,20 @@ mod engine;
 mod error;
 pub mod query;
 
-pub use engine::{CommitStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode};
+pub use engine::{
+    CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, MAX_EXTERNAL_ID_BYTES,
+    Maintenance, MaintenanceOptions, OwnedBatch,
+};
 pub use error::{Error, Result};
+
+/// O snapshot das métricas ([`Engine::metrics_snapshot`] e o arquivo que a
+/// amostradora grava): o formato que o `fire-flower monitor` lê.
+pub mod metrics {
+    pub use crate::engine::metrics::snapshot::{
+        COMMIT_BOUNDS, COMMIT_PHASES, CacheCounters, FILE_NAME, LAYOUT, OpCounters, QUERY_BOUNDS, RocksdbProps,
+        Snapshot, Writer, default_path, read,
+    };
+}
 pub use analysis::stem::{Stemmer, Stemming};
 pub use analysis::stopwords::{Language, Stopwords};
 
@@ -43,9 +55,12 @@ pub use analysis::stopwords::{Language, Stopwords};
 #[doc(hidden)]
 pub mod internals {
     pub use crate::codec::{
-        NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_positions, decode_postings, encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
+        DeadBits, NormBlock, PositionsCursor, PostingsCursor, TrieNode, decode_docs, decode_docs_except, decode_positions,
+        decode_postings,
+        encode_positions_into, encode_postings, list_len, merge_positions, merge_postings,
     };
     pub use crate::engine::{intersect, reads_on_this_thread};
+    pub use crate::engine::metrics::{Metrics, Op};
 }
 
 pub type DocId = u64;

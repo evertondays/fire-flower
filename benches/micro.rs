@@ -10,12 +10,15 @@
 use std::hint::black_box;
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use fire_flower::{Config, Engine, Posting, Stopwords};
+use fire_flower::{CommitStats, Config, Engine, Posting, Stopwords};
 use fire_flower::analysis::{Analyzer, tokenize};
 use fire_flower::internals::{
-    decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_postings,
+    Metrics, Op, decode_docs, decode_docs_except, decode_positions, decode_postings, encode_postings, intersect,
+    merge_postings,
 };
 
 fn env_path(var: &str, default: &str) -> PathBuf {
@@ -93,8 +96,11 @@ fn bench_postings(c: &mut Criterion) {
     let pieces: Vec<Vec<u8>> = (1..=8u64)
         .map(|i| encode_postings(&[Posting::new(max + i * 10, 1), Posting::new(max + i * 10 + 1, 2)]))
         .collect();
-    // Pedaço que sobrepõe a lista: força o merge lento (ordenação).
+    // Pedaço que sobrepõe a lista: reindexar um documento antigo (remendo).
     let overlap = encode_postings(&[Posting::new(area[area.len() / 2].doc, 3)]);
+    // Versões mortas (1% da lista): a busca as pula ao decodificar.
+    let dead_ids: Vec<u64> = area.iter().step_by(100).map(|p| p.doc).collect();
+    let dead = fire_flower::internals::DeadBits::new(&dead_ids);
 
     let mut g = c.benchmark_group("lists");
     g.bench_function(format!("decode_area_{}_postings", area.len()), |b| {
@@ -109,6 +115,9 @@ fn bench_postings(c: &mut Criterion) {
     });
     g.bench_function("merge_area_overlapping", |b| {
         b.iter(|| merge_postings([black_box(area_bytes.as_slice()), overlap.as_slice()].into_iter()).unwrap())
+    });
+    g.bench_function(format!("decode_docs_area_{}_dead_1pct", area.len()), |b| {
+        b.iter(|| decode_docs_except(black_box(&area_bytes), &dead).unwrap())
     });
     g.bench_function(format!("intersect_rare{}_x_area{}", rare.len(), area.len()), |b| {
         b.iter(|| intersect(black_box(&rare), black_box(&area_docs)))
@@ -163,5 +172,58 @@ fn bench_index(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_tokenize, bench_postings, bench_search, bench_index);
+/// O custo das métricas (`docs/plano-monitoramento.md`): meta de ≤ 50 ns por
+/// consulta, com 1 e com 12 threads registrando ao mesmo tempo.
+fn bench_metrics(c: &mut Criterion) {
+    let mut g = c.benchmark_group("metrics");
+    let m = Arc::new(Metrics::new());
+    g.bench_function("record_query", |b| {
+        b.iter(|| m.record_query(black_box(Op::Search), black_box(Duration::from_nanos(12_345)), 7, false))
+    });
+    // Tempo por registro em cada thread, com 12 registrando juntas: sem
+    // shards, a linha de cache dos contadores pularia entre os núcleos.
+    g.bench_function("record_query_12_threads", |b| {
+        b.iter_custom(|iters| {
+            let start = Arc::new(Barrier::new(13));
+            let threads: Vec<_> = (0..12)
+                .map(|_| {
+                    let (m, start) = (Arc::clone(&m), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        for i in 0..iters {
+                            m.record_query(Op::SearchTop, Duration::from_nanos(black_box(i)), 3, false);
+                        }
+                    })
+                })
+                .collect();
+            start.wait();
+            let t = Instant::now();
+            for th in threads {
+                th.join().unwrap();
+            }
+            t.elapsed()
+        })
+    });
+    let stats = CommitStats { docs: 1, replaced: 1, killed: 1, total_secs: 2e-4, ..CommitStats::default() };
+    g.bench_function("record_commit", |b| b.iter(|| m.record_commit(black_box(&stats), 100_000)));
+    // Uma consulta curta de verdade com as métricas desligadas e ligadas: a
+    // diferença é o custo inteiro (relógio, leituras, registro, cache).
+    let dir = tempfile::tempdir().unwrap();
+    for (name, metrics) in [("suggest_off", false), ("suggest_on", true)] {
+        if metrics && !cfg!(feature = "metrics") {
+            continue;
+        }
+        let path = dir.path().join(name);
+        let engine = Engine::open(&path, Config { metrics, ..Config::default() }).unwrap();
+        let mut batch = engine.batch();
+        for (i, w) in ["roupa", "rotina", "roma", "rato", "rei", "rapido"].iter().enumerate() {
+            batch.add_document(i as u64 + 1, w).unwrap();
+        }
+        batch.commit().unwrap();
+        g.bench_function(name, |b| b.iter(|| engine.suggest(black_box("ro"), 10).unwrap().len()));
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_tokenize, bench_postings, bench_search, bench_index, bench_metrics);
 criterion_main!(benches);

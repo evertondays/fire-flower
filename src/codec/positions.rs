@@ -3,19 +3,20 @@
 use crate::{DocId, Error};
 use crate::codec::{SKIP_BLOCK, put_varint};
 use crate::codec::list::{Block, ListHeader, write_list};
+use crate::codec::postings::PostingEntry;
 use crate::codec::varint::{Reader, corrupt};
 
 /// Grava em `buf` as posições de cada documento. `entries` traz
 /// `(doc, tf, tf no título)` ordenado por doc (só o tf é usado); `positions`
 /// traz as posições de todos, em sequência (`tf` posições crescentes por
 /// documento).
-pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)], positions: &[u32]) {
-    debug_assert_eq!(entries.iter().map(|e| e.1 as usize).sum::<usize>(), positions.len());
+pub fn encode_positions_into<E: PostingEntry>(buf: &mut Vec<u8>, entries: &[E], positions: &[u32]) {
+    debug_assert_eq!(entries.iter().map(|e| e.tf() as usize).sum::<usize>(), positions.len());
     let mut at = 0usize;
-    encode_positions_with(buf, entries.len(), entries.iter().map(|&(doc, tf, _)| {
-        let slice = &positions[at..at + tf as usize];
-        at += tf as usize;
-        (doc, slice)
+    encode_positions_with(buf, entries.len(), entries.iter().map(|e| {
+        let slice = &positions[at..at + e.tf() as usize];
+        at += e.tf() as usize;
+        (e.doc(), slice)
     }));
 }
 

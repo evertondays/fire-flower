@@ -15,7 +15,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use fire_flower::{Config, Engine, Posting, Stopwords};
 use fire_flower::analysis::{Analyzer, tokenize};
 use fire_flower::internals::{
-    decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_postings,
+    decode_docs, decode_positions, decode_postings, encode_postings, intersect, merge_positions, merge_postings,
 };
 
 fn env_path(var: &str, default: &str) -> PathBuf {
@@ -93,8 +93,11 @@ fn bench_postings(c: &mut Criterion) {
     let pieces: Vec<Vec<u8>> = (1..=8u64)
         .map(|i| encode_postings(&[Posting::new(max + i * 10, 1), Posting::new(max + i * 10 + 1, 2)]))
         .collect();
-    // Pedaço que sobrepõe a lista: força o merge lento (ordenação).
+    // Pedaço que sobrepõe a lista: reindexar um documento antigo (remendo).
     let overlap = encode_postings(&[Posting::new(area[area.len() / 2].doc, 3)]);
+    // Lápide de um documento do meio: remover ou editar um documento antigo.
+    let mut tombstone = Vec::new();
+    fire_flower::internals::encode_tombstones_into(&mut tombstone, &[area[area.len() / 2].doc]);
 
     let mut g = c.benchmark_group("lists");
     g.bench_function(format!("decode_area_{}_postings", area.len()), |b| {
@@ -109,6 +112,12 @@ fn bench_postings(c: &mut Criterion) {
     });
     g.bench_function("merge_area_overlapping", |b| {
         b.iter(|| merge_postings([black_box(area_bytes.as_slice()), overlap.as_slice()].into_iter()).unwrap())
+    });
+    g.bench_function("merge_area_tombstone", |b| {
+        b.iter(|| merge_postings([black_box(area_bytes.as_slice()), tombstone.as_slice()].into_iter()).unwrap())
+    });
+    g.bench_function("merge_area_positions_tombstone", |b| {
+        b.iter(|| merge_positions([black_box(area_pos_bytes.as_slice()), tombstone.as_slice()].into_iter()).unwrap())
     });
     g.bench_function(format!("intersect_rare{}_x_area{}", rare.len(), area.len()), |b| {
         b.iter(|| intersect(black_box(&rare), black_box(&area_docs)))

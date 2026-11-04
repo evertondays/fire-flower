@@ -1,6 +1,6 @@
 //! Busca ranqueada (BM25F) com top-k.
 
-use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits, codec};
+use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits};
 use crate::codec::PostingsCursor;
 use crate::engine::conjunction::{AndList, Member, use_cursor};
 use crate::engine::groups::{GroupParts, decode_group};
@@ -8,7 +8,7 @@ use crate::engine::phrase::PhraseMatcher;
 use crate::engine::ranking::bm25::{Bm25, Bound};
 use crate::engine::ranking::score::{Scorer, doc_bound, doc_score};
 use crate::engine::ranking::topk::TopK;
-use crate::engine::view::{NormCursor, View};
+use crate::engine::view::{NormCursor, PostSource, View};
 use crate::query::Clause;
 
 mod bm25;
@@ -42,7 +42,7 @@ impl View<'_> {
         // 1. As listas. Todas entram no E; cada parte da consulta sabe quais
         //    são as suas. As exatas ficam como bytes (o df vem do cabeçalho)
         //    até se saber quem conduz.
-        let mut bytes: Vec<rocksdb::DBPinnableSlice<'_>> = Vec::new();
+        let mut bytes: Vec<PostSource<'_>> = Vec::new();
         let mut lists: Vec<Member<Posting>> = Vec::new();
         let mut scorers: Vec<Scorer> = Vec::with_capacity(clauses.len());
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
@@ -107,8 +107,7 @@ impl View<'_> {
                 }
             }
         }
-        let slices: Vec<Vec<rocksdb::DBPinnableSlice<'_>>> =
-            phrases.iter().map(|p| self.load_positions(p)).collect::<Result<_>>()?;
+        let slices = phrases.iter().map(|p| self.load_positions(p)).collect::<Result<Vec<_>>>()?;
         let mut matchers: Vec<PhraseMatcher<'_>> =
             phrases.iter().zip(&slices).map(|(p, s)| PhraseMatcher::new(p, s)).collect::<Result<_>>()?;
         // (ocorrências da frase, quantas no título), por frase.
@@ -124,7 +123,7 @@ impl View<'_> {
         // Decodifica uma lista inteira (a de um grupo guarda as entradas em `groups`).
         let decode = |m: Member<Posting>, i: usize, groups: &mut Vec<GroupParts>| -> Result<Vec<Posting>> {
             match m {
-                Member::Bytes { idx, .. } => codec::decode_postings(&bytes[idx]),
+                Member::Bytes { idx, .. } => bytes[idx].postings(),
                 Member::Decoded(list) => Ok(list),
                 Member::Group { parts, .. } => {
                     let (union, entries) = decode_group(&bytes, &parts)?;
@@ -157,11 +156,13 @@ impl View<'_> {
         let mut sources: Vec<AndList<'_>> = Vec::with_capacity(lists.len());
         for (i, m) in lists.into_iter().enumerate() {
             sources.push(match m {
-                Member::Bytes { idx, len } if i != driver && use_cursor(len, driver_len) => {
-                    AndList::Cursor { cursor: PostingsCursor::new(&bytes[idx])?, current: Posting { doc: 0, tf: 1, title_tf: 0 } }
+                Member::Bytes { idx, len } if i != driver && bytes[idx].edits.is_empty() && use_cursor(len, driver_len) => {
+                    AndList::Cursor { cursor: PostingsCursor::new(bytes[idx].base())?, current: Posting { doc: 0, tf: 1, title_tf: 0 } }
                 }
-                Member::Group { parts, len } if i != driver && use_cursor(len, driver_len) => {
-                    let cursors = parts.iter().map(|&(e, idx)| Ok((e, PostingsCursor::new(&bytes[idx])?))).collect::<Result<_>>()?;
+                Member::Group { parts, len }
+                    if i != driver && parts.iter().all(|&(_, idx)| bytes[idx].edits.is_empty()) && use_cursor(len, driver_len) =>
+                {
+                    let cursors = parts.iter().map(|&(e, idx)| Ok((e, PostingsCursor::new(bytes[idx].base())?))).collect::<Result<_>>()?;
                     let none = Posting { doc: 0, tf: 0, title_tf: 0 };
                     AndList::Group { cursors, current: (none, none) }
                 }

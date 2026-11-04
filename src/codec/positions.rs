@@ -3,19 +3,20 @@
 use crate::{DocId, Error};
 use crate::codec::{SKIP_BLOCK, put_varint};
 use crate::codec::list::{Block, ListHeader, write_list};
+use crate::codec::postings::PostingEntry;
 use crate::codec::varint::{Reader, corrupt};
 
 /// Grava em `buf` as posições de cada documento. `entries` traz
 /// `(doc, tf, tf no título)` ordenado por doc (só o tf é usado); `positions`
 /// traz as posições de todos, em sequência (`tf` posições crescentes por
 /// documento).
-pub fn encode_positions_into(buf: &mut Vec<u8>, entries: &[(DocId, u32, u32)], positions: &[u32]) {
-    debug_assert_eq!(entries.iter().map(|e| e.1 as usize).sum::<usize>(), positions.len());
+pub fn encode_positions_into<E: PostingEntry>(buf: &mut Vec<u8>, entries: &[E], positions: &[u32]) {
+    debug_assert_eq!(entries.iter().map(|e| e.tf() as usize).sum::<usize>(), positions.len());
     let mut at = 0usize;
-    encode_positions_with(buf, entries.len(), entries.iter().map(|&(doc, tf, _)| {
-        let slice = &positions[at..at + tf as usize];
-        at += tf as usize;
-        (doc, slice)
+    encode_positions_with(buf, entries.len(), entries.iter().map(|e| {
+        let slice = &positions[at..at + e.tf() as usize];
+        at += e.tf() as usize;
+        (e.doc(), slice)
     }));
 }
 
@@ -39,7 +40,7 @@ pub(super) fn encode_positions_with<'p>(buf: &mut Vec<u8>, n: usize, entries: im
             }
         }
     };
-    write_list(buf, n, write);
+    write_list(buf, n, false, write);
 }
 
 /// Lista completa de posições (diagnóstico e testes; a busca usa o cursor).
@@ -53,6 +54,14 @@ pub fn decode_positions(bytes: &[u8]) -> Result<Vec<(DocId, Vec<u32>)>, Error> {
     }
     cursor.r.finish()?;
     Ok(out)
+}
+
+/// Uma entrada do remendo de `pos:`: posições novas, ou `None` para apagar
+/// as da base. Ordenada por documento.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PosEdit {
+    pub doc: DocId,
+    pub positions: Option<Vec<u32>>,
 }
 
 /// Percorre uma lista `pos:` sem decodificá-la inteira: salta pela tabela de
@@ -69,12 +78,20 @@ pub struct PositionsCursor<'a> {
     prev: DocId,
     /// Cabeçalho (doc, k) já lido, com as posições ainda por ler.
     head: Option<(DocId, u64)>,
+    /// Edições ainda não incorporadas na base. Vazio no caminho comum.
+    edits: &'a [PosEdit],
 }
 
 impl<'a> PositionsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let ListHeader { n, blocks, body, .. } = ListHeader::parse(bytes, true)?;
-        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None })
+        Self::with_edits(bytes, &[])
+    }
+
+    /// Como [`PositionsCursor::new`], aplicando `edits` (ordenado por
+    /// documento) por cima da base, sem regravá-la.
+    pub fn with_edits(bytes: &'a [u8], edits: &'a [PosEdit]) -> Result<Self, Error> {
+        let ListHeader { n, blocks, body, .. } = ListHeader::parse_clean(bytes, true)?;
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None, edits })
     }
 
     /// Se o bloco da próxima entrada termina antes de `target`, vai direto
@@ -143,6 +160,19 @@ impl<'a> PositionsCursor<'a> {
     /// Avança até `target` (que só pode crescer entre chamadas). Se o
     /// documento estiver na lista, escreve as posições dele em `out`.
     pub fn seek(&mut self, target: DocId, out: &mut Vec<u32>) -> Result<bool, Error> {
+        if !self.edits.is_empty()
+            && let Ok(i) = self.edits.binary_search_by_key(&target, |e| e.doc)
+        {
+            return match &self.edits[i].positions {
+                // Lápide: o documento saiu do termo. A base ainda tem as
+                // posições velhas; não são visíveis.
+                None => Ok(false),
+                Some(positions) => {
+                    out.clone_from(positions);
+                    Ok(true)
+                }
+            };
+        }
         self.jump(target);
         loop {
             let doc = match self.head {

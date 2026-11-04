@@ -114,11 +114,8 @@ pub(crate) fn skip_lists_give_the_same_results() {
     for id in (0..3600u64).step_by(37) {
         let text = make(&mut next);
         batch.add_document(id * 3, &text.join(" ")).unwrap();
-        // Termos que saíram do texto continuam apontando para o documento.
-        let old = docs.remove(&(id * 3)).unwrap();
-        let mut merged: Vec<&str> = text.clone();
-        merged.extend(old.iter().filter(|w| !text.contains(w)));
-        docs.insert(id * 3, merged);
+        // O texto novo substitui o antigo: termos que saíram não acham mais o documento.
+        docs.insert(id * 3, text);
     }
     batch.commit().unwrap();
 

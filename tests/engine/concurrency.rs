@@ -194,3 +194,64 @@ pub(crate) fn reader_node_cache_under_concurrent_commits() {
         assert_eq!(engine.search(t).unwrap(), [10 + i as u64]);
     }
 }
+
+/// Edições também são atômicas: um escritor troca, lote a lote, o texto de
+/// todos os documentos entre uma versão com "alfa" e outra com "beta" (e
+/// remove e devolve metade deles). Numa busca, nenhum documento tem os dois
+/// termos (o antigo sumiu no mesmo commit em que o novo entrou), e cada
+/// versão aparece inteira ou não aparece.
+#[test]
+pub(crate) fn edits_are_atomic_for_readers() {
+    const DOCS: u64 = 300;
+    const ROUNDS: u64 = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(&dir));
+    let mut batch = engine.batch();
+    for id in 0..DOCS {
+        batch.add_document(id, "comum alfa").unwrap();
+    }
+    batch.commit().unwrap();
+
+    let writer = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                let word = if round % 2 == 0 { "alfa" } else { "beta" };
+                let mut batch = engine.batch();
+                for id in 0..DOCS {
+                    if round % 4 == 1 && id % 2 == 0 {
+                        batch.delete_document(id).unwrap();
+                    } else {
+                        batch.add_document(id, &format!("comum {word}")).unwrap();
+                    }
+                }
+                batch.commit().unwrap();
+            }
+        })
+    };
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (engine, done) = (Arc::clone(&engine), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut checks = 0;
+                while checks == 0 || !done.load(std::sync::atomic::Ordering::Acquire) {
+                    assert!(engine.search("alfa beta").unwrap().is_empty(), "documento com o texto velho e o novo");
+                    let alfa = engine.search_ranked("alfa", 5).unwrap().total as u64;
+                    assert!(alfa == 0 || alfa == DOCS, "versão vista pela metade: {alfa}");
+                    let all = engine.search("comum").unwrap().len() as u64;
+                    assert!(all == DOCS || all == DOCS / 2, "remoção vista pela metade: {all}");
+                    checks += 1;
+                }
+                checks
+            })
+        })
+        .collect();
+    writer.join().unwrap();
+    done.store(true, std::sync::atomic::Ordering::Release);
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+    assert_eq!(engine.search("comum alfa").unwrap().len() as u64, DOCS);
+    assert!(engine.search("beta").unwrap().is_empty());
+}

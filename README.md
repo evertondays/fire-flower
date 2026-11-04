@@ -24,7 +24,9 @@ Suporta:
   título como campo de peso próprio (`add_titled`; `k1 = 1,2`, `b = 0,75`,
   peso do título 50); `search` continua devolvendo todos os IDs em ordem;
 - autocompletar (`suggest`), das palavras mais curtas para as mais longas;
-- indexação em lotes atômicos, com buscas rodando em paralelo.
+- indexação em lotes atômicos, com buscas rodando em paralelo;
+- **edição e remoção** de documentos: indexar um ID que já existe o
+  substitui, e `delete_document` o remove, no mesmo commit atômico.
 
 ## Uso
 
@@ -47,6 +49,9 @@ docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower search meu-banco
 
 # busca interativa (precisa do -it)
 docker run --rm -it -v "$PWD:/data" ghcr.io/evertondays/fire-flower tui meu-banco
+
+# reindexa a pasta: arquivos alterados são substituídos e os que sumiram, removidos
+docker run --rm -v "$PWD:/data" ghcr.io/evertondays/fire-flower index --sync meu-banco documentos/
 ```
 
 Com um alias, fica igual ao binário:
@@ -81,6 +86,21 @@ Indexar arquivos e pastas (recursivo; ignora arquivos ocultos e binários;
 
 ```bash
 ./target/release/fire-flower index /tmp/indice ~/documentos
+```
+
+Rodar `index` de novo cria documentos novos para os mesmos arquivos. Para
+manter o banco igual à pasta, use `--sync`: um arquivo já indexado (achado
+pelo caminho) é substituído com o mesmo ID, e um que sumiu da pasta é
+removido.
+
+```bash
+./target/release/fire-flower index --sync /tmp/indice ~/documentos
+```
+
+Remover documentos pelo ID:
+
+```bash
+./target/release/fire-flower delete /tmp/indice 42 43
 ```
 
 Busca interativa, com resultados enquanto você digita:
@@ -133,13 +153,20 @@ Por baixo, o script chama:
 
 Cada linha do JSONL é `{"id", "title", "text"}`: indexa o texto e o título
 (como campo próprio, que pesa mais no ranking) sob o `id`, e guarda o título
-como rótulo. No `index` de arquivos, o título é o nome do arquivo sem a
-extensão.
+como rótulo. Um `id` que já existe é substituído, e uma linha
+`{"op": "delete", "id": 42}` remove o documento. No `index` de arquivos, o
+título é o nome do arquivo sem a extensão.
 
 Por padrão o banco grava as **posições** de cada termo, que a busca por frase
 usa. Com `--no-positions` (em `index`, `index-jsonl` e
 `scripts/carregar_wikipedia.py`) o banco fica menor e a carga mais rápida, mas
 frases dão erro. A escolha fica gravada no banco, como os idiomas.
+
+Também por padrão, o banco grava os **termos de cada documento** (`fwd:`),
+que a edição e a remoção usam. Com `--no-edits` (em `index` e `index-jsonl`)
+o banco fica menor, mas remover dá erro e reindexar um ID só troca tf,
+posições e tamanho (os termos que saíram do texto continuam apontando para
+ele). Também fica gravado no banco.
 
 Para achar outras formas da palavra há duas opções (nas mesmas opções de
 criação; ver [docs/plano-stemming.md](docs/plano-stemming.md)):
@@ -201,11 +228,40 @@ assert_eq!(engine.suggest("es", 5)?, ["estudante"]);
 let top = engine.search_top("coração", 10)?;
 // Com o total de documentos que casaram.
 let ranked = engine.search_ranked("coração", 10)?; // TopHits { hits, total }
+
+// Editar e remover: o mesmo ID substitui o documento inteiro.
+let mut batch = engine.batch();
+batch.add_document(1, "O coração de Minas")?;
+batch.delete_document(2)?;
+batch.commit()?;
+assert!(engine.search("brasil")?.is_empty());
+assert_eq!(engine.search("coração")?, [1]);
 ```
 
 `Engine` é `Sync`: compartilhe com `Arc<Engine>`. Só um lote de indexação
 existe por vez (os outros esperam); buscas nunca esperam e nunca veem um lote
-pela metade.
+pela metade, nem uma edição pela metade. No mesmo lote, a última operação de
+cada documento vence.
+
+Editar é barato no commit (~1 ms para um documento), mas até a compactação
+as listas dos termos editados têm pedaços pendentes que toda leitura une de
+novo, e as buscas ficam mais lentas. Numa aplicação que edita aos poucos,
+ligue a manutenção em segundo plano: ela compacta quando as edições acumuladas
+passam de 1% dos documentos (no mínimo 1.000) e tira da Trie as palavras que
+ficaram sem documento.
+
+```rust
+use std::sync::Arc;
+use fire_flower::{Maintenance, MaintenanceOptions};
+
+let engine = Arc::new(engine);
+let maintenance = Maintenance::spawn(Arc::clone(&engine), MaintenanceOptions::default());
+// ... edições e buscas ...
+maintenance.stop()?; // ou só descarte
+```
+
+Sem ela, chame `Engine::compact` e `Engine::collect_empty_words` (o `compact`
+da CLI faz os dois) depois de editar muito.
 
 ## Arquitetura
 
@@ -226,7 +282,7 @@ imports, erros, performance, git): [docs/diretrizes-de-codigo.md](docs/diretrize
 
 ### Chaves no RocksDB
 
-Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
+Formato v6 (`meta:format = 6`). Um banco de formato anterior não abre: o
 `open` diz em que formato ele está e pede para recarregar.
 
 | Chave | Valor |
@@ -236,10 +292,12 @@ Formato v5 (`meta:format = 5`). Um banco de formato anterior não abre: o
 | `pos:<id>` | posições do termo em cada documento: `(Δdoc, k, k × Δposição)` (só com posições); o título vem primeiro e o texto começa 100 posições depois |
 | `norm:<bloco>` | tamanho (tokens indexados) de cada documento com `id ÷ 1024 = bloco`, e o do título |
 | `doc:<id>` | rótulo opcional do documento (o CLI grava o caminho do arquivo) |
+| `fwd:<id>` | nós terminais dos termos do documento, em ordem (para editar e remover; só sem `--no-edits`) |
 | `meta:next_node_id`, `meta:next_doc_id` | contadores de ID |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e dos títulos (BM25) |
 | `stem:<radical>` | nós das palavras com esse radical (só com `--inflections`) |
-| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | formato, se grava posições, idiomas das stopwords, stemming e flexões |
+| `meta:maybe_empty` | nós que receberam lápide e podem ter ficado sem documento (até a limpeza) |
+| `meta:format`, `meta:positions`, `meta:edits`, `meta:languages`, `meta:stemming`, `meta:inflections` | formato, se grava posições e `fwd:`, idiomas das stopwords, stemming e flexões |
 
 Os valores usam varint; as listas gravam a diferença entre IDs consecutivos,
 então documentos com IDs próximos custam ~1 byte cada. `post:` e `pos:` ficam
@@ -248,6 +306,12 @@ de 256 documentos têm, antes das entradas, uma tabela de saltos (último
 documento, tamanho e quantidade de entradas de cada bloco, 128 na gravação):
 o E e as frases vão direto ao bloco de um documento, sem decodificar a lista
 inteira, e o merge só concatena as tabelas dos pedaços.
+
+Editar ou remover grava uma **lápide** (entrada com tf 0) nas listas dos
+termos que saíram do documento, no mesmo commit. O merge que o RocksDB faz na
+leitura descarta as lápides, então a busca nunca as vê; até a compactação, as
+listas com lápide pendente são unidas por remendo (só os blocos tocados são
+regravados; os outros são copiados).
 
 ### Configuração do RocksDB
 
@@ -294,9 +358,14 @@ python3 scripts/perf.py all --scale 10k
 
 ## Limitações conhecidas
 
-- **Sem remoção ou atualização de documentos.** Reindexar o mesmo ID troca o
-  tf, as posições e o tamanho dele (e não conta o documento duas vezes), mas
-  termos que saíram do texto continuam apontando para ele.
+- **Edições pesam até a compactação.** Cada termo de um documento editado
+  ou removido ganha um pedaço pendente na lista, que a leitura une até a
+  compactação: na fatia de 100k, 1.000 edições deixam a busca de um termo
+  frequente ~7× mais lenta. Use a `Maintenance` (biblioteca) ou
+  `fire-flower compact` depois de editar muito.
+- **A Trie não encolhe sozinha.** Uma palavra que ficou sem documento continua
+  na Trie até `collect_empty_words` (o `compact` da CLI chama); até lá ela já
+  não é sugerida, mas o autocompletar confere a lista dela, o que é mais lento.
 - **Peso do título ajustado para a Wikipédia.** O peso 50 saiu de consultas
   com resposta conhecida na Wikipédia, onde o título descreve o artigo; em
   outro tipo de corpus, ajuste `Config::title_weight`. Páginas de

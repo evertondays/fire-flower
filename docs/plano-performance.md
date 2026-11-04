@@ -68,8 +68,9 @@ Medido na Wikipédia inteira, cache quente, 1 thread, banco compactado.
 | Várias threads | 4,3× com 12 threads | suspeito: `RwLock` dos caches de leitura (`EpochCache`) | aberto (P4) |
 | Abrir o banco | 38 ms após a carga, 29 ms compactado | | resolvido |
 
-**Fora do escopo por enquanto** (o motor não tem): OR, remoção e atualização
-(ver [design-escrita-leitura.md](design-escrita-leitura.md)).
+**Fora do escopo por enquanto** (o motor não tem): OR. Remoção e atualização
+têm plano e medição próprios: [plano-edicao.md](plano-edicao.md) e
+`perf.py edits`.
 
 ---
 

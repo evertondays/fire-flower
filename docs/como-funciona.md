@@ -165,8 +165,12 @@ nada.
 milhão de IDs. Sem merge, adicionar um documento exigiria ler a lista inteira,
 acrescentar um ID e regravá-la. Com merge, gravamos só o pedaço novo
 (`merge("post:1", [42])`) e registramos uma função que sabe unir pedaços (a
-`merge_postings`). O RocksDB chama essa função quando alguém lê a chave e
-durante a compactação, quando consolida os pedaços de vez.
+`merge_lists`). O RocksDB chama essa função quando alguém lê a chave e
+durante a compactação, quando consolida os pedaços de vez. Ela tem duas
+versões: a **completa**, quando o RocksDB tem o valor base (ou sabe que não há
+nenhum: toda leitura e a compactação do último nível), e a **parcial**, que só
+junta pedaços consecutivos e pode ter um valor mais antigo embaixo. A
+diferença importa para a remoção (seção 5.6).
 
 **Snapshot (consistência de leitura).** Toda escrita recebe um número de
 sequência crescente. Um snapshot "congela" um número: leituras feitas por ele
@@ -239,11 +243,13 @@ prefixo na chave:
 | `pos:<id>` | as posições do termo em cada documento (só em bancos com posições); o título vem primeiro e o texto começa 100 posições depois do fim dele | `pos:11` = onde `casa` aparece |
 | `norm:<bloco>` | o tamanho de cada documento cujo `id ÷ 1024` é o bloco, e o do título | `norm:0` = documentos 0 a 1023 |
 | `doc:<id>` | rótulo do documento (a CLI grava o caminho do arquivo) | `doc:42` → `/home/.../notas.txt` |
+| `fwd:<id>` | os nós terminais dos termos do documento (o índice "direto"), para editar e remover | `fwd:2` = nós de `azul`, `carro`, `casa` |
 | `meta:next_node_id` | próximo ID livre para nós | |
 | `meta:next_doc_id` | próximo ID livre para documentos | |
 | `meta:doc_count`, `meta:total_len`, `meta:total_title_len` | total de documentos, soma dos tamanhos e soma dos tamanhos de título (para o ranking) | |
 | `stem:<radical>` | nós das palavras com esse radical (só com flexões na consulta) | |
-| `meta:format`, `meta:positions`, `meta:languages`, `meta:stemming`, `meta:inflections` | versão do formato, se grava posições, idiomas das stopwords, stemming e flexões | |
+| `meta:maybe_empty` | nós que receberam lápide desde a última limpeza (seção 5.6) | |
+| `meta:format`, `meta:positions`, `meta:edits`, `meta:languages`, `meta:stemming`, `meta:inflections` | versão do formato, se grava posições e `fwd:`, idiomas das stopwords, stemming e flexões | |
 
 A lista de postagem usa o mesmo número do nó onde a palavra termina. Assim
 não precisamos de um segundo contador nem de guardar o ID da lista dentro do
@@ -264,12 +270,17 @@ O banco resultante tem exatamente estas chaves (valores em hexadecimal, na
 ordem em que o RocksDB as guarda):
 
 ```text
+fwd:1                  04 07
+fwd:2                  04 05 02
 meta:doc_count         02
-meta:format            04
+meta:edits             01
+meta:format            06
+meta:inflections       none
 meta:languages         pt,en
 meta:next_doc_id       03
 meta:next_node_id      0c
 meta:positions         01
+meta:stemming          none
 meta:total_len         05
 meta:total_title_len   00
 node:0                 00 02 61 01 63 05
@@ -284,7 +295,7 @@ node:6                 00 02 72 07 73 0a
 node:7                 00 01 72 08
 node:8                 00 01 6f 09
 node:9                 01 00
-norm:0                 02 01 02 00 01 03 00
+norm:0                 02 01 02 00 00 01 03 00 00
 pos:11                 02 00 01 01 01 01 01 05
 pos:4                  02 00 01 01 02 01 01 02
 pos:9                  01 00 02 01 01
@@ -339,10 +350,14 @@ maioria dos nós tem um filho só.
 
 ```text
 02          2 documentos
-00          tabela de saltos vazia (lista pequena)
+00          tabela de saltos vazia (lista pequena), sem lápides
 01 02       documento 0 + 1 = 1; 02 = tf 1 << 1, sem título
 01 02       documento 1 + 1 = 2; tf 1, sem título
 ```
+
+O segundo número é `s << 1 | tem lápide`: `s` é a quantidade de blocos da
+tabela de saltos (abaixo), e o bit de baixo diz se alguma entrada é uma
+lápide (seção 5.6). Uma lista que a busca lê nunca tem lápide.
 
 O segundo número é `tf << 1 | tem título`. Quando o bit de baixo é 1, vem
 mais um número: quantas das ocorrências estão no título. Um documento com
@@ -350,7 +365,7 @@ mais um número: quantas das ocorrências estão no título. Um documento com
 título). Entradas sem o termo no título, que são quase todas, não pagam nada
 a mais.
 
-**Tabela de saltos (formato v5).** O segundo número é a quantidade de
+**Tabela de saltos (desde o formato v5).** `s` é a quantidade de
 blocos de uma tabela de saltos, que só listas com mais de 256 documentos
 têm: para cada bloco, o último documento (em delta), o tamanho em bytes e
 quantas entradas ele tem (menos 1). As entradas vêm logo depois e são as
@@ -383,15 +398,29 @@ conferida: `azul` em 2 e `casa` em 2 + 3.
 ### Lendo os tamanhos: `norm:0`
 
 ```text
-02          2 documentos neste bloco (IDs 0 a 1023)
-01 02 00    deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul), título 0
-01 03 00    deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa), título 0
+02           2 documentos neste bloco (IDs 0 a 1023)
+01 02 00 00  deslocamento 0 + 1 = 1 (documento 1), tamanho 2 (casa, azul), título 0, extensão do título 0
+01 03 00 00  deslocamento 1 + 1 = 2 (documento 2), tamanho 3 (carro, azul, casa), título 0, extensão 0
 ```
 
 O tamanho conta só os tokens indexados (sem stopwords), título e texto
-juntos; o terceiro número é quanto disso é título. `meta:total_len = 5` é a
-soma dos tamanhos e `meta:doc_count = 2`; o ranking usa o tamanho médio
-(5 ÷ 2) para comparar documentos.
+juntos; o terceiro número é quanto disso é título, e o quarto, quantas
+posições o título ocupa (stopwords inclusive; as frases usam para saber se
+uma ocorrência está no título). `meta:total_len = 5` é a soma dos tamanhos e
+`meta:doc_count = 2`; o ranking usa o tamanho médio (5 ÷ 2) para comparar
+documentos.
+
+### Lendo os termos de um documento: `fwd:2`
+
+```text
+04          nó 4 (azul)
+05          nó 4 + 5 = 9 (carro)
+02          nó 9 + 2 = 11 (casa)
+```
+
+Os nós terminais dos termos do documento, em ordem e em delta. É o que a
+edição e a remoção leem para saber de quais listas tirar o documento (seção
+5.6).
 
 Duas técnicas deixam tudo isso pequeno:
 
@@ -557,10 +586,10 @@ ele. E como os termos vêm em ordem, vizinhos compartilham o começo ("casa",
 "casaco", "casamento"): a descida recomeça do fim do prefixo comum com o
 termo anterior, e não da raiz.
 
-**Reindexar o mesmo ID** troca o tf, as posições e o tamanho dele: dentro do
-lote, a última adição vence; entre lotes, quem decide é o merge operator
-(5.5). O total de documentos não conta o ID duas vezes. Termos que saíram do
-texto continuam apontando para o documento (não há remoção).
+**Reindexar o mesmo ID** substitui o documento: os termos que saíram do
+texto deixam de achá-lo no mesmo commit (seção 5.6). Dentro do lote, a última
+operação de cada documento vence; entre lotes, quem decide é o merge operator
+(5.5). O total de documentos não conta o ID duas vezes.
 
 A ordem alfabética deixa a criação de nós determinística: o mesmo corpus com
 o mesmo tamanho de lote gera sempre os mesmos IDs. Com outro tamanho de lote
@@ -608,15 +637,17 @@ Um único `WriteBatch` com:
 | cada nó *dirty* | `put node:<id>` | nós só lidos não são regravados |
 | cada lista nova | `merge post:<id>` | só os documentos novos, com tf, ordenados e em deltas |
 | cada lista de posições | `merge pos:<id>` | só com posições ligadas |
-| cada bloco de tamanhos tocado | `put norm:<bloco>` | o bloco inteiro: lido, atualizado e regravado |
-| cada rótulo | `put doc:<id>` | |
+| cada bloco de tamanhos tocado | `put norm:<bloco>` | o bloco inteiro: lido, atualizado e regravado (`delete` se ficou vazio) |
+| cada documento | `put fwd:<id>` | os nós dos termos dele; `delete` numa remoção |
+| cada termo que perdeu documentos | `merge post:<id>`, `merge pos:<id>` | lápides (seção 5.6) |
+| cada rótulo | `put doc:<id>` | `delete` numa remoção |
 | contadores e estatísticas | `put meta:*` | `doc_count` e `total_len` incluídos |
 
-Os blocos de `norm:` são lidos no commit (com IDs crescentes, um ou dois por
-lote) para saber se o documento já existia: se sim, troca o tamanho e ajusta
-`total_len`; se não, conta mais um em `doc_count`. Tudo vai no mesmo
-`WriteBatch`, então lista, posições, tamanhos e estatísticas nunca
-discordam.
+Os blocos de `norm:` são lidos no começo do commit (com IDs crescentes, um ou
+dois por lote) para saber se o documento já existia: se sim, troca o tamanho
+e ajusta `total_len` (e lê o `fwd:` dele, seção 5.6); se não, conta mais um em
+`doc_count`. Tudo vai no mesmo `WriteBatch`, então lista, posições, tamanhos,
+estatísticas e `fwd:` nunca discordam.
 
 O `db.write(batch)` é atômico. Só depois dele os contadores em memória
 (`WriterState`) avançam. Se o lote for descartado sem commit, ou o commit
@@ -653,6 +684,62 @@ regrava em blocos de 128).
 Enquanto a compactação não roda, uma leitura de `post:<id>` une os pedaços na
 hora. Por isso listas muito disputadas podem ficar mais lentas logo depois de
 uma carga grande; o plano de performance mede isso.
+
+Pedaços que se sobrepõem (reindexar ou remover um documento antigo) não
+decodificam a lista inteira: os pedaços mais novos são unidos num **remendo**,
+e os blocos da lista que o remendo não toca são copiados com um `memcpy`; só
+os tocados são relidos e regravados. Unir uma lista de 25 mil documentos com
+um remendo de um documento leva ~10 µs (decodificar e regravar tudo levava
+~330 µs). Nenhum caminho decodifica o conteúdo das entradas (tf, posições): os
+bytes de cada uma são copiados como estão.
+
+### 5.6 Edição e remoção
+
+`add_*` com um ID que já existe **substitui** o documento, e
+`delete_document` o **remove**. Para saber de quais listas tirar o documento,
+cada um guarda os seus termos em `fwd:<id>` (os nós terminais, em ordem e em
+delta). Num commit, para cada documento que já existia (os blocos de `norm:`
+dizem quem), o escritor lê o `fwd:` antigo (um `MultiGet` para o lote
+inteiro) e compara com os termos novos:
+
+- termo que continua: nada a fazer, a entrada nova vence a antiga no merge;
+- termo que saiu (ou todos, numa remoção): uma **lápide** na lista dele, uma
+  entrada com `tf << 1 | título = 0` em `post:` e `k = 0` em `pos:`.
+
+As lápides vão no mesmo `WriteBatch` que o resto, então nenhuma busca vê o
+documento editado pela metade. O merge **parcial** guarda as lápides (pode
+haver, num nível mais fundo, um valor antigo com aquele documento); o
+**completo** as descarta. Como toda leitura usa o merge completo, o código de
+busca não sabe que lápides existem. Uma carga de documentos novos não lê nada
+a mais: só quem já existia tem `fwd:` lido.
+
+No mesmo lote, a última operação de cada documento vence: adicionar e remover
+não grava nada, e reindexar duas vezes vale o segundo texto inteiro.
+
+**Palavras sem documento.** A Trie não encolhe: uma palavra cujo último
+documento saiu continua com o fim de palavra marcado. Todo nó que recebe
+lápide entra num conjunto de suspeitos (em memória e em `meta:maybe_empty`), e
+o autocompletar e a expansão de prefixo conferem a lista de um suspeito antes
+de usá-lo. `Engine::collect_empty_words` (o `compact` da CLI chama) confere
+todos e tira o fim de palavra dos vazios; depois disso as buscas não conferem
+mais nada. Sem remoções o conjunto fica vazio, e a busca nem pega a trava
+dele.
+
+**Até a compactação, edições pesam nas leituras.** Uma lista que perdeu ou
+trocou documentos fica com pedaços pendentes, e toda leitura dela faz o merge
+de novo. Com edições espalhadas, quase todo bloco de uma lista frequente é
+tocado, e o remendo vira percorrer e regravar a lista inteira. Na fatia de
+100k da Wikipédia, 1.000 edições de um documento deixam a busca de um termo
+frequente ~7× mais lenta e o autocompletar ~17× (até a limpeza das palavras);
+a compactação (4 s) devolve tudo ao tempo de antes. Por isso existe a
+`Maintenance`: uma thread opcional que compacta quando as edições acumuladas
+(`Engine::pending_edits`) passam de um limite (1% dos documentos, no mínimo
+1.000) e depois limpa as palavras sem documento. As edições continuam
+síncronas e baratas (~1 ms por commit de um documento); a parte cara fica em
+segundo plano.
+
+Num banco criado com `--no-edits` (`Config::edits`), não há `fwd:`: remover dá
+erro, e reindexar um ID só troca tf, posições e tamanho.
 
 ---
 
@@ -743,7 +830,8 @@ longas e, no mesmo comprimento, em ordem alfabética**: para `ca`, `casa` (4
 letras) vem antes de `carro` (5).
 
 As sugestões vêm **normalizadas** (`coracao`, não `coração`), porque é assim
-que os termos estão na Trie.
+que os termos estão na Trie. Uma palavra que ficou sem documento depois de
+remoções não é sugerida (seção 5.6).
 
 ### 6.5 Frase: `"azul e a casa"`
 
@@ -877,6 +965,10 @@ flowchart LR
 - **Por que um nó nunca aponta para o vazio:** nós só ganham filhos, nunca os
   perdem, e um nó novo é gravado no mesmo `WriteBatch` que o pai que aponta
   para ele.
+- **Edições também são atômicas:** as lápides dos termos que saíram e as
+  entradas dos que entraram vão no mesmo `WriteBatch`. Um teste troca o texto
+  de todos os documentos entre uma versão e outra enquanto leitores buscam, e
+  nenhum documento aparece com as duas.
 - **Os caches das buscas respeitam o snapshot.** Os blocos `norm:` e os nós
   rasos da Trie ficam num cache compartilhado (`EpochCache`), mas uma busca
   não pode usar um valor gravado depois do snapshot dela. Cada commit tem um número (*epoch*). Antes de gravar, o
@@ -969,14 +1061,14 @@ src/
 │   ├── stem.rs         Stemmer (Snowball pt/en e pt-plural)
 │   └── stopwords/      Language, Stopwords e as listas pt.txt e en.txt
 ├── query/              consulta → partes: parse_query, Clause, QueryTerm
-├── codec/              formatos gravados no RocksDB (v5)
+├── codec/              formatos gravados no RocksDB (v6)
 │   ├── trie_node.rs    node:  TrieNode
 │   ├── list.rs         cabeçalho e tabela de saltos comuns a post: e pos:
 │   ├── postings.rs     post:  decode_postings, decode_docs, PostingsCursor
 │   ├── positions.rs    pos:   PositionsCursor
 │   ├── norms.rs        norm:  NormBlock
 │   ├── node_set.rs     stem:  conjuntos de nós
-│   ├── merge.rs        merge por documento (merge_postings, merge_positions)
+│   ├── merge.rs        merge por documento, com lápides e remendo (merge_lists)
 │   └── varint.rs       varint e leitor de bytes
 ├── engine/             índice e armazenamento
 │   ├── mod.rs          Engine: open, batch, search, search_top/search_ranked, suggest, label
@@ -984,6 +1076,8 @@ src/
 │   ├── keys.rs         espaços de chave (node:, post:, pos:, norm:, doc:, stem:, meta:)
 │   ├── meta.rs         formato, idiomas e stemming gravados; merge_operator
 │   ├── cache.rs        EpochCache: nós e blocos de tamanhos compartilhados entre buscas
+│   ├── empty_words.rs  palavras que podem ter ficado sem documento e a limpeza delas
+│   ├── maintenance.rs  Maintenance: compacta e limpa em segundo plano depois de edições
 │   ├── view.rs         View: leituras sobre um snapshot
 │   ├── search.rs       busca sem ranking (documentos em ordem de ID)
 │   ├── conjunction.rs  o E entre listas: cursores que saltam blocos, intersect
@@ -992,9 +1086,10 @@ src/
 │   ├── groups.rs       grupos de flexões na consulta
 │   ├── diagnostics.rs  medições para o harness de performance
 │   ├── ranking/        BM25F (bm25.rs), nota por documento (score.rs), top-k (topk.rs)
-│   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs)
+│   └── writer/         IndexBatch e commit; a Trie do escritor (trie.rs); tamanhos,
+│                       fwd:, lápides e rótulos (documents.rs)
 └── bin/fire-flower/    a CLI
-    ├── main.rs         subcomandos tui, index, index-jsonl, compact, search, suggest
+    ├── main.rs         subcomandos tui, index, index-jsonl, delete, compact, search, suggest
     ├── jsonl.rs        index-jsonl
     └── tui/            busca interativa: estado (mod.rs), desenho, prévia
 tests/engine/           testes de ponta a ponta, um arquivo por tema
@@ -1032,6 +1127,7 @@ engine.suggest("cor", 10)?;        // Vec<String>
 | Frase de *n* termos | as *n* listas `post:` + *n* listas `pos:` | posições só conferidas nos documentos que passaram no E |
 | Top *k* (BM25) | o E + 2 `get`s (estatísticas) + tamanho dos documentos que podem entrar no top | blocos de `norm:` em cache |
 | Indexar um lote | tokenizar + 1 caminho na Trie por termo distinto do lote + os blocos de `norm:` tocados | nós no cache do escritor não são relidos |
+| Substituir ou remover | 1 `fwd:` lido por documento que já existia + 1 lápide por termo que saiu | as lápides pesam nas leituras até a compactação |
 | Commit | 1 `WriteBatch` | escrita sequencial no WAL |
 
 **Espaço:** as posições são a maior parte do banco. Na fatia de 10k da
@@ -1041,8 +1137,6 @@ formato v1, sem tf nem tamanhos, tinha ~17 MB).
 
 **Ainda não existe:**
 
-- remover documentos (reindexar o mesmo ID troca tf, posições e tamanho, mas
-  termos que saíram do texto continuam apontando para ele);
 - campos com pesos diferentes (o título pesando mais que o texto, BM25F);
 - OU, prefixo dentro de frase, proximidade (`NEAR`) e stemming ("casa" ≠ "casas");
 - `fsync` a cada commit: se o *sistema operacional* cair (não só o processo),

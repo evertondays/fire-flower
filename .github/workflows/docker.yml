@@ -85,6 +85,8 @@ jobs:
           run suggest banco bra | grep -qx 'brasil'
           run index-jsonl wiki artigos.jsonl
           run search wiki planeta | grep -q 'Planeta Terra'
+          run delete wiki 1 | grep -q '^1 documento'
+          run search wiki planeta | tee /dev/stderr | grep -q '^0 resultado'
 
       - name: Guarda o digest
         if: env.PUSH == 'true'

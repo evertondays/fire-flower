@@ -66,6 +66,9 @@ pub(crate) fn labels_and_auto_ids() {
     assert_eq!(engine.search("automatico").unwrap(), [42, 43]);
     assert_eq!(engine.label(43).unwrap().as_deref(), Some("b.txt"));
     assert_eq!(engine.label(41).unwrap(), None);
+    let mut labels = Vec::new();
+    engine.for_each_label(|doc, label| labels.push((doc, label.to_string()))).unwrap();
+    assert_eq!(labels, [(42, "a.txt".to_string()), (43, "b.txt".to_string())]);
 }
 
 #[test]

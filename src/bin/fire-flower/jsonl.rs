@@ -1,5 +1,6 @@
 //! `fire-flower index-jsonl`: indexa um JSONL com um documento por linha,
 //! no formato do corpus da Wikipédia: `{"id": u64, "title": str, "text": str}`.
+//! Um ID que já existe é substituído; `{"op": "delete", "id": u64}` remove.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -14,9 +15,13 @@ const REPORT_EVERY: Duration = Duration::from_millis(500);
 #[derive(Deserialize)]
 struct Article {
     id: u64,
+    /// `"delete"` remove o documento; sem `op`, adiciona ou substitui.
+    #[serde(default)]
+    op: Option<String>,
     #[serde(default)]
     title: String,
-    text: String,
+    /// Obrigatório para adicionar; uma remoção não precisa.
+    text: Option<String>,
 }
 
 /// Uma linha de progresso. Com `--progress-json`, vai para a saída padrão
@@ -28,6 +33,8 @@ struct Progress {
     phase: &'static str,
     lines: u64,
     documents: u64,
+    /// Linhas `{"op": "delete"}`.
+    deleted: u64,
     invalid: u64,
     bytes: u64,
     bytes_total: u64,
@@ -68,13 +75,27 @@ pub fn index(engine: &Engine, path: &Path, opts: &Options) -> Result<(), Box<dyn
         }
 
         match serde_json::from_slice::<Article>(&line) {
-            Ok(article) => {
-                // O título é um campo à parte: buscável e com peso próprio no ranking.
-                batch.add_titled(article.id, &article.title, &article.text)?;
-                batch.set_label(article.id, &article.title);
-                progress.documents += 1;
-                progress.last_title = article.title;
-            }
+            Ok(article) => match (article.op.as_deref(), &article.text) {
+                (None, None) => {
+                    progress.invalid += 1;
+                    eprintln!("linha {} ignorada: falta o campo text", progress.lines);
+                }
+                (None, Some(text)) => {
+                    // O título é um campo à parte: buscável e com peso próprio no ranking.
+                    batch.add_titled(article.id, &article.title, text)?;
+                    batch.set_label(article.id, &article.title);
+                    progress.documents += 1;
+                    progress.last_title = article.title;
+                }
+                (Some("delete"), _) => {
+                    batch.delete_document(article.id)?;
+                    progress.deleted += 1;
+                }
+                (Some(op), _) => {
+                    progress.invalid += 1;
+                    eprintln!("linha {} ignorada: op {op:?} desconhecida (use \"delete\")", progress.lines);
+                }
+            },
             Err(_) if line.iter().all(u8::is_ascii_whitespace) => {}
             Err(e) => {
                 progress.invalid += 1;

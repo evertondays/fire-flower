@@ -112,25 +112,31 @@ impl View<'_> {
         bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
         members: &mut Vec<Member<T>>,
     ) -> Result<usize> {
-        let mut parts = Vec::with_capacity(variants.len() + 1);
-        let (mut max_df, mut len) = (0usize, 0usize);
-        let mut push = |is_exact: bool, value: rocksdb::DBPinnableSlice<'s>| -> Result<()> {
-            let n = codec::list_len(&value)? as usize;
-            max_df = max_df.max(n);
-            len += n;
-            parts.push((is_exact, bytes.len()));
-            bytes.push(value);
-            Ok(())
-        };
-        if let Some(value) = exact.map(|n| self.post_bytes(n)).transpose()?.flatten() {
-            push(true, value)?;
-        }
-        for value in self.get_many(POST, variants.into_iter())?.into_iter().flatten() {
-            push(false, value)?;
-        }
-        if len > 0 {
-            members.push(Member::Group { parts, len });
-        }
-        Ok(max_df)
+        let exact = exact.map(|n| self.post_bytes(n)).transpose()?.flatten();
+        let variants = self.get_many(POST, variants.into_iter())?.into_iter().flatten().collect();
+        add_group_values(exact, variants, bytes, members)
     }
+}
+
+/// Guarda listas já lidas como um grupo (a exata e as outras: flexões ou
+/// correções) e devolve o maior df entre elas (0 se nenhuma existe).
+pub(super) fn add_group_values<'s, T>(
+    exact: Option<rocksdb::DBPinnableSlice<'s>>,
+    others: Vec<rocksdb::DBPinnableSlice<'s>>,
+    bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+    members: &mut Vec<Member<T>>,
+) -> Result<usize> {
+    let mut parts = Vec::with_capacity(others.len() + 1);
+    let (mut max_df, mut len) = (0usize, 0usize);
+    for (is_exact, value) in exact.map(|v| (true, v)).into_iter().chain(others.into_iter().map(|v| (false, v))) {
+        let n = codec::list_len(&value)? as usize;
+        max_df = max_df.max(n);
+        len += n;
+        parts.push((is_exact, bytes.len()));
+        bytes.push(value);
+    }
+    if len > 0 {
+        members.push(Member::Group { parts, len });
+    }
+    Ok(max_df)
 }

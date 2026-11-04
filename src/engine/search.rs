@@ -3,8 +3,9 @@
 use crate::{DocId, InflectionMode, Result, codec};
 use crate::codec::PostingsCursor;
 use crate::engine::conjunction::{Member, seek_docs, use_cursor};
-use crate::engine::groups::decode_group_docs;
+use crate::engine::groups::{add_group_values, decode_group_docs};
 use crate::engine::phrase::PhraseMatcher;
+use crate::engine::typos::TermLists;
 use crate::engine::view::View;
 use crate::query::Clause;
 
@@ -41,7 +42,12 @@ impl View<'_> {
                     let (exact, variants) =
                         if expand { self.inflections(&t.text)? } else { (self.term_node(&t.text)?, Vec::new()) };
                     let df = if variants.is_empty() {
-                        self.add_exact(exact, &mut bytes, &mut members)?
+                        match self.exact_or_corrected(&t.text, exact)? {
+                            TermLists::Exact(value) => add_value(value, &mut bytes, &mut members)?,
+                            TermLists::Corrected { exact, fixes } => {
+                                add_group_values(exact, fixes.into_iter().map(|f| f.value).collect(), &mut bytes, &mut members)?
+                            }
+                        }
                     } else {
                         self.add_group(exact, variants, &mut bytes, &mut members)?
                     };
@@ -150,10 +156,19 @@ impl View<'_> {
         members: &mut Vec<Member<T>>,
     ) -> Result<usize> {
         let Some(node) = node else { return Ok(0) };
-        let Some(value) = self.post_bytes(node)? else { return Ok(0) };
-        let len = codec::list_len(&value)? as usize;
-        members.push(Member::Bytes { idx: bytes.len(), len });
-        bytes.push(value);
-        Ok(len)
+        add_value(self.post_bytes(node)?, bytes, members)
     }
+}
+
+/// Guarda os bytes de uma lista `post:` já lida e devolve o df (0 sem lista).
+pub(super) fn add_value<'s, T>(
+    value: Option<rocksdb::DBPinnableSlice<'s>>,
+    bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
+    members: &mut Vec<Member<T>>,
+) -> Result<usize> {
+    let Some(value) = value else { return Ok(0) };
+    let len = codec::list_len(&value)? as usize;
+    members.push(Member::Bytes { idx: bytes.len(), len });
+    bytes.push(value);
+    Ok(len)
 }

@@ -3,11 +3,13 @@
 use crate::{DocId, Hit, InflectionMode, Posting, Result, TopHits};
 use crate::codec::PostingsCursor;
 use crate::engine::conjunction::{AndList, Member, use_cursor};
-use crate::engine::groups::{GroupParts, decode_group};
+use crate::engine::groups::{GroupParts, add_group_values, decode_group};
 use crate::engine::phrase::PhraseMatcher;
 use crate::engine::ranking::bm25::{Bm25, Bound};
 use crate::engine::ranking::score::{Scorer, doc_bound, doc_score};
 use crate::engine::ranking::topk::TopK;
+use crate::engine::search::add_value;
+use crate::engine::typos::TermLists;
 use crate::engine::view::{NormCursor, View};
 use crate::query::Clause;
 
@@ -47,29 +49,42 @@ impl View<'_> {
         let mut scorers: Vec<Scorer> = Vec::with_capacity(clauses.len());
         let mut phrases: Vec<Vec<(u32, u64)>> = Vec::new();
         let mut groups: Vec<GroupParts> = Vec::new();
+        let mut corrections = Vec::new();
         for clause in clauses {
             match clause {
                 Clause::Term(t) if !t.prefix => {
                     let (exact, variants) =
                         if expand { self.inflections(&t.text)? } else { (self.term_node(&t.text)?, Vec::new()) };
-                    if variants.is_empty() {
-                        let df = self.add_exact(exact, &mut bytes, &mut lists)?;
-                        if df == 0 {
-                            return Ok(TopHits::default());
-                        }
-                        let weight = bm25.weight(bm25.idf(df));
-                        scorers.push(Scorer::Term { weight, list: lists.len() - 1, bound: Bound::new(weight, &bm25) });
-                        continue;
-                    }
                     let list = lists.len();
-                    let max_df = self.add_group(exact, variants, &mut bytes, &mut lists)?;
+                    // Um grupo: flexões com peso α, ou correções com peso γ.
+                    let (max_df, alpha) = if variants.is_empty() {
+                        let found = self.exact_or_corrected(&t.text, exact)?;
+                        corrections.extend(found.correction(&t.text));
+                        match found {
+                            TermLists::Exact(value) => {
+                                let df = add_value(value, &mut bytes, &mut lists)?;
+                                if df == 0 {
+                                    return Ok(TopHits::default());
+                                }
+                                let weight = bm25.weight(bm25.idf(df));
+                                scorers.push(Scorer::Term { weight, list, bound: Bound::new(weight, &bm25) });
+                                continue;
+                            }
+                            TermLists::Corrected { exact, fixes } => {
+                                let others = fixes.into_iter().map(|f| f.value).collect();
+                                (add_group_values(exact, others, &mut bytes, &mut lists)?, self.engine.config.typo_weight)
+                            }
+                        }
+                    } else {
+                        (self.add_group(exact, variants, &mut bytes, &mut lists)?, self.engine.config.inflection_weight)
+                    };
                     if max_df == 0 {
                         return Ok(TopHits::default());
                     }
                     let weight = bm25.weight(bm25.idf(max_df));
                     scorers.push(Scorer::Group {
                         weight,
-                        alpha: self.engine.config.inflection_weight,
+                        alpha,
                         list,
                         group: groups.len(),
                         bound: Box::new(Bound::new(weight, &bm25)),
@@ -139,7 +154,7 @@ impl View<'_> {
         {
             let list = decode(lists.pop().expect("um termo, uma lista"), 0, &mut groups)?;
             let hits = self.top_single_term(&list, *weight, bound, &bm25, k)?;
-            return Ok(TopHits { hits, total: list.len() });
+            return Ok(TopHits { hits, total: list.len(), corrections });
         }
         if let [Scorer::Group { weight, alpha, bound, .. }] = scorers.as_slice()
             && matchers.is_empty()
@@ -147,7 +162,7 @@ impl View<'_> {
         {
             let (_, entries) = decode_group(&bytes, &parts, dead)?;
             let hits = self.top_single_group(&entries, *weight, *alpha, bound, &bm25, k)?;
-            return Ok(TopHits { hits, total: entries.len() });
+            return Ok(TopHits { hits, total: entries.len(), corrections });
         }
 
         // 2. E pelas listas: a menor conduz (decodificada inteira); nas
@@ -221,6 +236,6 @@ impl View<'_> {
             let score = doc_score(&bm25, &scorers, &sources, &groups, &counts, bm25.doc_norm(lens));
             top.push(Hit { doc: self.user_id(doc)?, score });
         }
-        Ok(TopHits { hits: top.into_sorted(), total })
+        Ok(TopHits { hits: top.into_sorted(), total, corrections })
     }
 }

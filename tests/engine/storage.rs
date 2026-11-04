@@ -146,7 +146,7 @@ pub(crate) fn filter_bytes_per_get(partition_filters: bool) -> u64 {
         }
         batch.commit().unwrap();
         // Um SST só, com ~1 milhão de chaves: filtro de ~1 MB se for inteiro.
-        engine.compact();
+        engine.compact().unwrap();
     }
     let engine = Engine::open(dir.path(), config).unwrap();
     let before = (ticker(&engine, "rocksdb.block.cache.filter.bytes.insert"), engine_reads());

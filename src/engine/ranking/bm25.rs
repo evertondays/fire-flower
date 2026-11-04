@@ -63,8 +63,10 @@ impl Bm25 {
         Self { k1: config.bm25_k1, n: stats.doc_count as f64, body, title, title_weight: config.title_weight, max_body, title_ratio }
     }
 
+    /// `df` vem do cabeçalho da lista, que conta as versões mortas até a
+    /// compactação: limitado a N, o idf continua positivo.
     pub(super) fn idf(&self, df: usize) -> f64 {
-        let df = df as f64;
+        let df = (df as f64).min(self.n);
         (1.0 + (self.n - df + 0.5) / (df + 0.5)).ln()
     }
 

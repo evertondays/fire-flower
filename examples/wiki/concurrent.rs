@@ -20,7 +20,8 @@ use crate::env::{save_result, write_metrics};
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn concurrent(db: &Path, corpus_path: &Path, skip: u64, take: Option<u64>, queries_path: &Path, threads: usize, batch_size: usize, baseline_secs: u64, edits: Option<EditPlanArgs>, maintenance: Option<u64>, label: Option<String>) -> AnyResult {
     let set = read_query_sets(&[queries_path.to_path_buf()])?.pop().ok_or("conjunto de consultas vazio")?;
-    let engine = Arc::new(Engine::open(db, Config { statistics: true, ..Config::default() })?);
+    let config = crate::env::with_metrics(Config { statistics: true, ..Config::default() });
+    let engine = Arc::new(Engine::open(db, config)?);
 
     // Leitores rodam até `stop`; cada um devolve suas amostras.
     let readers = |stop: Arc<AtomicBool>| -> Vec<std::thread::JoinHandle<Vec<Sample>>> {

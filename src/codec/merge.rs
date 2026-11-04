@@ -1,74 +1,50 @@
-//! Merge operator das listas: une pedaços gravados em lotes diferentes, com
-//! lápides para os pares (termo, documento) que saíram do índice.
+//! Merge operator das listas: une pedaços gravados em lotes diferentes e,
+//! na compactação, tira as versões mortas dos documentos.
 //!
-//! Regra: por documento, a entrada mais nova vence; uma lápide é uma entrada
-//! que diz "este documento não está mais aqui". O merge **parcial** (só
-//! operandos; pode haver valor mais antigo em outro nível do RocksDB) guarda
-//! as lápides. O merge **completo** (com o valor base, ou com a certeza de
-//! que não há base: leituras e compactação no último nível) as descarta. Toda
-//! leitura passa pelo merge completo, então nenhuma busca vê uma lápide.
+//! Regra: por documento, a entrada mais nova vence. Um ID interno nunca volta
+//! (ver `engine::versions`): editar não regrava entradas, então pedaços com o
+//! mesmo documento só aparecem com IDs fora de ordem dentro da carga.
 
 use crate::{DocId, Error};
 use crate::codec::{SKIP_BLOCK, put_varint};
-use crate::codec::list::{ListHeader, SkipEntry, put_skips, write_list};
+use crate::codec::list::{DeadSkip, ListHeader, SkipEntry, put_skips};
 use crate::codec::varint::{Reader, corrupt};
 
 /// O que vem depois do Δdoc em cada entrada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
-    /// `post:`: `tf << 1 | tem título` e, se tiver, o tf do título. Lápide: `0`.
+    /// `post:`: `tf << 1 | tem título` e, se tiver, o tf do título.
     Postings,
-    /// `pos:`: `k` e `k` posições. Lápide: `k = 0`.
+    /// `pos:`: `k` e `k` posições.
     Positions,
 }
 
-/// Grava uma lista só de lápides (os documentos que saíram de um termo),
-/// pronta para ser um operando de merge em `post:` ou `pos:` (nos dois
-/// formatos a lápide é o mesmo byte `0` depois do Δdoc). `docs` em ordem
-/// crescente e sem repetição.
-pub fn encode_tombstones_into(buf: &mut Vec<u8>, docs: &[DocId]) {
-    debug_assert!(docs.windows(2).all(|w| w[0] < w[1]));
-    let write = |out: &mut Vec<u8>, blocks: &mut Vec<(DocId, usize)>| {
-        let start = out.len();
-        let mut prev = 0;
-        for (i, &doc) in docs.iter().enumerate() {
-            put_varint(out, doc - prev);
-            out.push(0);
-            prev = doc;
-            if (i + 1) % SKIP_BLOCK == 0 || i + 1 == docs.len() {
-                blocks.push((doc, out.len() - start));
-            }
-        }
-    };
-    write_list(buf, docs.len(), !docs.is_empty(), write);
-}
-
-/// Merge completo de `post:` (`inputs` do mais antigo para o mais novo).
+/// Merge de `post:` (`inputs` do mais antigo para o mais novo).
 /// `None` = dado corrompido (a leitura falha em vez de mentir).
 pub fn merge_postings<'a>(inputs: impl Iterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
-    merge_lists(inputs, ListKind::Postings, true)
+    merge_lists(inputs, ListKind::Postings, &[])
 }
 
-/// Merge completo de `pos:`, com a mesma regra de [`merge_postings`].
+/// Merge de `pos:`, com a mesma regra de [`merge_postings`].
 pub fn merge_positions<'a>(inputs: impl Iterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
-    merge_lists(inputs, ListKind::Positions, true)
+    merge_lists(inputs, ListKind::Positions, &[])
 }
 
-/// Une `inputs` (do mais antigo para o mais novo). `full` descarta as
-/// lápides (merge completo); senão elas ficam (merge parcial).
+/// Une `inputs` (do mais antigo para o mais novo) e tira as entradas dos
+/// documentos de `purge` (em ordem crescente; vazio na carga e nas leituras
+/// fora de uma limpeza).
 ///
 /// A **base** é o maior trecho inicial de pedaços em que cada um começa
-/// depois do fim do anterior (a carga, com IDs crescentes, grava assim); o
-/// **remendo** é o resto (edições, reindexação), unido de uma vez só por
-/// documento. Os blocos da base que o remendo não toca são copiados com um
-/// `memcpy` (só o delta da primeira entrada de cada trecho é refeito), e só
-/// os tocados são relidos e regravados. Sem remendo, isso é a concatenação dos
-/// pedaços; sem base (o primeiro pedaço tem lápides que o merge completo
-/// precisa tirar), tudo é relido e regravado.
+/// depois do fim do anterior (a carga e as edições gravam assim); o
+/// **remendo** é o resto (IDs fora de ordem), unido de uma vez só por
+/// documento. Os blocos da base que nem o remendo nem `purge` tocam são
+/// copiados com um `memcpy` (só o delta da primeira entrada de cada trecho é
+/// refeito), e só os tocados são relidos e regravados. Sem remendo e sem
+/// `purge`, isso é a concatenação dos pedaços.
 ///
 /// Nenhum caminho decodifica o conteúdo das entradas (tf, posições): os bytes
 /// de cada entrada são copiados como estão.
-pub fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, kind: ListKind, full: bool) -> Option<Vec<u8>> {
+pub fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, kind: ListKind, purge: &[DocId]) -> Option<Vec<u8>> {
     let mut lists: Vec<Scan<'a>> = Vec::new();
     for bytes in inputs {
         let s = Scan::new(bytes, kind).ok()?;
@@ -77,23 +53,27 @@ pub fn merge_lists<'a>(inputs: impl Iterator<Item = &'a [u8]>, kind: ListKind, f
         }
     }
     let (bytes, blocks) = (lists.iter().map(|s| s.bytes.len()).sum(), lists.iter().map(|s| s.table().len()).sum());
-    let mut out = Out::new(full, bytes, blocks);
-    // Uma lista com lápides só entra na base num merge parcial: blocos
-    // copiados levam as lápides junto.
-    let usable = |s: &Scan<'_>| !(full && s.header.tombstones);
-    let mut base = lists.iter().take_while(|s| usable(s)).count().min(1);
-    while base > 0 && base < lists.len() && lists[base - 1].last < lists[base].first && usable(&lists[base]) {
+    let mut out = Out::new(bytes, blocks);
+    let mut base = lists.len().min(1);
+    while base < lists.len() && lists[base - 1].last < lists[base].first {
         base += 1;
     }
     let overlay = newest_entries(&lists[base..], kind).ok()?;
-    if base == 0 {
-        for e in &overlay {
-            out.push(e);
-        }
-    } else {
-        apply_patch(&lists[..base], &overlay, &mut out).ok()?;
-    }
+    apply_patch(&lists[..base], &overlay, purge, &mut out).ok()?;
     Some(out.finish())
+}
+
+/// A lista sem as entradas dos documentos de `purge` (em ordem crescente), ou
+/// `None` se nenhum deles estava nela: a compactação deixa o valor como está.
+pub fn purge_list(bytes: &[u8], kind: ListKind, purge: &[DocId]) -> Result<Option<Vec<u8>>, Error> {
+    let list = Scan::new(bytes, kind)?;
+    let i = purge.partition_point(|&d| d < list.first);
+    if list.header.n == 0 || i == purge.len() || purge[i] > list.last {
+        return Ok(None);
+    }
+    let mut out = Out::new(bytes.len(), list.table().len());
+    apply_patch(std::slice::from_ref(&list), &[], &purge[i..], &mut out)?;
+    Ok((out.n < list.header.n).then(|| out.finish()))
 }
 
 /// Uma lista codificada, pronta para o merge.
@@ -151,7 +131,7 @@ impl<'a> Scan<'a> {
     /// `count` entradas a partir de `pos`, com `prev` como documento anterior.
     fn entries(&self, pos: usize, prev: DocId, count: u64) -> Entries<'a> {
         let r = Reader { buf: self.bytes, pos };
-        Entries { r, prev, left: count, kind: self.kind, tombstones: self.header.tombstones }
+        Entries { r, prev, left: count, kind: self.kind }
     }
 
     /// Documento anterior ao bloco `i` (o último do bloco de antes).
@@ -167,7 +147,7 @@ impl<'a> Scan<'a> {
         let table = self.table();
         let start = self.start(range.start);
         let end = self.start(range.end - 1) + table[range.end - 1].bytes;
-        out.copy_blocks(&self.bytes[start..end], self.prev_of(range.start), &table[range], self.header.tombstones)
+        out.copy_blocks(&self.bytes[start..end], self.prev_of(range.start), &table[range])
     }
 }
 
@@ -175,7 +155,6 @@ impl<'a> Scan<'a> {
 struct Entry<'a> {
     doc: DocId,
     payload: &'a [u8],
-    tombstone: bool,
 }
 
 /// Percorre as entradas de uma lista sem decodificar tf nem posições.
@@ -184,8 +163,6 @@ struct Entries<'a> {
     prev: DocId,
     left: u64,
     kind: ListKind,
-    /// A lista diz que pode ter lápides.
-    tombstones: bool,
 }
 
 impl<'a> Entries<'a> {
@@ -197,23 +174,20 @@ impl<'a> Entries<'a> {
         let doc = self.prev.checked_add(self.r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
         let start = self.r.pos;
         let head = self.r.varint()?;
-        let tombstone = head == 0;
         match self.kind {
-            ListKind::Postings if head == 1 => return Err(corrupt("tf inválido na lista")),
+            ListKind::Postings if head <= 1 => return Err(corrupt("tf inválido na lista")),
             ListKind::Postings if head & 1 == 1 => self.r.skip_varints(1)?,
+            ListKind::Positions if head == 0 => return Err(corrupt("documento sem posições")),
             ListKind::Positions => self.r.skip_varints(head)?,
             ListKind::Postings => {}
         }
-        if tombstone && !self.tombstones {
-            return Err(corrupt("lápide numa lista que não diz ter lápides"));
-        }
         self.prev = doc;
-        Ok(Some(Entry { doc, payload: &self.r.buf[start..self.r.pos], tombstone }))
+        Ok(Some(Entry { doc, payload: &self.r.buf[start..self.r.pos] }))
     }
 }
 
-/// As entradas de `lists` unidas por documento, com a mais nova vencendo
-/// (lápides inclusive), em ordem de documento.
+/// As entradas de `lists` unidas por documento, com a mais nova vencendo, em
+/// ordem de documento.
 fn newest_entries<'a>(lists: &[Scan<'a>], kind: ListKind) -> Result<Vec<Entry<'a>>, Error> {
     let mut all: Vec<Entry<'a>> = Vec::with_capacity(lists.iter().map(|s| s.header.n as usize).sum());
     for s in lists {
@@ -241,17 +215,18 @@ fn newest_entries<'a>(lists: &[Scan<'a>], kind: ListKind) -> Result<Vec<Entry<'a
 }
 
 /// Aplica `overlay` (mais novo, em ordem de documento) sobre `base` (listas
-/// em sequência, cada uma depois do fim da anterior): os blocos sem documento
-/// do remendo são copiados; os outros, relidos e regravados com as entradas
-/// do remendo no lugar.
-fn apply_patch(base: &[Scan<'_>], overlay: &[Entry<'_>], out: &mut Out) -> Result<(), Error> {
+/// em sequência, cada uma depois do fim da anterior) e tira os documentos de
+/// `purge`: os blocos sem documento do remendo nem de `purge` são copiados;
+/// os outros, relidos e regravados com as entradas do remendo no lugar.
+fn apply_patch(base: &[Scan<'_>], overlay: &[Entry<'_>], purge: &[DocId], out: &mut Out) -> Result<(), Error> {
     let mut at = 0;
+    let mut dead = DeadSkip::new(purge);
     for list in base {
         // Blocos sem documento do remendo desde `untouched`: copiados juntos.
         let mut untouched = 0;
         for (i, blk) in list.table().iter().enumerate() {
             let end = at + overlay[at..].partition_point(|e| e.doc <= blk.last);
-            if end == at {
+            if end == at && !dead.any_up_to(blk.last) {
                 continue;
             }
             list.copy_blocks(untouched..i, out)?;
@@ -265,28 +240,35 @@ fn apply_patch(base: &[Scan<'_>], overlay: &[Entry<'_>], out: &mut Out) -> Resul
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                if take_overlay {
+                let e = if take_overlay {
                     let o = &overlay[at];
                     if current.as_ref().is_some_and(|c| c.doc == o.doc) {
                         current = entries.next_entry()?;
                     }
-                    out.push(o);
                     at += 1;
+                    Entry { doc: o.doc, payload: o.payload }
                 } else {
                     let c = current.take().expect("há uma entrada da base");
-                    out.push(&c);
                     current = entries.next_entry()?;
+                    c
+                };
+                if !dead.is_dead(e.doc) {
+                    out.push(&e);
                 }
             }
             if entries.r.pos != start + blk.bytes {
                 return Err(corrupt("bloco da tabela de saltos não bate com as entradas"));
             }
+            // Os mortos até o fim do bloco que não estavam nele ficam para trás.
+            dead.pass(blk.last);
             out.close_block();
         }
         list.copy_blocks(untouched..list.table().len(), out)?;
     }
     for e in &overlay[at..] {
-        out.push(e);
+        if !dead.is_dead(e.doc) {
+            out.push(e);
+        }
     }
     Ok(())
 }
@@ -294,13 +276,10 @@ fn apply_patch(base: &[Scan<'_>], overlay: &[Entry<'_>], out: &mut Out) -> Resul
 /// A lista sendo montada pelo merge: as entradas, os blocos da tabela de
 /// saltos e o bloco ainda aberto (entradas regravadas).
 struct Out {
-    /// Merge completo: lápides são descartadas.
-    full: bool,
     body: Vec<u8>,
     blocks: Vec<SkipEntry>,
     prev: DocId,
     n: u64,
-    tombstones: bool,
     open_start: usize,
     open_count: u64,
 }
@@ -309,30 +288,24 @@ impl Out {
     /// `bytes` e `blocks`: o que os pedaços somam, quase sempre o tamanho
     /// final (sem isso, copiar uma lista de 145 mil entradas realocava várias
     /// vezes e o caminho rápido ficava 30% mais lento que no v5).
-    fn new(full: bool, bytes: usize, blocks: usize) -> Self {
+    fn new(bytes: usize, blocks: usize) -> Self {
         Self {
-            full,
             body: Vec::with_capacity(bytes),
             blocks: Vec::with_capacity(blocks),
             prev: 0,
             n: 0,
-            tombstones: false,
             open_start: 0,
             open_count: 0,
         }
     }
 
-    /// Regrava uma entrada (no merge completo, uma lápide some).
+    /// Regrava uma entrada.
     fn push(&mut self, e: &Entry<'_>) {
-        if e.tombstone && self.full {
-            return;
-        }
         debug_assert!(self.n == 0 || e.doc > self.prev);
         put_varint(&mut self.body, e.doc - self.prev);
         self.body.extend_from_slice(e.payload);
         self.prev = e.doc;
         self.n += 1;
-        self.tombstones |= e.tombstone;
         self.open_count += 1;
         if self.open_count == SKIP_BLOCK as u64 {
             self.close_block();
@@ -351,11 +324,8 @@ impl Out {
     /// Copia blocos consecutivos de outra lista com um `memcpy` só. `bytes`
     /// começa com o Δdoc da primeira entrada em relação a `prev` (o documento
     /// anterior a esses blocos lá); só esse delta é refeito, e o primeiro bloco
-    /// muda de tamanho. `tombstones` é a marca da lista de origem: as lápides
-    /// vêm junto, então só se copiam blocos com lápides num merge parcial (ver
-    /// `merge_lists`).
-    fn copy_blocks(&mut self, bytes: &[u8], prev: DocId, blocks: &[SkipEntry], tombstones: bool) -> Result<(), Error> {
-        debug_assert!(!(self.full && tombstones));
+    /// muda de tamanho.
+    fn copy_blocks(&mut self, bytes: &[u8], prev: DocId, blocks: &[SkipEntry]) -> Result<(), Error> {
         self.close_block();
         let start = self.body.len();
         let mut r = Reader::new(bytes);
@@ -372,7 +342,6 @@ impl Out {
         self.n += blocks.iter().map(|b| b.count).sum::<u64>();
         self.open_start = self.body.len();
         self.prev = blocks.last().expect("ao menos um bloco").last;
-        self.tombstones |= tombstones;
         Ok(())
     }
 
@@ -381,7 +350,7 @@ impl Out {
         let mut out = Vec::with_capacity(16 + self.blocks.len() * 5 + self.body.len());
         put_varint(&mut out, self.n);
         let blocks: &[SkipEntry] = if self.n as usize > 2 * SKIP_BLOCK { &self.blocks } else { &[] };
-        put_skips(&mut out, blocks, self.tombstones);
+        put_skips(&mut out, blocks);
         out.extend_from_slice(&self.body);
         out
     }

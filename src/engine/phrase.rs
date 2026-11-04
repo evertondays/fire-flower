@@ -2,7 +2,8 @@
 
 use crate::{DocId, Error, Result};
 use crate::codec::PositionsCursor;
-use crate::engine::view::{PosSource, View};
+use crate::engine::keys::{Key, POS};
+use crate::engine::view::{Source, View};
 use crate::query::Clause;
 
 impl View<'_> {
@@ -14,8 +15,15 @@ impl View<'_> {
     }
 
     /// As listas `pos:` dos termos de uma frase, na ordem dos termos.
-    pub(super) fn load_positions(&self, phrase: &[(u32, u64)]) -> Result<Vec<PosSource<'_>>> {
-        phrase.iter().map(|&(_, node)| self.pos_source(node)).collect()
+    pub(super) fn load_positions(&self, phrase: &[(u32, u64)]) -> Result<Vec<rocksdb::DBPinnableSlice<'_>>> {
+        phrase
+            .iter()
+            .map(|&(_, node)| {
+                self.snap
+                    .get_bytes(Key::new(POS, node).as_ref())?
+                    .ok_or_else(|| Error::Corrupt(format!("termo do nó {node} sem posições")))
+            })
+            .collect()
     }
 }
 
@@ -28,8 +36,8 @@ pub(super) struct PhraseMatcher<'s> {
 }
 
 impl<'s> PhraseMatcher<'s> {
-    pub(super) fn new(phrase: &[(u32, u64)], slices: &'s [PosSource<'s>]) -> Result<Self> {
-        let cursors = slices.iter().map(|s| PositionsCursor::with_edits(s.bytes(), &s.edits)).collect::<Result<_>>()?;
+    pub(super) fn new(phrase: &[(u32, u64)], slices: &'s [rocksdb::DBPinnableSlice<'_>]) -> Result<Self> {
+        let cursors = slices.iter().map(|s| PositionsCursor::new(s)).collect::<Result<_>>()?;
         Ok(Self {
             offsets: phrase.iter().map(|&(o, _)| o).collect(),
             cursors,

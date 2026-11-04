@@ -1,52 +1,36 @@
 //! Formato do banco e metadados gravados na criação (posições, idiomas,
-//! stemming), e o merge operator das listas.
+//! stemming).
 
 use std::path::Path;
 
-use rocksdb::{DB, MergeOperands, Options, WriteBatch};
+use rocksdb::{DB, Options, WriteBatch};
 
 use crate::{Error, Result, codec};
-use crate::codec::ListKind;
 use crate::analysis::stopwords;
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::{Language, Stopwords};
-use crate::engine::keys::{
-    META_EDITS, META_FORMAT, META_LANGUAGES, META_MAYBE_EMPTY, META_NEXT_NODE, META_OVERLAYS, META_POSITIONS,
-    META_STEMMING, POS, POST, POV, PSV, STEM,
-};
+use crate::engine::keys::{META_FORMAT, META_LANGUAGES, META_NEXT_NODE, META_POSITIONS, META_STEMMING};
 
 /// Versão do formato gravado. Bancos de outra versão precisam ser recarregados.
-pub const FORMAT_VERSION: u64 = 6;
+pub const FORMAT_VERSION: u64 = 7;
 
-/// O que o banco grava, decidido na criação ([`resolve_format`]).
-pub(super) struct Features {
-    /// Posições de cada termo (`pos:`), para frases.
-    pub(super) positions: bool,
-    /// Termos de cada documento (`fwd:`), para editar e remover.
-    pub(super) edits: bool,
-}
-
-/// Confere a versão do formato e o que o banco grava (posições, `fwd:`).
-/// Num banco novo, grava as três coisas.
-pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>, wanted_edits: Option<bool>) -> Result<Features> {
+/// Confere a versão do formato e se o banco grava posições. Num banco novo,
+/// grava as duas coisas (`writable`; aberto só para leitura, é erro).
+pub(super) fn resolve_format(db: &DB, wanted_positions: Option<bool>, writable: bool) -> Result<bool> {
     match read_counter(db, META_FORMAT)? {
-        Some(FORMAT_VERSION) => Ok(Features {
-            positions: stored_flag(db, META_POSITIONS, wanted_positions, "posições")?,
-            edits: stored_flag(db, META_EDITS, wanted_edits, "edição de documentos (fwd:)")?,
-        }),
+        Some(FORMAT_VERSION) => stored_flag(db, META_POSITIONS, wanted_positions, "posições"),
         Some(v) => Err(Error::Config(format!(
             "banco no formato {v}, mas este binário lê o formato {FORMAT_VERSION}; recarregue o banco"
         ))),
         None if read_counter(db, META_NEXT_NODE)?.is_some() => Err(old_format()),
+        None if !writable => Err(Error::Config("o banco está vazio (nunca foi aberto para escrita)".into())),
         None => {
-            let features =
-                Features { positions: wanted_positions.unwrap_or(true), edits: wanted_edits.unwrap_or(true) };
+            let positions = wanted_positions.unwrap_or(true);
             let mut wb = WriteBatch::default();
             wb.put(META_FORMAT, varint(FORMAT_VERSION));
-            wb.put(META_POSITIONS, varint(u64::from(features.positions)));
-            wb.put(META_EDITS, varint(u64::from(features.edits)));
+            wb.put(META_POSITIONS, varint(u64::from(positions)));
             db.write(wb)?;
-            Ok(features)
+            Ok(positions)
         }
     }
 }
@@ -102,8 +86,8 @@ pub(super) fn stored_format_error(path: &Path) -> Option<Error> {
 }
 
 /// Idiomas das stopwords do banco. Num banco sem a chave, grava os da config
-/// (ou o padrão).
-pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<Vec<Language>> {
+/// (ou o padrão), se `writable`.
+pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>, writable: bool) -> Result<Vec<Language>> {
     let normalize = |langs: &[Language]| Stopwords::new(langs).languages().to_vec();
     let stored = match db.get_pinned(META_LANGUAGES)? {
         Some(v) => Some(parse_languages(&String::from_utf8_lossy(&v))?),
@@ -120,7 +104,7 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
         (Some(stored), _) => stored,
         (None, wanted) => normalize(wanted.unwrap_or(Language::DEFAULT)),
     };
-    if db.get_pinned(META_LANGUAGES)?.is_none() {
+    if writable && db.get_pinned(META_LANGUAGES)?.is_none() {
         let codes: Vec<&str> = languages.iter().map(|l| l.code()).collect();
         db.put(META_LANGUAGES, codes.join(","))?;
     }
@@ -129,8 +113,8 @@ pub(super) fn resolve_languages(db: &DB, wanted: Option<&[Language]>) -> Result<
 
 /// Stemming do banco (`key` = `meta:stemming` ou `meta:inflections`). Num
 /// banco sem a chave, grava o da config (ou `Off`); um banco que já tem dados
-/// e não tem a chave é de antes dela: `Off`.
-pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) -> Result<Stemming> {
+/// e não tem a chave é de antes dela: `Off`. Só grava se `writable`.
+pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>, writable: bool) -> Result<Stemming> {
     let what = if key == META_STEMMING { "stemming" } else { "flexões na consulta" };
     let stored = match db.get_pinned(key)? {
         Some(v) => {
@@ -149,7 +133,7 @@ pub(super) fn resolve_stemming(db: &DB, key: &[u8], wanted: Option<Stemming>) ->
         (Some(stored), _) => stored,
         (None, wanted) => wanted.unwrap_or_default(),
     };
-    if db.get_pinned(key)?.is_none() {
+    if writable && db.get_pinned(key)?.is_none() {
         db.put(key, stemming.code())?;
     }
     Ok(stemming)
@@ -171,42 +155,4 @@ pub(super) fn varint(v: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     codec::put_varint(&mut buf, v);
     buf
-}
-
-/// Merge operator completo de `post:` e `pos:`: une as listas por documento,
-/// com a gravação mais nova vencendo, e descarta as lápides (ver
-/// `codec::merge_lists`). O RocksDB o chama com o valor base, ou sem base
-/// quando sabe que não há valor mais antigo (leituras e compactação no último
-/// nível). Devolver `None` (dado corrompido) faz a leitura falhar em vez de mentir.
-pub(super) fn full_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
-    merge(key, existing, operands, true)
-}
-
-/// Merge operator parcial: só operandos consecutivos, e pode haver valor mais
-/// antigo em outro nível. Une como o completo, mas guarda as lápides.
-pub(super) fn partial_merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
-    merge(key, existing, operands, false)
-}
-
-fn merge(key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands, full: bool) -> Option<Vec<u8>> {
-    let started = crate::engine::merge_trace::trace_start();
-    let inputs = existing.into_iter().chain(operands.iter());
-    let result = if key.starts_with(POST) {
-        codec::merge_lists(inputs, ListKind::Postings, full)
-    } else if key.starts_with(POS) {
-        codec::merge_lists(inputs, ListKind::Positions, full)
-    } else if key.starts_with(POV) {
-        // O remendo guarda as lápides nos dois merges: a base é outra chave.
-        codec::merge_overlays(inputs, ListKind::Postings)
-    } else if key.starts_with(PSV) {
-        codec::merge_overlays(inputs, ListKind::Positions)
-    } else if key.starts_with(STEM) || key == META_MAYBE_EMPTY || key == META_OVERLAYS {
-        codec::merge_node_sets(inputs)
-    } else {
-        None
-    };
-    if let Some(started) = started {
-        crate::engine::merge_trace::trace_record(full, existing, operands, result.as_deref(), started);
-    }
-    result
 }

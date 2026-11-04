@@ -1,6 +1,7 @@
 //! Indexação: o lote ([`IndexBatch`]) e o commit.
 
-use std::sync::MutexGuard;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
@@ -9,20 +10,23 @@ use rustc_hash::FxHashMap;
 
 use crate::{DocId, Engine, Error, IndexStats, Result, codec};
 use crate::analysis::Analyzer;
-use crate::codec::ListKind;
-use crate::engine::keys::{
-    Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_OVERLAYS, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, POS,
-    POST, POV, PSV, stem_key,
-};
-use crate::engine::overlays::Overlays;
 use crate::engine::reads_on_this_thread;
+use crate::engine::keys::{
+    Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, POS, POST,
+    stem_key,
+};
 use crate::engine::meta::varint;
-use crate::engine::writer::documents::{NewTerms, Norms, exists};
+use crate::engine::versions::MAX_DOC;
+use crate::engine::writer::documents::Norms;
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
 mod documents;
+mod external;
 pub(super) mod trie;
 
+pub(super) use self::external::ExternalIds;
+
+#[derive(Default)]
 pub(crate) struct WriterState {
     pub(super) next_node_id: u64,
     pub(super) next_doc_id: DocId,
@@ -34,6 +38,77 @@ pub(crate) struct WriterState {
     pub(super) cache: NodeCache,
     /// Buffers da análise e radicais já calculados, entre um lote e outro.
     pub(super) analyzer: Analyzer,
+    /// Documento → ID interno da última versão, para os que já mudaram
+    /// (`ver:`; ver `versions`).
+    pub(super) latest: FxHashMap<DocId, u64>,
+    /// O banco tem algum ID externo (`xid:`). Sem nenhum, remover não
+    /// precisa procurar o ID externo do documento.
+    pub(super) has_external_ids: bool,
+}
+
+/// O estado do único escritor. O lote o pega para si ([`WriterSlot::take`]) e
+/// o devolve ao terminar, com ou sem commit: por isso o lote não guarda uma
+/// trava e pode ir para outra thread ([`OwnedBatch`]).
+pub(crate) struct WriterSlot {
+    state: Mutex<Option<WriterState>>,
+    returned: Condvar,
+}
+
+impl WriterSlot {
+    pub(crate) fn new(state: WriterState) -> Self {
+        Self { state: Mutex::new(Some(state)), returned: Condvar::new() }
+    }
+
+    /// Pega o estado, esperando o lote aberto terminar.
+    pub(super) fn take(&self) -> WriterState {
+        // O estado só muda depois de um commit gravado: uma thread que entrou
+        // em pânico com a trava não o deixou pela metade.
+        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(state) = slot.take() {
+                return state;
+            }
+            slot = self.returned.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Pega o estado se nenhum lote estiver aberto.
+    pub(super) fn try_take(&self) -> Option<WriterState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn put(&self, state: WriterState) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        self.returned.notify_one();
+    }
+}
+
+/// O motor de um lote: emprestado ([`Engine::batch`]) ou compartilhado
+/// ([`Engine::owned_batch`]).
+pub(crate) enum EngineRef<'a> {
+    Borrowed(&'a Engine),
+    Shared(Arc<Engine>),
+}
+
+impl Deref for EngineRef<'_> {
+    type Target = Engine;
+
+    #[inline]
+    fn deref(&self) -> &Engine {
+        match self {
+            EngineRef::Borrowed(e) => e,
+            EngineRef::Shared(e) => e,
+        }
+    }
+}
+
+impl Clone for EngineRef<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            EngineRef::Borrowed(e) => EngineRef::Borrowed(e),
+            EngineRef::Shared(e) => EngineRef::Shared(Arc::clone(e)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -50,9 +125,13 @@ pub(super) struct NodeCache {
 /// O lote é invertido: `add_document` só junta termo → documentos (com tf e
 /// posições), e a Trie é percorrida no commit, uma vez por termo distinto do
 /// lote (e não uma vez por documento que contém o termo).
+///
+/// Só um lote existe por vez: enquanto este estiver vivo, [`Engine::batch`]
+/// espera e [`Engine::try_batch`] dá [`Error::Busy`].
 pub struct IndexBatch<'a> {
-    pub(super) engine: &'a Engine,
-    pub(super) state: MutexGuard<'a, WriterState>,
+    pub(super) engine: EngineRef<'a>,
+    /// O estado do escritor, devolvido ao [`WriterSlot`] no `Drop`.
+    pub(super) state: WriterState,
     pub(super) next_node_id: u64,
     pub(super) next_doc_id: DocId,
     /// Cache de nós emprestado do `WriterState`, mais os nós lidos ou criados
@@ -72,11 +151,22 @@ pub struct IndexBatch<'a> {
     /// Algum documento apareceu em mais de uma operação do lote.
     pub(super) repeated: bool,
     pub(super) labels: Vec<(DocId, String)>,
+    /// IDs externos mudados no lote (ver `external`).
+    pub(super) external: ExternalIds,
     pub(super) analyzer: Analyzer,
-    /// Menor ID que este lote pode tratar como documento novo (anexo no fim
-    /// da lista). IDs menores podem cair no meio de uma lista já gravada e
-    /// vão para o remendo.
-    pub(super) doc_floor: DocId,
+}
+
+/// Um lote que é dono de um `Arc<Engine>`: `Send + 'static`, pode viver num
+/// objeto de outra linguagem (binding) e fazer commit em outra thread.
+pub type OwnedBatch = IndexBatch<'static>;
+
+impl Drop for IndexBatch<'_> {
+    /// Com ou sem commit, o estado volta para o próximo lote. Sem commit, o
+    /// cache de nós emprestado vai embora com o lote: nada que não foi
+    /// gravado sobrevive.
+    fn drop(&mut self) {
+        self.engine.writer.put(std::mem::take(&mut self.state));
+    }
 }
 
 /// Uma operação do lote sobre um documento.
@@ -85,8 +175,6 @@ pub(super) struct DocOp {
     pub(super) doc: DocId,
     /// Tamanhos (documento inteiro, título, extensão do título); `None` é remoção.
     pub(super) lens: Option<(u32, u32, u32)>,
-    /// Termos distintos do documento (0 numa remoção).
-    pub(super) terms: u32,
 }
 
 /// O que o lote juntou de um termo.
@@ -110,36 +198,6 @@ struct BatchEntry {
     op: u32,
 }
 
-/// Pedaços de remendo de um termo neste lote, mais anexos na lista base.
-#[derive(Default)]
-pub(super) struct OverlayBatch {
-    post: Vec<Vec<u8>>,
-    pos: Vec<Vec<u8>>,
-    appends: u64,
-}
-
-/// Separa anexos (documento novo, ID alto) de edições (vão para o remendo).
-fn split_acc(acc: &TermAcc, floor: DocId, norms: &Norms, with_pos: bool) -> (Vec<BatchEntry>, Vec<u32>, Vec<BatchEntry>, Vec<u32>) {
-    let mut appends = Vec::new();
-    let mut append_pos = Vec::new();
-    let mut edits = Vec::new();
-    let mut edit_pos = Vec::new();
-    let mut at = 0usize;
-    for e in &acc.docs {
-        let n = if with_pos { e.tf as usize } else { 0 };
-        let positions = if with_pos { &acc.positions[at..at + n] } else { &[] };
-        at += n;
-        if e.doc >= floor && !exists(norms, e.doc) {
-            appends.push(*e);
-            append_pos.extend_from_slice(positions);
-        } else {
-            edits.push(*e);
-            edit_pos.extend_from_slice(positions);
-        }
-    }
-    (appends, append_pos, edits, edit_pos)
-}
-
 impl codec::PostingEntry for BatchEntry {
     #[inline]
     fn doc(&self) -> DocId {
@@ -160,9 +218,9 @@ impl codec::PostingEntry for BatchEntry {
 impl TermAcc {
     /// Ordena por documento. Se algum documento apareceu em mais de uma
     /// operação do lote (`repeated`), fica só com as entradas da última
-    /// (`is_final`): reindexar duas vezes no mesmo lote vale o segundo texto
-    /// inteiro, e adicionar e remover não grava nada.
-    fn normalize(&mut self, positions: bool, repeated: bool, is_final: impl Fn(DocId, u32) -> bool) {
+    /// (`is_final(op)`): reindexar duas vezes no mesmo lote vale o segundo
+    /// texto inteiro, e adicionar e remover não grava nada.
+    fn normalize(&mut self, positions: bool, repeated: bool, is_final: impl Fn(u32) -> bool) {
         if !repeated && self.docs.windows(2).all(|w| w[0].doc < w[1].doc) {
             return; // o caso comum: IDs crescentes
         }
@@ -170,7 +228,7 @@ impl TermAcc {
         let mut entries: Vec<(BatchEntry, usize)> = Vec::with_capacity(self.docs.len());
         let mut start = 0usize;
         for &e in &self.docs {
-            if !repeated || is_final(e.doc, e.op) {
+            if !repeated || is_final(e.op) {
                 entries.push((e, start));
             }
             start += e.tf as usize;
@@ -197,14 +255,14 @@ pub struct CommitStats {
     pub replaced: usize,
     /// Documentos removidos (os que existiam).
     pub deleted: usize,
-    /// Pares (termo, documento) que saíram do índice: lápides gravadas.
-    pub tombstones: usize,
+    /// Versões novas com ID da faixa alta (substituições e readições).
+    pub versions: usize,
+    /// Versões que morreram (ficam nas listas até a compactação).
+    pub killed: usize,
     /// Termos distintos do lote.
     pub terms: usize,
     /// Leituras no RocksDB durante a travessia (nós fora do cache do escritor).
     pub node_reads: u64,
-    /// Leituras de `fwd:` (os termos antigos dos documentos que já existiam).
-    pub fwd_reads: u64,
     /// Nós criados e nós regravados neste lote.
     pub new_nodes: usize,
     pub dirty_nodes: usize,
@@ -220,7 +278,7 @@ pub struct CommitStats {
     pub encode_secs: f64,
     /// Codificar os nós alterados, os blocos de `norm:` e os contadores.
     pub nodes_secs: f64,
-    /// Ler os blocos de `norm:` e os `fwd:` antigos, gravar os novos e as lápides.
+    /// Ler e gravar os blocos de `norm:`, as versões e os mortos.
     pub documents_secs: f64,
     /// `db.write` do lote inteiro.
     pub write_secs: f64,
@@ -260,9 +318,8 @@ impl IndexBatch<'_> {
     /// para pesar o título mais que o resto.
     ///
     /// Um ID que já existe é **substituído**: os termos que saíram do texto
-    /// deixam de achar o documento no mesmo commit. Num banco sem
-    /// [`crate::Config::edits`], só o tf, as posições e o tamanho são trocados.
-    /// No mesmo lote, a última operação de cada documento vence.
+    /// deixam de achar o documento no mesmo commit. No mesmo lote, a última
+    /// operação de cada documento vence. IDs vão até 2^40 − 1 (ver `versions`).
     pub fn add_titled(&mut self, doc_id: DocId, title: &str, text: &str) -> Result<()> {
         let positions = self.engine.positions;
         let op = self.push_op(doc_id)?;
@@ -274,16 +331,14 @@ impl IndexBatch<'_> {
                 acc.positions.extend_from_slice(found);
             }
         };
-        let mut terms = 0u32;
         for (term, found) in analyzer.terms() {
             // Só aloca a `String` do termo na primeira vez que ele aparece no lote.
             match self.pending.get_mut(term) {
                 Some(acc) => record(acc, found),
                 None => record(self.pending.entry(term.to_string()).or_default(), found),
             }
-            terms += 1;
         }
-        self.ops.push(DocOp { doc: doc_id, lens: Some((len, title_len, analyzer.title_span())), terms });
+        self.ops.push(DocOp { doc: doc_id, lens: Some((len, title_len, analyzer.title_span())) });
         // IDs automáticos de `add_labeled` nunca colidem com IDs manuais.
         self.next_doc_id = self.next_doc_id.max(doc_id.saturating_add(1));
         Ok(())
@@ -291,20 +346,17 @@ impl IndexBatch<'_> {
 
     /// Remove o documento no commit: ele some de todos os termos, dos tamanhos,
     /// das estatísticas e do rótulo. Um ID que não existe não faz nada.
-    /// Precisa de um banco com [`crate::Config::edits`].
     pub fn delete_document(&mut self, doc_id: DocId) -> Result<()> {
-        if !self.engine.edits {
-            return Err(Error::Config(
-                "o banco foi criado sem edição de documentos (--no-edits); recarregue sem a opção para remover".into(),
-            ));
-        }
         self.push_op(doc_id)?;
-        self.ops.push(DocOp { doc: doc_id, lens: None, terms: 0 });
+        self.ops.push(DocOp { doc: doc_id, lens: None });
         Ok(())
     }
 
     /// Anota que `doc_id` tem mais uma operação no lote e devolve o índice dela.
     fn push_op(&mut self, doc_id: DocId) -> Result<u32> {
+        if doc_id > MAX_DOC {
+            return Err(Error::Config(format!("ID de documento {doc_id} grande demais: vão até 2^40 − 1")));
+        }
         let op = u32::try_from(self.ops.len())
             .map_err(|_| Error::Config("lote com mais de 4 bilhões de operações: faça commit antes".into()))?;
         if self.last_op.insert(doc_id, op).is_some() {
@@ -351,7 +403,19 @@ impl IndexBatch<'_> {
 
     /// Como [`IndexBatch::commit`], devolvendo onde o commit gastou o tempo.
     /// Usado pelo harness de performance para achar o gargalo da carga.
-    pub fn commit_with_stats(mut self) -> Result<CommitStats> {
+    pub fn commit_with_stats(self) -> Result<CommitStats> {
+        let engine = self.engine.clone();
+        let result = self.write();
+        if result.is_err()
+            && let Some(m) = engine.metrics()
+        {
+            m.record_commit_error();
+        }
+        result
+    }
+
+    fn write(mut self) -> Result<CommitStats> {
+        self.engine.require_writable()?;
         let started = Instant::now();
         let mut stats = CommitStats::default();
         let positions = self.engine.positions;
@@ -362,11 +426,10 @@ impl IndexBatch<'_> {
             (0..self.ops.len()).collect()
         };
         stats.docs = finals.iter().filter(|&&i| self.ops[i].lens.is_some()).count();
-        // Antes da Trie: quem já existia (pelos blocos de `norm:`) e, desses, os termos antigos.
+        // Antes da Trie: a versão de cada documento (pelos blocos de `norm:`).
         let t = Instant::now();
-        let mut norms = self.read_norms(&finals)?;
-        let old_terms = self.read_old_terms(&finals, &norms)?;
-        stats.fwd_reads = old_terms.reads;
+        let mut norms = Norms::new();
+        let versions = self.plan_versions(&finals, &mut norms)?;
         let mut documents_secs = t.elapsed();
         let reads_before = reads_on_this_thread();
 
@@ -383,20 +446,22 @@ impl IndexBatch<'_> {
         let mut trie = std::time::Duration::ZERO;
         let mut path = TriePath::default();
         let encode_started = Instant::now();
-        // Termos novos de cada operação (só com `fwd:`): nós terminais.
-        let mut new_terms = NewTerms::new(&self.ops, self.engine.edits);
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
-        // Documento novo (ID ≥ `doc_floor`) anexa na lista. Documento que já
-        // existia, ou um ID antigo, vai para o remendo (`pov:` / `psv:`): a
-        // lista base não ganha um pedaço no meio, e a leitura não a regrava.
         // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
-        let inflector = &self.engine.inflector;
+        // Um clone da referência ao motor: `self` é emprestado mutável na travessia.
+        let engine = self.engine.clone();
+        let inflector = &engine.inflector;
         let mut new_by_stem: FxHashMap<String, Vec<u64>> = FxHashMap::default();
-        let mut overlays: FxHashMap<u64, OverlayBatch> = FxHashMap::default();
         for (term, mut acc) in terms {
-            let last_op = &self.last_op;
-            acc.normalize(positions, self.repeated, |doc, op| last_op[&doc] == op);
+            if versions.remapped {
+                // As listas guardam o ID interno da versão nova.
+                for e in acc.docs.iter_mut() {
+                    e.doc = versions.internal[e.op as usize];
+                }
+            }
+            let (ops, last_op) = (&self.ops, &self.last_op);
+            acc.normalize(positions, self.repeated, |op| last_op[&ops[op as usize].doc] == op);
             if acc.docs.is_empty() {
                 continue; // todos os documentos deste termo foram removidos ou reindexados no lote
             }
@@ -406,44 +471,13 @@ impl IndexBatch<'_> {
             if new_word && inflector.is_on() {
                 new_by_stem.entry(inflector.stem(&term)).or_default().push(id);
             }
-            if new_terms.is_on() {
-                for e in &acc.docs {
-                    new_terms.push(e.op, id);
-                }
-            }
-            // Sem `fwd:` o comportamento antigo: reindexar só troca o tf e o
-            // termo que saiu continua na lista. Tudo vai para `post:`.
-            let (appends, append_pos, edits, edit_pos) = if self.engine.edits {
-                split_acc(&acc, self.doc_floor, &norms, positions)
-            } else {
-                (acc.docs.clone(), acc.positions.clone(), Vec::new(), Vec::new())
-            };
-            if !appends.is_empty() {
+            buf.clear();
+            codec::encode_postings_into(&mut buf, &acc.docs);
+            wb.merge(Key::new(POST, id), &buf);
+            if positions {
                 buf.clear();
-                codec::encode_postings_into(&mut buf, &appends);
-                wb.merge(Key::new(POST, id), &buf);
-                if positions {
-                    buf.clear();
-                    codec::encode_positions_into(&mut buf, &appends, &append_pos);
-                    wb.merge(Key::new(POS, id), &buf);
-                }
-                if self.engine.edits && (self.engine.overlays.is_active(id) || !edits.is_empty()) {
-                    overlays.entry(id).or_default().appends += appends.len() as u64;
-                }
-            }
-            if !edits.is_empty() {
-                // +1 só para o documento que ainda não tinha o termo. Trocar o
-                // tf não muda o df; a lápide (em `write_documents`) desconta.
-                let delta = edits.iter().filter(|e| !old_terms.had(e.doc, id)).count() as i64;
-                buf.clear();
-                codec::encode_postings_into(&mut buf, &edits);
-                let slot = overlays.entry(id).or_default();
-                slot.post.push(codec::wrap_delta(delta, &buf));
-                if positions {
-                    buf.clear();
-                    codec::encode_positions_into(&mut buf, &edits, &edit_pos);
-                    slot.pos.push(codec::wrap_delta(0, &buf));
-                }
+                codec::encode_positions_into(&mut buf, &acc.docs, &acc.positions);
+                wb.merge(Key::new(POS, id), &buf);
             }
         }
         for (stem, mut ids) in new_by_stem {
@@ -457,9 +491,10 @@ impl IndexBatch<'_> {
         stats.dirty_nodes = self.dirty.len();
 
         let t = Instant::now();
-        let maybe_empty = self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats, &mut overlays)?;
-        let (index, blocks) = self.write_lengths(&mut wb, &finals, &mut norms)?;
-        self.write_labels(&mut wb, &finals, &norms);
+        self.write_versions(&mut wb, &versions, &mut stats);
+        let (index, blocks) = self.write_lengths(&mut wb, &finals, &versions, &mut norms, &mut stats)?;
+        self.write_labels(&mut wb, &finals);
+        self.write_external_ids(&mut wb, &finals)?;
         documents_secs += t.elapsed();
         stats.documents_secs = documents_secs.as_secs_f64();
 
@@ -473,27 +508,34 @@ impl IndexBatch<'_> {
         wb.put(META_TOTAL_LEN, varint(index.total_len));
         wb.put(META_TOTAL_TITLE_LEN, varint(index.total_title_len));
         stats.nodes_secs = t.elapsed().as_secs_f64();
-        if !overlays.is_empty() {
-            flush_overlays(&self.engine.db, &mut wb, &overlays, &self.engine.overlays)?;
-        }
         stats.batch_bytes = wb.size_in_bytes();
 
-        // Ver `EpochCache`: marca, grava, publica.
-        let engine = self.engine;
-        let next = engine.epoch.load(AtomicOrdering::Acquire) + 1;
+        // Ver `EpochCache` e `versions`: marca e publica o que muda, grava, publica o commit.
+        let next = engine.epoch() + 1;
         engine.norms.mark(blocks, next);
-        if !maybe_empty.is_empty() {
-            engine.maybe_empty.add(maybe_empty);
-        }
         if let Some(max) = engine.config.reader_cache_depth {
             let shallow = self.dirty.iter().copied().filter(|id| usize::from(self.nodes[id].depth) <= max);
             engine.nodes.mark(shallow, next);
         }
+        engine.deaths.add(&versions.kills, next);
         let t = Instant::now();
-        engine.db.write(wb)?;
+        if let Err(e) = engine.write_commit(wb, next) {
+            engine.deaths.rollback(next);
+            return Err(e);
+        }
         stats.write_secs = t.elapsed().as_secs_f64();
-        engine.epoch.store(next, AtomicOrdering::Release);
-        engine.pending_edits.fetch_add((stats.replaced + stats.deleted) as u64, AtomicOrdering::AcqRel);
+        let mut dead_versions = None;
+        if !versions.kills.is_empty() {
+            // O commit inteiro tem números de sequência até este: um snapshot
+            // vê as mortes dele se e só se o número dele chega aqui.
+            let seq = engine.db.latest_sequence_number();
+            let mut dead = engine.dead.lock().unwrap_or_else(|e| e.into_inner());
+            dead.extend(versions.kills.iter().map(|&id| (seq, id)));
+            dead_versions = Some(dead.len() as u64);
+        }
+        let edits = (stats.replaced + stats.deleted) as u64;
+        let pending_edits = engine.pending_edits.fetch_add(edits, AtomicOrdering::AcqRel) + edits;
+        self.state.latest.extend(versions.changed.iter().copied());
 
         // Gravado: o cache volta a ser igual ao banco e fica para o próximo lote.
         for id in std::mem::take(&mut self.dirty) {
@@ -512,73 +554,12 @@ impl IndexBatch<'_> {
         self.state.next_doc_id = self.next_doc_id;
         self.state.stats = index;
         stats.total_secs = started.elapsed().as_secs_f64();
+        if let Some(m) = engine.metrics() {
+            m.record_commit(&stats, index.doc_count);
+            if let Some(dead) = dead_versions {
+                m.set_edit_backlog(dead, pending_edits);
+            }
+        }
         Ok(stats)
     }
-}
-
-/// Um `put` do remendo já unido com o que estava no banco. A leitura seguinte
-/// não percorre os pedaços de cada edição: é um valor só.
-fn flush_overlays(db: &rocksdb::DB, wb: &mut WriteBatch, batches: &FxHashMap<u64, OverlayBatch>, book: &Overlays) -> Result<()> {
-    let mut ids: Vec<u64> = batches.keys().copied().collect();
-    ids.sort_unstable();
-    let cf = db
-        .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
-        .ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
-    let pov: Vec<Key> = ids.iter().map(|&id| Key::new(POV, id)).collect();
-    let psv: Vec<Key> = ids.iter().map(|&id| Key::new(PSV, id)).collect();
-    // A lista base só entra no df na primeira edição do termo. Nas seguintes
-    // o tamanho já está em memória: relê-la aqui regravaria a lista inteira
-    // a cada commit de um termo frequente.
-    let fresh: Vec<usize> = ids.iter().enumerate().filter(|&(_, id)| !book.is_active(*id)).map(|(i, _)| i).collect();
-    let post: Vec<Key> = fresh.iter().map(|&i| Key::new(POST, ids[i])).collect();
-    let old_post = db.batched_multi_get_cf(cf, pov.iter().map(|k| k.as_ref()), false);
-    let old_pos = db.batched_multi_get_cf(cf, psv.iter().map(|k| k.as_ref()), false);
-    let bases = db.batched_multi_get_cf(cf, post.iter().map(|k| k.as_ref()), false);
-    let mut base_at = 0usize;
-    let mut touched = Vec::new();
-    for (i, &id) in ids.iter().enumerate() {
-        let acc = &batches[&id];
-        let mut delta = 0i64;
-        for op in &acc.post {
-            delta += codec::peek_delta(op)?;
-        }
-        if !acc.post.is_empty() {
-            let old = old_post[i].as_ref().map_err(|e| Error::Db(e.clone()))?;
-            wb.put(Key::new(POV, id), collapse(old.as_deref(), &acc.post, ListKind::Postings)?);
-        }
-        if !acc.pos.is_empty() {
-            let old = old_pos[i].as_ref().map_err(|e| Error::Db(e.clone()))?;
-            wb.put(Key::new(PSV, id), collapse(old.as_deref(), &acc.pos, ListKind::Positions)?);
-        }
-        if acc.post.is_empty() && acc.pos.is_empty() {
-            if acc.appends > 0 {
-                book.bump(id, acc.appends, 0);
-            }
-            continue;
-        }
-        if book.is_active(id) {
-            book.bump(id, acc.appends, delta);
-        } else {
-            let base_len = match bases[base_at].as_ref().map_err(|e| Error::Db(e.clone()))? {
-                Some(v) => codec::list_len(v)?,
-                None => 0,
-            };
-            base_at += 1;
-            book.observe(id, base_len + acc.appends, delta);
-        }
-        touched.push(id);
-    }
-    if !touched.is_empty() {
-        wb.merge(META_OVERLAYS, codec::encode_node_set(&touched));
-    }
-    Ok(())
-}
-
-fn collapse(old: Option<&[u8]>, ops: &[Vec<u8>], kind: ListKind) -> Result<Vec<u8>> {
-    let mut inputs: Vec<&[u8]> = Vec::with_capacity(ops.len() + 1);
-    if let Some(old) = old {
-        inputs.push(old);
-    }
-    inputs.extend(ops.iter().map(Vec::as_slice));
-    codec::merge_overlays(inputs.into_iter(), kind).ok_or_else(|| Error::Corrupt("remendo inválido".into()))
 }

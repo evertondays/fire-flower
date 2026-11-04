@@ -1,5 +1,8 @@
 //! Configuração do motor ([`Config`]).
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::{Error, Result};
 use crate::analysis::stem::Stemming;
 use crate::analysis::stopwords::Language;
@@ -52,15 +55,6 @@ pub struct Config {
     /// faz o `open` falhar. Sem posições o banco fica menor e a carga mais
     /// rápida, mas frases dão erro.
     pub positions: Option<bool>,
-    /// Grava os termos de cada documento (`fwd:`), o que permite substituir
-    /// ([`crate::IndexBatch::add_titled`] com um ID que já existe) e remover
-    /// ([`crate::IndexBatch::delete_document`]) documentos.
-    ///
-    /// Decidido na criação, como as posições: `None` usa o gravado (ou liga,
-    /// num banco novo). Sem ele o banco fica menor e a carga mais rápida, mas
-    /// remover dá erro, e reindexar um ID só troca tf, posições e tamanho
-    /// (termos que saíram do texto continuam apontando para o documento).
-    pub edits: Option<bool>,
     /// Reduz as palavras ao radical (Snowball) na indexação e na busca:
     /// "correndo" acha "corrida". Ver [`crate::analysis::stem`].
     ///
@@ -99,6 +93,31 @@ pub struct Config {
     pub title_weight: f64,
     /// `b` do título: quanto um título longo perde para um curto (0 a 1).
     pub title_b: f64,
+    /// Cria o banco se a pasta não tiver um (ligado por padrão). Desligado, o
+    /// `open` de um caminho errado dá erro em vez de criar um banco vazio.
+    /// [`Engine::open_read_only`](crate::Engine::open_read_only) nunca cria.
+    pub create_if_missing: bool,
+    /// Conta consultas, commits, edições, remoções e compactações (ver
+    /// `docs/plano-monitoramento.md`). No caminho quente custa só somas
+    /// atômicas num contador da própria thread e duas leituras de relógio
+    /// por consulta. Desligado por padrão; sem a feature `metrics`, ligar dá
+    /// erro no `open`.
+    pub metrics: bool,
+    /// Onde a thread amostradora grava o snapshot das métricas, que o
+    /// `fire-flower monitor` lê. `None`: `fire-flower.metrics.json` na pasta
+    /// do banco. Um banco aberto só para leitura só grava com um arquivo
+    /// próprio aqui (o da pasta é de quem grava o banco).
+    pub metrics_file: Option<PathBuf>,
+    /// De quanto em quanto tempo a amostradora grava o snapshot; as
+    /// propriedades do RocksDB são relidas a cada 5 snapshots.
+    pub metrics_interval: Duration,
+    /// Tamanho da memtable do RocksDB no processo que grava (o WAL a
+    /// acompanha: até ~2× isso). Um leitor em outro processo
+    /// ([`crate::Reader`]) repete o WAL ao reabrir, ~12 ms por MB: com o padrão
+    /// (`None`: 64 MB, WAL de até ~90 MB numa carga) reabrir leva até ~1 s.
+    /// Menor, reabrir fica mais barato e os flushes, mais frequentes. Só vale
+    /// para quem grava.
+    pub max_wal_bytes: Option<u64>,
 }
 
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
@@ -112,6 +131,12 @@ pub enum InflectionMode {
 }
 
 impl Config {
+    /// Para quem só lê e convive com o processo que grava (a TUI, `search` e
+    /// `suggest` da CLI): block cache de 32 MB e nada de criar banco.
+    pub fn reader() -> Self {
+        Self { block_cache_bytes: 32 << 20, create_if_missing: false, ..Self::default() }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         let in_unit = |v: f64| (0.0..=1.0).contains(&v);
         let ok = self.bm25_k1.is_finite()
@@ -121,6 +146,9 @@ impl Config {
             && self.title_weight.is_finite()
             && self.title_weight >= 0.0
             && in_unit(self.inflection_weight);
+        if self.metrics_interval.is_zero() {
+            return Err(Error::Config("Config::metrics_interval precisa ser maior que zero".into()));
+        }
         if ok {
             Ok(())
         } else {
@@ -144,7 +172,6 @@ impl Default for Config {
             reader_cache_depth: Some(4),
             languages: None,
             positions: None,
-            edits: None,
             stemming: None,
             inflections: None,
             // Escolhidos pela grade da Fase 4 do plano de stemming (100k da
@@ -162,6 +189,11 @@ impl Default for Config {
             // ~50 e depois quase não muda; b 0,9 mantém o limite do corte finito.
             title_weight: 50.0,
             title_b: 0.9,
+            create_if_missing: true,
+            metrics: false,
+            metrics_file: None,
+            metrics_interval: Duration::from_secs(1),
+            max_wal_bytes: None,
         }
     }
 }

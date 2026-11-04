@@ -1,9 +1,9 @@
-//! Edição e remoção: substituir um ID, remover, a regra do lote e bancos
-//! sem `fwd:`.
+//! Edição e remoção: substituir um ID, remover, a regra do lote, as versões
+//! mortas até e depois da compactação.
 
 use std::collections::BTreeMap;
 
-use fire_flower::{Config, Engine, IndexStats};
+use fire_flower::{CompactStats, Config, Engine, IndexStats};
 
 use crate::{open, p, positions};
 
@@ -26,10 +26,13 @@ pub(crate) fn replacing_a_document_drops_the_terms_that_left() {
     assert_eq!(engine.doc_len(1).unwrap(), Some(3));
     assert_eq!(engine.stats().unwrap(), IndexStats { doc_count: 2, total_len: 5, total_title_len: 0 });
     assert_eq!(engine.label(1).unwrap().as_deref(), Some("um.txt"), "o rótulo continua");
-    // `fwd:` tem exatamente os termos do texto novo.
-    let mut want: Vec<u64> = ["jardim", "pedra"].iter().map(|t| engine.term_node(t).unwrap().unwrap()).collect();
-    want.sort_unstable();
-    assert_eq!(engine.document_nodes(1).unwrap(), Some(want));
+    assert_eq!(engine.search_ranked("jardim", 10).unwrap().hits[0].doc, 1, "o ranking devolve o ID do usuário");
+    assert_eq!(engine.dead_versions(), 1, "a versão antiga fica nas listas até a compactação");
+    assert_eq!(engine.compact().unwrap(), CompactStats { purged: 1, emptied_words: 1 }, "azul ficou sem documento");
+    assert_eq!(engine.dead_versions(), 0);
+    assert_eq!(engine.search("casa").unwrap(), [2]);
+    assert_eq!(engine.term_postings("jardim").unwrap(), [p(1, 2)]);
+    assert!(engine.suggest("az", 5).unwrap().is_empty());
 }
 
 #[test]
@@ -52,7 +55,6 @@ pub(crate) fn deleting_removes_the_document_everywhere() {
     assert!(!engine.contains(1).unwrap());
     assert!(engine.contains(2).unwrap());
     assert_eq!(engine.label(1).unwrap(), None);
-    assert_eq!(engine.document_nodes(1).unwrap(), None);
     let after = engine.stats().unwrap();
     assert_eq!(after.doc_count, before.doc_count - 1);
     assert_eq!(after.total_len, engine.doc_len(2).unwrap().unwrap() as u64);
@@ -113,22 +115,31 @@ pub(crate) fn edits_survive_reopening() {
     engine.delete_document(1).unwrap();
     assert!(engine.search("delta").unwrap().is_empty());
     assert_eq!(engine.stats().unwrap(), IndexStats::default());
-    engine.compact();
+    assert_eq!(engine.compact().unwrap().purged, 3, "as duas versões do 1 e a do 2");
     assert!(engine.search("delta").unwrap().is_empty());
+    drop(engine);
+    let engine = open(&dir);
+    assert_eq!(engine.dead_versions(), 0);
+    engine.index_document(2, "alfa").unwrap();
+    assert_eq!(engine.search("alfa").unwrap(), [2]);
 }
 
 #[test]
-pub(crate) fn database_without_edits_keeps_the_old_reindexing() {
+pub(crate) fn ids_from_the_version_range_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), Config { edits: Some(false), ..Config::default() }).unwrap();
-    assert!(!engine.has_edits());
-    engine.index_document(1, "eco azul").unwrap();
-    engine.index_document(1, "eco").unwrap();
-    assert_eq!(engine.search("azul").unwrap(), [1], "sem fwd:, o termo que saiu fica");
-    assert!(matches!(engine.delete_document(1), Err(fire_flower::Error::Config(_))));
-    drop(engine);
-    assert!(Engine::open(dir.path(), Config { edits: Some(true), ..Config::default() }).is_err());
-    assert!(!Engine::open(dir.path(), Config::default()).unwrap().has_edits());
+    let engine = open(&dir);
+    let mut batch = engine.batch();
+    let max = (1 << 40) - 1;
+    assert!(matches!(batch.add_document(max + 1, "alto"), Err(fire_flower::Error::Config(_))));
+    assert!(matches!(batch.delete_document(u64::MAX), Err(fire_flower::Error::Config(_))));
+    batch.add_document(max, "maior").unwrap();
+    batch.add_document(3, "menor").unwrap();
+    batch.commit().unwrap();
+    engine.index_document(max, "maior ainda").unwrap();
+    engine.index_document(3, "menor ainda").unwrap();
+    assert_eq!(engine.search("ainda").unwrap(), [3, max]);
+    assert_eq!(engine.search_top("ainda", 1).unwrap()[0].doc, 3, "no empate, o menor ID");
+    assert_eq!(engine.doc_len(max).unwrap(), Some(2));
 }
 
 /// Gerador pequeno e determinístico.
@@ -159,6 +170,7 @@ fn content(engine: &Engine) -> Content {
     }
     let mut lens = Vec::new();
     engine.for_each_doc_len(|doc, len, title| lens.push((doc, len, title))).unwrap();
+    lens.sort_unstable();
     (terms, lens, engine.stats().unwrap())
 }
 
@@ -193,7 +205,7 @@ pub(crate) fn edits_match_a_fresh_load() {
             }
             batch.commit().unwrap();
             if round == 6 {
-                engine.compact();
+                engine.compact().unwrap();
             }
         }
         let fresh_dir = tempfile::tempdir().unwrap();
@@ -203,23 +215,26 @@ pub(crate) fn edits_match_a_fresh_load() {
             batch.add_titled(*doc, title, body).unwrap();
         }
         batch.commit().unwrap();
+        let queries = ["sol lua", "\"mar rio\"", "pedra*", "vento"];
         assert!(content(&engine) == content(&fresh), "seed {seed}: antes de compactar");
-        for q in ["sol lua", "\"mar rio\"", "pedra*", "vento"] {
-            let (a, b) = (engine.search_ranked(q, 50).unwrap(), fresh.search_ranked(q, 50).unwrap());
-            assert_eq!(a.total, b.total, "seed {seed}: {q}");
-            let docs = |t: &fire_flower::TopHits| t.hits.iter().map(|h| h.doc).collect::<Vec<_>>();
-            assert_eq!(docs(&a), docs(&b), "seed {seed}: {q}");
+        for q in queries {
+            assert_eq!(engine.search(q).unwrap(), fresh.search(q).unwrap(), "seed {seed}: {q}");
+            // O df conta as versões mortas até a compactação: as notas mudam, o total não.
+            assert_eq!(engine.search_ranked(q, 50).unwrap().total, fresh.search_ranked(q, 50).unwrap().total);
         }
-        engine.compact();
+        engine.compact().unwrap();
         assert!(content(&engine) == content(&fresh), "seed {seed}: depois de compactar");
+        for q in queries {
+            assert_eq!(engine.search_ranked(q, 50).unwrap(), fresh.search_ranked(q, 50).unwrap(), "seed {seed}: {q}");
+        }
     }
 }
 
-/// Uma palavra cujo último documento saiu some do autocompletar e do prefixo
-/// na hora (sem ocupar vaga do limite de termos), continua fora depois de
-/// reabrir, e a limpeza tira o fim de palavra dela na Trie.
+/// Uma palavra cujo último documento saiu continua no autocompletar até a
+/// compactação, que a tira da Trie; a busca por prefixo já não acha o
+/// documento. A palavra pode voltar.
 #[test]
-pub(crate) fn words_without_documents_leave_suggestions() {
+pub(crate) fn words_without_documents_leave_at_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let config = || Config { max_prefix_terms: 2, ..Config::default() };
     {
@@ -232,17 +247,17 @@ pub(crate) fn words_without_documents_leave_suggestions() {
         assert_eq!(engine.suggest("pal", 10).unwrap(), ["palco", "palha", "palma", "palito"]);
         engine.delete_document(1).unwrap();
         engine.index_document(3, "outro").unwrap();
-        assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"], "palco e palito ficaram sem documento");
-        // As duas vagas do prefixo vão para palavras com documento.
         assert_eq!(engine.search("pal*").unwrap(), [2]);
+        assert!(engine.search("palco").unwrap().is_empty());
+        assert_eq!(engine.suggest("pal", 10).unwrap().len(), 4, "até a compactação");
     }
     let engine = Engine::open(dir.path(), config()).unwrap();
-    assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"], "o conjunto sobrevive ao open");
-    assert!(engine.term_node("palco").unwrap().is_some(), "antes da limpeza o nó ainda é palavra");
-    assert_eq!(engine.collect_empty_words().unwrap(), 2);
-    assert_eq!(engine.collect_empty_words().unwrap(), 0, "nada mais a limpar");
+    assert_eq!(engine.dead_versions(), 2, "os mortos sobrevivem ao open");
+    assert!(engine.search("palito").unwrap().is_empty());
+    assert_eq!(engine.compact().unwrap(), CompactStats { purged: 2, emptied_words: 2 });
     assert_eq!(engine.term_node("palco").unwrap(), None);
     assert_eq!(engine.suggest("pal", 10).unwrap(), ["palha", "palma"]);
+    assert_eq!(engine.compact().unwrap(), CompactStats::default(), "nada mais a limpar");
     // A palavra pode voltar.
     engine.index_document(4, "palco").unwrap();
     assert_eq!(engine.suggest("palc", 10).unwrap(), ["palco"]);

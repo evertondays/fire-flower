@@ -3,7 +3,8 @@
 use fire_flower::Stemmer;
 
 use super::*;
-use super::draw::{describe_phrase, format_count, truncate_left};
+use super::draw::describe_phrase;
+use crate::style::{ACCENT, format_count, truncate_left};
 use super::preview::highlight;
 
 #[test]
@@ -35,7 +36,7 @@ fn renders_screen() {
     batch.add_labeled("outro.txt", "brasileiro bravo").unwrap();
     batch.commit().unwrap();
 
-    let mut app = App::new(&engine, "/tmp/db");
+    let mut app = App::new(engine, "/tmp/db");
     for c in "coração bra".chars() {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
@@ -81,7 +82,7 @@ fn phrases_are_one_unit_and_not_prefixes() {
     batch.add_labeled("c.txt", "papel casa").unwrap();
     batch.commit().unwrap();
 
-    let mut app = App::new(&engine, "/tmp/db");
+    let mut app = App::new(engine, "/tmp/db");
     // Aspas abertas: a palavra sendo digitada não vira prefixo.
     app.query = "\"casa de pap".into();
     app.refresh();

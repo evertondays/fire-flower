@@ -24,17 +24,23 @@ WORKDIR /src
 # Dependências primeiro, com fontes vazios: a camada (e o RocksDB, que leva
 # minutos para compilar) só é refeita quando o Cargo.toml ou o Cargo.lock mudam.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src/bin/fire-flower benches \
- && echo 'fn main() {}' > src/bin/fire-flower/main.rs \
- && touch src/lib.rs benches/micro.rs \
+COPY crates/fire-flower-cli/Cargo.toml crates/fire-flower-cli/
+# O binding Node é membro do workspace: o cargo precisa do manifesto, mas a
+# imagem não o compila (fonte vazio, sem build.rs).
+COPY bindings/node/Cargo.toml bindings/node/
+RUN mkdir -p src benches crates/fire-flower-cli/src bindings/node/src \
+ && echo 'fn main() {}' > crates/fire-flower-cli/src/main.rs \
+ && echo 'fn main() {}' > bindings/node/build.rs \
+ && touch src/lib.rs benches/micro.rs bindings/node/src/lib.rs \
  && cargo build --release --locked --bin fire-flower \
- && rm -rf src benches
+ && rm -rf src benches crates/fire-flower-cli/src
 
 COPY src ./src
 COPY benches ./benches
+COPY crates ./crates
 # O COPY preserva as datas dos arquivos, que podem ser mais antigas que as dos
 # fontes vazios: sem o touch, o cargo acharia que nada mudou.
-RUN touch src/lib.rs src/bin/fire-flower/main.rs \
+RUN touch src/lib.rs crates/fire-flower-cli/src/main.rs \
  && cargo build --release --locked --bin fire-flower \
  && cp target/release/fire-flower /usr/local/bin/fire-flower
 

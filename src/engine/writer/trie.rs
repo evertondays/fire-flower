@@ -87,10 +87,14 @@ impl IndexBatch<'_> {
             Entry::Occupied(e) => {
                 let cached = e.into_mut();
                 cached.used = generation;
+                // A limpeza de palavras põe no cache, como fundo, um nó que
+                // ainda não estava nele: a profundidade de verdade vem aqui, ou
+                // o commit deixaria de marcá-lo no cache das buscas.
+                cached.depth = cached.depth.min(depth);
                 Ok(cached)
             }
             Entry::Vacant(e) => {
-                let (node, dirty) = match load_node(&self.engine.db, id)? {
+                let (node, dirty) = match load_node(&*self.engine.db, id)? {
                     Some(node) => (node, false),
                     // Banco novo: a raiz nasce no primeiro commit.
                     None if id == ROOT_ID => (TrieNode::default(), true),

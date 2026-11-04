@@ -79,13 +79,16 @@ jobs:
           mkdir -p t/docs
           echo 'O Coração do Brasil bate forte.' > t/docs/brasil.txt
           echo '{"id": 1, "title": "Planeta Terra", "text": "O terceiro planeta."}' > t/artigos.jsonl
+          echo '{"external_id": "https://exemplo.com/marte", "title": "Planeta Marte", "text": "O quarto planeta."}' >> t/artigos.jsonl
           run() { docker run --rm -v "$PWD/t:/data" --user "$(id -u):$(id -g)" fire-flower:test "$@"; }
           run index banco docs
           run search banco 'coração bras*' | tee /dev/stderr | grep -q 'docs/brasil.txt'
           run suggest banco bra | grep -qx 'brasil'
           run index-jsonl wiki artigos.jsonl
           run search wiki planeta | grep -q 'Planeta Terra'
+          run search wiki marte | grep -q 'https://exemplo.com/marte'
           run delete wiki 1 | grep -q '^1 documento'
+          run delete wiki --external-ids https://exemplo.com/marte | grep -q '^1 documento'
           run search wiki planeta | tee /dev/stderr | grep -q '^0 resultado'
 
       - name: Guarda o digest

@@ -352,7 +352,7 @@ pub(crate) fn run_relevance(
     label: Option<String>,
 ) -> AnyResult {
     let started = Instant::now();
-    let engine = Engine::open(db, config)?;
+    let engine = Engine::open(db, crate::env::with_metrics(config))?;
     let stopwords = engine.stopwords().clone();
     std::fs::create_dir_all(sets_dir)?;
 

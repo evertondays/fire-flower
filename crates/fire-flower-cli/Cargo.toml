@@ -1,0 +1,25 @@
+[package]
+name = "fire-flower-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI do fire-flower: indexar, buscar, busca interativa e monitor"
+
+[[bin]]
+name = "fire-flower"
+path = "src/main.rs"
+
+[features]
+default = ["metrics"]
+# O `--metrics` dos comandos de indexação liga as métricas do core.
+metrics = ["fire-flower/metrics"]
+
+[dependencies]
+fire-flower.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+ratatui = "0.30"
+serde.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

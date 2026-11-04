@@ -1,0 +1,89 @@
+# Regras de alerta do Prometheus para o fire-flower, sobre as métricas do
+# `fire-flower monitor --serve` (nomes em docs/plano-monitoramento.md).
+#
+# No prometheus.yml:
+#   rule_files: [prometheus-alerts.yml]
+#   scrape_configs:
+#     - job_name: fire-flower
+#       static_configs: [{targets: ["127.0.0.1:9187"]}]
+groups:
+  - name: fire-flower
+    rules:
+      - alert: FireFlowerMonitorDown
+        expr: up{job="fire-flower"} == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "o fire-flower monitor de {{ $labels.instance }} não responde"
+
+      - alert: FireFlowerSnapshotStale
+        expr: fireflower_exporter_snapshot_age_seconds > 30
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "o motor parou de gravar o snapshot das métricas há {{ $value | humanizeDuration }}"
+          description: "o processo dono do banco parou, travou ou perdeu o disco"
+
+      - alert: FireFlowerWritesStopped
+        expr: fireflower_rocksdb_write_stopped > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "o RocksDB parou as escritas (compactação atrasada demais)"
+
+      - alert: FireFlowerBackgroundErrors
+        expr: increase(fireflower_rocksdb_background_errors_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "erros em segundo plano do RocksDB (flush ou compactação)"
+
+      - alert: FireFlowerCommitErrors
+        expr: increase(fireflower_commit_errors_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "commits falhando: {{ $value }} nos últimos 10 min"
+
+      - alert: FireFlowerL0Backlog
+        expr: fireflower_rocksdb_sst_files{level="0"} >= 20
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "L0 com {{ $value }} arquivos: as escritas estão sendo atrasadas"
+
+      - alert: FireFlowerCompactionBacklogGrowing
+        expr: deriv(fireflower_rocksdb_pending_compaction_bytes[15m]) > 0 and fireflower_rocksdb_pending_compaction_bytes > 1e9
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "a compactação pendente só cresce ({{ $value | humanize1024 }}B)"
+
+      - alert: FireFlowerDiskAlmostFull
+        expr: fireflower_filesystem_free_bytes / fireflower_filesystem_size_bytes < 0.10
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "disco do banco com menos de 10% livre"
+
+      - alert: FireFlowerTooManyDeadVersions
+        expr: fireflower_dead_versions > 1000 and fireflower_dead_versions > 0.10 * fireflower_documents
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} versões mortas nas listas: compacte (fire-flower compact ou Maintenance)"
+          description: >-
+            Documentos substituídos ou removidos deixam a versão antiga nas listas até a compactação:
+            ocupam espaço, contam no df do ranking e deixam palavras sem documento no autocompletar.
+
+      - alert: FireFlowerQueryErrors
+        expr: sum by (instance, op) (rate(fireflower_query_errors_total[5m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "consultas {{ $labels.op }} dando erro"
+
+      - alert: FireFlowerSlowQueries
+        expr: histogram_quantile(0.99, sum by (instance, op, le) (rate(fireflower_query_duration_seconds_bucket[5m]))) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 de {{ $labels.op }} acima de 100 ms ({{ $value | humanizeDuration }})"

@@ -8,10 +8,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph};
 
-use super::{ACCENT, ACCENT_SOFT, App, MUTED, Preview, PreviewContent};
+use super::{App, Preview, PreviewContent};
+use crate::style::{ACCENT, ACCENT_SOFT, MUTED, format_count, panel, truncate_left};
 
-
-impl<'a> App<'a> {
+impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
         let [header, search, status, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -174,10 +174,17 @@ impl<'a> App<'a> {
             .into_iter()
             .map(|hit| {
                 let label = self.label(hit.doc).unwrap_or_else(|| "(sem rótulo)".into());
+                // O ID externo vai no fim, apagado e curto: o rótulo é o que se lê.
+                let external = self
+                    .external_id(hit.doc)
+                    .map(|e| format!("  {}", truncate_left(&e, (label_width / 3).max(12))))
+                    .unwrap_or_default();
+                let rest = label_width.saturating_sub(external.chars().count());
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{:>id_width$} ", hit.doc), Style::new().fg(MUTED)),
                     Span::styled(format!("{:>6.2} ", hit.score), Style::new().fg(ACCENT)),
-                    Span::raw(truncate_left(&label, label_width)),
+                    Span::raw(truncate_left(&label, rest)),
+                    Span::styled(external, Style::new().fg(MUTED)),
                 ]))
             })
             .collect();
@@ -211,7 +218,10 @@ impl<'a> App<'a> {
 
     fn draw_reader(&mut self, frame: &mut Frame, area: Rect) {
         let doc = self.results.get(self.selected).map(|h| h.doc);
-        let label = doc.and_then(|d| self.label(d)).unwrap_or_default();
+        let mut label = doc.and_then(|d| self.label(d)).unwrap_or_default();
+        if let Some(external) = doc.and_then(|d| self.external_id(d)) {
+            label = format!("{label} · {external}");
+        }
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(ACCENT))
@@ -242,6 +252,7 @@ impl<'a> App<'a> {
                 ("↑↓", "resultado"),
                 ("Enter", "abrir"),
                 ("^W", "apagar"),
+                ("^R", "recarregar"),
                 ("Esc", "sair"),
             ]
         };
@@ -253,7 +264,6 @@ impl<'a> App<'a> {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
-
 
 /// `"copa _ mundo"`: a frase com um `_` por stopword pulada.
 pub(super) fn describe_phrase(clause: &Clause) -> String {
@@ -269,35 +279,4 @@ pub(super) fn describe_phrase(clause: &Clause) -> String {
         next = part.offset + 1;
     }
     format!("\"{}\"", words.join(" "))
-}
-
-fn panel(title: &str) -> Block<'_> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(MUTED))
-        .title(Span::styled(title, Style::new().fg(Color::Gray).bold()))
-}
-
-
-/// Corta pela esquerda: em caminhos, o fim (nome do arquivo) é o que importa.
-pub(super) fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max || max < 2 {
-        return s.to_string();
-    }
-    let skip = count - (max - 1);
-    format!("…{}", s.chars().skip(skip).collect::<String>())
-}
-
-/// 1234567 -> "1.234.567"
-pub(super) fn format_count(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
 }

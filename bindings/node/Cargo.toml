@@ -1,0 +1,25 @@
+[package]
+name = "fire-flower-node"
+version.workspace = true
+edition.workspace = true
+description = "Binding Node.js (napi-rs) do fire-flower"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+# Os testes são em JS (test/*.test.js), sobre o addon compilado.
+test = false
+doctest = false
+
+[features]
+default = ["metrics"]
+metrics = ["fire-flower/metrics"]
+
+[dependencies]
+fire-flower.workspace = true
+napi = "3"
+napi-derive = "3"
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build = "2"

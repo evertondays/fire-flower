@@ -3,7 +3,7 @@
 
 use crate::{DocId, Error, Posting};
 use crate::codec::{SKIP_BLOCK, put_varint};
-use crate::codec::list::{Block, ListHeader, write_list};
+use crate::codec::list::{Block, DeadBits, ListHeader, write_list};
 use crate::codec::varint::{Reader, corrupt};
 
 /// Uma entrada a gravar numa lista: documento, tf e tf no título. O lote
@@ -57,7 +57,7 @@ pub fn encode_postings_into<E: PostingEntry>(buf: &mut Vec<u8>, entries: &[E]) {
             }
         }
     };
-    write_list(buf, entries.len(), false, write);
+    write_list(buf, entries.len(), write);
 }
 
 pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
@@ -82,15 +82,31 @@ fn read_tfs(r: &mut Reader<'_>) -> Result<(u32, u32), Error> {
 
 /// Lista completa: documento e frequência do termo (total e no título).
 pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
-    let header = ListHeader::parse_clean(bytes, false)?;
+    decode_postings_with::<false>(bytes, &DeadBits::default())
+}
+
+/// Como [`decode_postings`], sem os documentos de `dead`: as versões mortas
+/// que ainda estão na lista (ver `engine::versions`).
+pub fn decode_postings_except(bytes: &[u8], dead: &DeadBits) -> Result<Vec<Posting>, Error> {
+    if dead.is_empty() { decode_postings(bytes) } else { decode_postings_with::<true>(bytes, dead) }
+}
+
+/// `SKIP` em tempo de compilação: sem mortos, o laço é o mesmo de antes.
+#[inline(always)]
+fn decode_postings_with<const SKIP: bool>(bytes: &[u8], dead: &DeadBits) -> Result<Vec<Posting>, Error> {
+    let header = ListHeader::parse(bytes, false)?;
     let n = header.n;
     let mut r = Reader { buf: bytes, pos: header.body };
     // Cada entrada ocupa pelo menos 2 bytes: limita a pré-alocação a dados reais.
     let mut out = Vec::with_capacity((n as usize).min(bytes.len() / 2));
+    let mut dead = dead.cursor();
     let mut doc: DocId = 0;
     for _ in 0..n {
         doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
         let (tf, title_tf) = read_tfs(&mut r)?;
+        if SKIP && dead.is_dead(doc) {
+            continue;
+        }
         out.push(Posting { doc, tf, title_tf });
     }
     r.finish()?;
@@ -99,15 +115,29 @@ pub fn decode_postings(bytes: &[u8]) -> Result<Vec<Posting>, Error> {
 
 /// Só os IDs, pulando as frequências: é o que a busca sem ranking precisa.
 pub fn decode_docs(bytes: &[u8]) -> Result<Vec<DocId>, Error> {
-    let header = ListHeader::parse_clean(bytes, false)?;
+    decode_docs_with::<false>(bytes, &DeadBits::default())
+}
+
+/// Como [`decode_docs`], sem os documentos de `dead`.
+pub fn decode_docs_except(bytes: &[u8], dead: &DeadBits) -> Result<Vec<DocId>, Error> {
+    if dead.is_empty() { decode_docs(bytes) } else { decode_docs_with::<true>(bytes, dead) }
+}
+
+#[inline(always)]
+fn decode_docs_with<const SKIP: bool>(bytes: &[u8], dead: &DeadBits) -> Result<Vec<DocId>, Error> {
+    let header = ListHeader::parse(bytes, false)?;
     let n = header.n;
     let mut r = Reader { buf: bytes, pos: header.body };
     let mut out = Vec::with_capacity((n as usize).min(bytes.len() / 2));
+    let mut dead = dead.cursor();
     let mut doc: DocId = 0;
     for _ in 0..n {
         doc = doc.checked_add(r.varint()?).ok_or_else(|| corrupt("delta estourou u64"))?;
         if r.varint()? & 1 == 1 {
             r.skip_varints(1)?;
+        }
+        if SKIP && dead.is_dead(doc) {
+            continue;
         }
         out.push(doc);
     }
@@ -134,7 +164,7 @@ pub struct PostingsCursor<'a> {
 
 impl<'a> PostingsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        let ListHeader { n, blocks, body, .. } = ListHeader::parse_clean(bytes, true)?;
+        let ListHeader { n, blocks, body, .. } = ListHeader::parse(bytes, true)?;
         Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, read: 0, prev: 0, current: None })
     }
 

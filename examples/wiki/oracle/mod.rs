@@ -69,7 +69,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     let started = Instant::now();
     let mut rng = Rng(args.seed);
     // Aberto antes: o oráculo descarta as mesmas stopwords que estão gravadas no banco.
-    let engine = Engine::open(&args.db, args.config.clone())?;
+    let engine = Engine::open(&args.db, crate::env::with_metrics(args.config.clone()))?;
     let stopwords = engine.stopwords().clone();
     // E o mesmo stemming: o termo de um token é o radical dele.
     let stemmer = engine.stemmer().clone();

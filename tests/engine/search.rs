@@ -142,7 +142,7 @@ pub(crate) fn skip_lists_give_the_same_results() {
     };
     check(&engine, "antes de compactar");
     let before: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
-    engine.compact();
+    engine.compact().unwrap();
     check(&engine, "depois de compactar");
     let after: Vec<Vec<u64>> = ["\"sol lua\"", "\"mar rio\" sol"].iter().map(|q| engine.search(q).unwrap()).collect();
     assert_eq!(before, after);

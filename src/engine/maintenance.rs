@@ -1,5 +1,5 @@
 //! Manutenção em segundo plano: depois de muitas edições, compacta o banco e
-//! limpa as palavras sem documento ([`Maintenance`]).
+//! limpa as versões mortas e as palavras sem documento ([`Maintenance`]).
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -25,13 +25,14 @@ impl Default for MaintenanceOptions {
     }
 }
 
-/// Thread que mantém as buscas rápidas depois de edições.
+/// Thread que limpa o banco depois de edições.
 ///
-/// Editar grava um remendo pequeno (`pov:` / `psv:`) em vez de um pedaço no
-/// meio da lista. A busca aplica o remendo em cima da base; a lista grande não
-/// é regravada a cada leitura. Esta thread incorpora os remendos e compacta
-/// quando as edições acumuladas passam do limite, e depois limpa as palavras
-/// que ficaram sem documento ([`Engine::collect_empty_words`]).
+/// Substituir e remover só acrescentam: a versão antiga de um documento
+/// continua nas listas, morta, até a compactação. A busca a pula (um teste
+/// por documento lido), então a latência quase não muda; o que se acumula é
+/// espaço, o df (que conta os mortos até lá) e as palavras sem documento no
+/// autocompletar. Esta thread chama [`Engine::compact`] quando as edições
+/// acumuladas passam do limite.
 ///
 /// Para ao ser descartada (espera a compactação em andamento terminar).
 pub struct Maintenance {
@@ -94,7 +95,6 @@ fn run_once(engine: &Engine, options: &MaintenanceOptions) -> Result<()> {
     if engine.pending_edits() < limit {
         return Ok(());
     }
-    engine.compact();
-    engine.collect_empty_words()?;
+    engine.compact()?;
     Ok(())
 }

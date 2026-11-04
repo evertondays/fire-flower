@@ -2,9 +2,10 @@
 //! a palavra exata e as do mesmo radical como um termo só.
 
 use crate::{DocId, InflectionMode, Posting, Result, codec};
+use crate::codec::DeadBits;
 use crate::engine::conjunction::Member;
-use crate::engine::keys::stem_key;
-use crate::engine::view::{PostSource, Source, View};
+use crate::engine::keys::{POST, stem_key};
+use crate::engine::view::{Source, View};
 
 /// (exata, flexões) de cada documento da união de um [`Scorer::Group`].
 pub(super) type GroupParts = Vec<(Posting, Posting)>;
@@ -42,22 +43,32 @@ fn align_group(exact: &[Posting], variants: &[Posting]) -> (Vec<Posting>, GroupP
     (union, parts)
 }
 
-/// Documentos de um grupo de flexões: a união das listas.
-pub(super) fn decode_group_docs(bytes: &[PostSource<'_>], parts: &[(bool, usize)]) -> Result<Vec<DocId>> {
+/// Documentos vivos de um grupo de flexões (`dead`: as versões mortas): a
+/// união das listas.
+pub(super) fn decode_group_docs(
+    bytes: &[rocksdb::DBPinnableSlice<'_>],
+    parts: &[(bool, usize)],
+    dead: &DeadBits,
+) -> Result<Vec<DocId>> {
     let mut all = Vec::new();
     for &(_, idx) in parts {
-        all.extend(bytes[idx].docs()?);
+        all.extend(codec::decode_docs_except(&bytes[idx], dead)?);
     }
     all.sort(); // trechos já ordenados: ver `View::union_postings`
     all.dedup();
     Ok(all)
 }
 
-/// Um grupo de flexões decodificado: a união e as entradas (exata, flexões).
-pub(super) fn decode_group(bytes: &[PostSource<'_>], parts: &[(bool, usize)]) -> Result<(Vec<Posting>, GroupParts)> {
+/// Um grupo de flexões decodificado, sem as versões mortas: a união e as
+/// entradas (exata, flexões).
+pub(super) fn decode_group(
+    bytes: &[rocksdb::DBPinnableSlice<'_>],
+    parts: &[(bool, usize)],
+    dead: &DeadBits,
+) -> Result<(Vec<Posting>, GroupParts)> {
     let (mut exact, mut variants) = (Vec::new(), Vec::new());
     for &(is_exact, idx) in parts {
-        let list = bytes[idx].postings()?;
+        let list = codec::decode_postings_except(&bytes[idx], dead)?;
         if is_exact { exact = list } else { variants.extend(list) }
     }
     variants.sort_by_key(|p| p.doc);
@@ -98,26 +109,23 @@ impl View<'_> {
         &'s self,
         exact: Option<u64>,
         variants: Vec<u64>,
-        bytes: &mut Vec<PostSource<'s>>,
+        bytes: &mut Vec<rocksdb::DBPinnableSlice<'s>>,
         members: &mut Vec<Member<T>>,
     ) -> Result<usize> {
         let mut parts = Vec::with_capacity(variants.len() + 1);
         let (mut max_df, mut len) = (0usize, 0usize);
-        let mut push = |is_exact: bool, value: PostSource<'s>| -> Result<()> {
-            let n = value.len()?;
-            if n == 0 {
-                return Ok(());
-            }
+        let mut push = |is_exact: bool, value: rocksdb::DBPinnableSlice<'s>| -> Result<()> {
+            let n = codec::list_len(&value)? as usize;
             max_df = max_df.max(n);
             len += n;
             parts.push((is_exact, bytes.len()));
             bytes.push(value);
             Ok(())
         };
-        if let Some(value) = exact.map(|n| self.post_source(n)).transpose()?.flatten() {
+        if let Some(value) = exact.map(|n| self.post_bytes(n)).transpose()?.flatten() {
             push(true, value)?;
         }
-        for value in self.post_sources(variants.into_iter())?.into_iter().flatten() {
+        for value in self.get_many(POST, variants.into_iter())?.into_iter().flatten() {
             push(false, value)?;
         }
         if len > 0 {

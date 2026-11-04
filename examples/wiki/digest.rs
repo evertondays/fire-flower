@@ -23,7 +23,7 @@ impl Fnv {
 /// documentos e estatísticas. Não depende dos IDs de nó, então bancos
 /// carregados com lotes diferentes têm que dar o mesmo resumo.
 pub(crate) fn digest(db: &Path) -> AnyResult {
-    let engine = Engine::open(db, Config::default())?;
+    let engine = Engine::open(db, crate::env::with_metrics(Config::default()))?;
     let mut nodes = Vec::new();
     engine.for_each_term(|term, node| nodes.push((term.to_string(), node)))?;
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);

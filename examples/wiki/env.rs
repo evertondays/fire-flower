@@ -174,3 +174,14 @@ pub(crate) fn write_metrics(engine: &Engine) -> Value {
 pub(crate) fn mb(bytes: u64) -> f64 {
     bytes as f64 / (1 << 20) as f64
 }
+
+/// Liga as métricas do motor quando `FF_METRICS_FILE` aponta para um arquivo:
+/// todas as fases do `perf.py` gravam o snapshot nele, e um único `fire-flower
+/// monitor` acompanha a rodada inteira (o A/B das métricas,
+/// `docs/plano-monitoramento.md`).
+pub(crate) fn with_metrics(config: Config) -> Config {
+    match std::env::var_os("FF_METRICS_FILE") {
+        Some(file) => Config { metrics: true, metrics_file: Some(PathBuf::from(file)), ..config },
+        None => config,
+    }
+}

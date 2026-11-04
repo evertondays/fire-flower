@@ -1,0 +1,85 @@
+# Binding Node (bindings/node): compila o addon e roda os testes no Node 20,
+# 22 e 24, e um teste rápido no Bun e no Deno (Node-API). A matriz completa de
+# plataformas e a publicação no npm são a Fase 4 do docs/plano-bindings.md.
+name: node
+
+on:
+  push:
+    branches: [main, v0.2-release]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # O RocksDB é compilado do fonte (C++) e o bindgen precisa da libclang.
+      - name: Dependências do sistema
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: node-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Compilar o addon
+        working-directory: bindings/node
+        run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fire-flower-node-linux-x64
+          path: bindings/node/fire-flower.node
+
+  runtimes:
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node20, node22, node24, bun, deno]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fire-flower-node-linux-x64
+          path: bindings/node
+
+      - if: startsWith(matrix.runtime, 'node')
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ fromJSON('{"node20":20,"node22":22,"node24":24}')[matrix.runtime] }}
+
+      - if: startsWith(matrix.runtime, 'node')
+        name: Testes (node --test)
+        working-directory: bindings/node
+        run: npm test
+
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - if: matrix.runtime == 'bun'
+        name: Teste rápido no Bun
+        run: bun bindings/node/test/smoke.mjs
+
+      - if: matrix.runtime == 'deno'
+        uses: denoland/setup-deno@v2
+
+      - if: matrix.runtime == 'deno'
+        name: Teste rápido no Deno
+        run: deno run --allow-read --allow-write --allow-env --allow-ffi bindings/node/test/smoke.mjs

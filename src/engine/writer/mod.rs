@@ -9,13 +9,15 @@ use rustc_hash::FxHashMap;
 
 use crate::{DocId, Engine, Error, IndexStats, Result, codec};
 use crate::analysis::Analyzer;
-use crate::engine::reads_on_this_thread;
+use crate::codec::ListKind;
 use crate::engine::keys::{
-    Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, POS, POST,
-    stem_key,
+    Key, META_DOC_COUNT, META_NEXT_DOC, META_NEXT_NODE, META_OVERLAYS, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, POS,
+    POST, POV, PSV, stem_key,
 };
+use crate::engine::overlays::Overlays;
+use crate::engine::reads_on_this_thread;
 use crate::engine::meta::varint;
-use crate::engine::writer::documents::NewTerms;
+use crate::engine::writer::documents::{NewTerms, Norms, exists};
 use crate::engine::writer::trie::{CachedNode, TriePath, evict};
 
 mod documents;
@@ -71,6 +73,10 @@ pub struct IndexBatch<'a> {
     pub(super) repeated: bool,
     pub(super) labels: Vec<(DocId, String)>,
     pub(super) analyzer: Analyzer,
+    /// Menor ID que este lote pode tratar como documento novo (anexo no fim
+    /// da lista). IDs menores podem cair no meio de uma lista já gravada e
+    /// vão para o remendo.
+    pub(super) doc_floor: DocId,
 }
 
 /// Uma operação do lote sobre um documento.
@@ -102,6 +108,36 @@ struct BatchEntry {
     title_tf: u32,
     /// Índice em `IndexBatch::ops`.
     op: u32,
+}
+
+/// Pedaços de remendo de um termo neste lote, mais anexos na lista base.
+#[derive(Default)]
+pub(super) struct OverlayBatch {
+    post: Vec<Vec<u8>>,
+    pos: Vec<Vec<u8>>,
+    appends: u64,
+}
+
+/// Separa anexos (documento novo, ID alto) de edições (vão para o remendo).
+fn split_acc(acc: &TermAcc, floor: DocId, norms: &Norms, with_pos: bool) -> (Vec<BatchEntry>, Vec<u32>, Vec<BatchEntry>, Vec<u32>) {
+    let mut appends = Vec::new();
+    let mut append_pos = Vec::new();
+    let mut edits = Vec::new();
+    let mut edit_pos = Vec::new();
+    let mut at = 0usize;
+    for e in &acc.docs {
+        let n = if with_pos { e.tf as usize } else { 0 };
+        let positions = if with_pos { &acc.positions[at..at + n] } else { &[] };
+        at += n;
+        if e.doc >= floor && !exists(norms, e.doc) {
+            appends.push(*e);
+            append_pos.extend_from_slice(positions);
+        } else {
+            edits.push(*e);
+            edit_pos.extend_from_slice(positions);
+        }
+    }
+    (appends, append_pos, edits, edit_pos)
 }
 
 impl codec::PostingEntry for BatchEntry {
@@ -351,9 +387,13 @@ impl IndexBatch<'_> {
         let mut new_terms = NewTerms::new(&self.ops, self.engine.edits);
         // `merge` em vez de ler + reescrever a lista: o RocksDB une os
         // fragmentos na leitura e na compactação (ver `merge_operator`).
+        // Documento novo (ID ≥ `doc_floor`) anexa na lista. Documento que já
+        // existia, ou um ID antigo, vai para o remendo (`pov:` / `psv:`): a
+        // lista base não ganha um pedaço no meio, e a leitura não a regrava.
         // Palavras novas por radical, para o `stem:` (só com flexões na consulta).
         let inflector = &self.engine.inflector;
         let mut new_by_stem: FxHashMap<String, Vec<u64>> = FxHashMap::default();
+        let mut overlays: FxHashMap<u64, OverlayBatch> = FxHashMap::default();
         for (term, mut acc) in terms {
             let last_op = &self.last_op;
             acc.normalize(positions, self.repeated, |doc, op| last_op[&doc] == op);
@@ -371,13 +411,39 @@ impl IndexBatch<'_> {
                     new_terms.push(e.op, id);
                 }
             }
-            buf.clear();
-            codec::encode_postings_into(&mut buf, &acc.docs);
-            wb.merge(Key::new(POST, id), &buf);
-            if positions {
+            // Sem `fwd:` o comportamento antigo: reindexar só troca o tf e o
+            // termo que saiu continua na lista. Tudo vai para `post:`.
+            let (appends, append_pos, edits, edit_pos) = if self.engine.edits {
+                split_acc(&acc, self.doc_floor, &norms, positions)
+            } else {
+                (acc.docs.clone(), acc.positions.clone(), Vec::new(), Vec::new())
+            };
+            if !appends.is_empty() {
                 buf.clear();
-                codec::encode_positions_into(&mut buf, &acc.docs, &acc.positions);
-                wb.merge(Key::new(POS, id), &buf);
+                codec::encode_postings_into(&mut buf, &appends);
+                wb.merge(Key::new(POST, id), &buf);
+                if positions {
+                    buf.clear();
+                    codec::encode_positions_into(&mut buf, &appends, &append_pos);
+                    wb.merge(Key::new(POS, id), &buf);
+                }
+                if self.engine.edits && (self.engine.overlays.is_active(id) || !edits.is_empty()) {
+                    overlays.entry(id).or_default().appends += appends.len() as u64;
+                }
+            }
+            if !edits.is_empty() {
+                // +1 só para o documento que ainda não tinha o termo. Trocar o
+                // tf não muda o df; a lápide (em `write_documents`) desconta.
+                let delta = edits.iter().filter(|e| !old_terms.had(e.doc, id)).count() as i64;
+                buf.clear();
+                codec::encode_postings_into(&mut buf, &edits);
+                let slot = overlays.entry(id).or_default();
+                slot.post.push(codec::wrap_delta(delta, &buf));
+                if positions {
+                    buf.clear();
+                    codec::encode_positions_into(&mut buf, &edits, &edit_pos);
+                    slot.pos.push(codec::wrap_delta(0, &buf));
+                }
             }
         }
         for (stem, mut ids) in new_by_stem {
@@ -391,7 +457,7 @@ impl IndexBatch<'_> {
         stats.dirty_nodes = self.dirty.len();
 
         let t = Instant::now();
-        let maybe_empty = self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats)?;
+        let maybe_empty = self.write_documents(&mut wb, &finals, &old_terms, &mut new_terms, &mut stats, &mut overlays)?;
         let (index, blocks) = self.write_lengths(&mut wb, &finals, &mut norms)?;
         self.write_labels(&mut wb, &finals, &norms);
         documents_secs += t.elapsed();
@@ -407,6 +473,9 @@ impl IndexBatch<'_> {
         wb.put(META_TOTAL_LEN, varint(index.total_len));
         wb.put(META_TOTAL_TITLE_LEN, varint(index.total_title_len));
         stats.nodes_secs = t.elapsed().as_secs_f64();
+        if !overlays.is_empty() {
+            flush_overlays(&self.engine.db, &mut wb, &overlays, &self.engine.overlays)?;
+        }
         stats.batch_bytes = wb.size_in_bytes();
 
         // Ver `EpochCache`: marca, grava, publica.
@@ -445,4 +514,71 @@ impl IndexBatch<'_> {
         stats.total_secs = started.elapsed().as_secs_f64();
         Ok(stats)
     }
+}
+
+/// Um `put` do remendo já unido com o que estava no banco. A leitura seguinte
+/// não percorre os pedaços de cada edição: é um valor só.
+fn flush_overlays(db: &rocksdb::DB, wb: &mut WriteBatch, batches: &FxHashMap<u64, OverlayBatch>, book: &Overlays) -> Result<()> {
+    let mut ids: Vec<u64> = batches.keys().copied().collect();
+    ids.sort_unstable();
+    let cf = db
+        .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+        .ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
+    let pov: Vec<Key> = ids.iter().map(|&id| Key::new(POV, id)).collect();
+    let psv: Vec<Key> = ids.iter().map(|&id| Key::new(PSV, id)).collect();
+    // A lista base só entra no df na primeira edição do termo. Nas seguintes
+    // o tamanho já está em memória: relê-la aqui regravaria a lista inteira
+    // a cada commit de um termo frequente.
+    let fresh: Vec<usize> = ids.iter().enumerate().filter(|&(_, id)| !book.is_active(*id)).map(|(i, _)| i).collect();
+    let post: Vec<Key> = fresh.iter().map(|&i| Key::new(POST, ids[i])).collect();
+    let old_post = db.batched_multi_get_cf(cf, pov.iter().map(|k| k.as_ref()), false);
+    let old_pos = db.batched_multi_get_cf(cf, psv.iter().map(|k| k.as_ref()), false);
+    let bases = db.batched_multi_get_cf(cf, post.iter().map(|k| k.as_ref()), false);
+    let mut base_at = 0usize;
+    let mut touched = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let acc = &batches[&id];
+        let mut delta = 0i64;
+        for op in &acc.post {
+            delta += codec::peek_delta(op)?;
+        }
+        if !acc.post.is_empty() {
+            let old = old_post[i].as_ref().map_err(|e| Error::Db(e.clone()))?;
+            wb.put(Key::new(POV, id), collapse(old.as_deref(), &acc.post, ListKind::Postings)?);
+        }
+        if !acc.pos.is_empty() {
+            let old = old_pos[i].as_ref().map_err(|e| Error::Db(e.clone()))?;
+            wb.put(Key::new(PSV, id), collapse(old.as_deref(), &acc.pos, ListKind::Positions)?);
+        }
+        if acc.post.is_empty() && acc.pos.is_empty() {
+            if acc.appends > 0 {
+                book.bump(id, acc.appends, 0);
+            }
+            continue;
+        }
+        if book.is_active(id) {
+            book.bump(id, acc.appends, delta);
+        } else {
+            let base_len = match bases[base_at].as_ref().map_err(|e| Error::Db(e.clone()))? {
+                Some(v) => codec::list_len(v)?,
+                None => 0,
+            };
+            base_at += 1;
+            book.observe(id, base_len + acc.appends, delta);
+        }
+        touched.push(id);
+    }
+    if !touched.is_empty() {
+        wb.merge(META_OVERLAYS, codec::encode_node_set(&touched));
+    }
+    Ok(())
+}
+
+fn collapse(old: Option<&[u8]>, ops: &[Vec<u8>], kind: ListKind) -> Result<Vec<u8>> {
+    let mut inputs: Vec<&[u8]> = Vec::with_capacity(ops.len() + 1);
+    if let Some(old) = old {
+        inputs.push(old);
+    }
+    inputs.extend(ops.iter().map(Vec::as_slice));
+    codec::merge_overlays(inputs.into_iter(), kind).ok_or_else(|| Error::Corrupt("remendo inválido".into()))
 }

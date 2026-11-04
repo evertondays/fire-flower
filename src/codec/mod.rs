@@ -33,6 +33,7 @@
 mod list;
 mod merge;
 mod node_set;
+mod overlay;
 mod norms;
 mod positions;
 mod postings;
@@ -45,7 +46,10 @@ pub use self::list::{SKIP_BLOCK, list_len};
 pub use self::merge::{ListKind, encode_tombstones_into, merge_lists, merge_positions, merge_postings};
 pub use self::node_set::{decode_node_set, encode_node_set, merge_node_sets};
 pub use self::norms::{DocLens, NORM_BLOCK_DOCS, NormBlock};
-pub use self::positions::{PositionsCursor, decode_positions, encode_positions_into};
+pub use self::overlay::{
+    OverlayPost, apply_docs, apply_positions, apply_postings, decode_pos_edits, decode_post_edits, live_len, merge_overlays, peek_delta, wrap_delta,
+};
+pub use self::positions::{PosEdit, PositionsCursor, decode_positions, encode_positions_into};
 pub use self::postings::{
     PostingEntry, PostingsCursor, decode_docs, decode_postings, encode_postings, encode_postings_into,
 };

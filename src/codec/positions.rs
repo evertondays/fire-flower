@@ -56,6 +56,14 @@ pub fn decode_positions(bytes: &[u8]) -> Result<Vec<(DocId, Vec<u32>)>, Error> {
     Ok(out)
 }
 
+/// Uma entrada do remendo de `pos:`: posições novas, ou `None` para apagar
+/// as da base. Ordenada por documento.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PosEdit {
+    pub doc: DocId,
+    pub positions: Option<Vec<u32>>,
+}
+
 /// Percorre uma lista `pos:` sem decodificá-la inteira: salta pela tabela de
 /// saltos até o bloco do documento e, dentro do bloco, pula as posições dos
 /// documentos que não interessam byte a byte.
@@ -70,12 +78,20 @@ pub struct PositionsCursor<'a> {
     prev: DocId,
     /// Cabeçalho (doc, k) já lido, com as posições ainda por ler.
     head: Option<(DocId, u64)>,
+    /// Edições ainda não incorporadas na base. Vazio no caminho comum.
+    edits: &'a [PosEdit],
 }
 
 impl<'a> PositionsCursor<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::with_edits(bytes, &[])
+    }
+
+    /// Como [`PositionsCursor::new`], aplicando `edits` (ordenado por
+    /// documento) por cima da base, sem regravá-la.
+    pub fn with_edits(bytes: &'a [u8], edits: &'a [PosEdit]) -> Result<Self, Error> {
         let ListHeader { n, blocks, body, .. } = ListHeader::parse_clean(bytes, true)?;
-        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None })
+        Ok(Self { r: Reader { buf: bytes, pos: body }, body, n, blocks, block: 0, remaining: n, prev: 0, head: None, edits })
     }
 
     /// Se o bloco da próxima entrada termina antes de `target`, vai direto
@@ -144,6 +160,19 @@ impl<'a> PositionsCursor<'a> {
     /// Avança até `target` (que só pode crescer entre chamadas). Se o
     /// documento estiver na lista, escreve as posições dele em `out`.
     pub fn seek(&mut self, target: DocId, out: &mut Vec<u32>) -> Result<bool, Error> {
+        if !self.edits.is_empty()
+            && let Ok(i) = self.edits.binary_search_by_key(&target, |e| e.doc)
+        {
+            return match &self.edits[i].positions {
+                // Lápide: o documento saiu do termo. A base ainda tem as
+                // posições velhas; não são visíveis.
+                None => Ok(false),
+                Some(positions) => {
+                    out.clone_from(positions);
+                    Ok(true)
+                }
+            };
+        }
         self.jump(target);
         loop {
             let doc = match self.head {

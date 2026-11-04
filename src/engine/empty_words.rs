@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use rocksdb::WriteBatch;
 use rustc_hash::FxHashMap;
 
-use crate::{Engine, Error, Result, codec};
-use crate::engine::keys::{Key, META_MAYBE_EMPTY, NODE, POST};
+use crate::{Engine, Result};
+use crate::engine::keys::{Key, META_MAYBE_EMPTY, NODE};
 use crate::engine::view::View;
 
 /// A Trie não encolhe: uma palavra cujo último documento saiu continua com o
@@ -94,8 +94,13 @@ impl View<'_> {
         if !maybe.applies_to(self.epoch) || !maybe.is_suspect(node, self.epoch) {
             return Ok(false);
         }
-        match self.post_bytes(node)? {
-            Some(v) => Ok(codec::list_len(&v)? == 0),
+        // O df em memória evita reler a lista (no pior caso, regravá-la) só
+        // para saber se a palavra esvaziou.
+        if let Some(live) = self.engine.overlays.live(node, self.epoch) {
+            return Ok(live == 0);
+        }
+        match self.post_source(node)? {
+            Some(src) => Ok(src.len()? == 0),
             None => Ok(true),
         }
     }
@@ -117,21 +122,16 @@ impl Engine {
             batch.keep_cache();
             return Ok(0);
         }
-        let db = &self.db;
-        let cf = db
-            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
-            .ok_or_else(|| Error::Corrupt("família de colunas padrão ausente".into()))?;
         let mut empty = Vec::new();
-        for chunk in ids.chunks(1024) {
-            let keys: Vec<Key> = chunk.iter().map(|&id| Key::new(POST, id)).collect();
-            for (&id, value) in chunk.iter().zip(db.batched_multi_get_cf(cf, keys.iter().map(|k| k.as_ref()), false)) {
-                let is_empty = match value? {
-                    Some(v) => codec::list_len(&v)? == 0,
-                    None => true,
-                };
-                if is_empty {
-                    empty.push(id);
-                }
+        for &id in &ids {
+            // Com remendo, a lista base ainda tem o documento: o df é o da base
+            // mais o delta, não o cabeçalho cru.
+            let is_empty = match self.view().post_source(id)? {
+                Some(src) => src.len()? == 0,
+                None => true,
+            };
+            if is_empty {
+                empty.push(id);
             }
         }
         let mut wb = WriteBatch::default();
@@ -143,7 +143,7 @@ impl Engine {
         // Como no commit: marca os nós no cache das buscas, grava, publica.
         let next = self.epoch.load(AtomicOrdering::Acquire) + 1;
         self.nodes.mark(empty.iter().copied(), next);
-        db.write(wb)?;
+        self.db.write(wb)?;
         self.epoch.store(next, AtomicOrdering::Release);
         self.maybe_empty.resolve(&ids, next);
         batch.keep_cache();

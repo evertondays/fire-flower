@@ -27,13 +27,11 @@ impl Default for MaintenanceOptions {
 
 /// Thread que mantém as buscas rápidas depois de edições.
 ///
-/// Editar e remover são baratos no commit, mas cada lista que perdeu ou trocou
-/// documentos ganha um pedaço pendente, e até a compactação toda leitura une
-/// esses pedaços de novo: na fatia de 100k da Wikipédia, 1.000 edições de um
-/// documento deixam a busca de um termo frequente ~7× mais lenta, e a
-/// compactação (4 s) a devolve ao tempo de antes. Esta thread compacta quando
-/// as edições acumuladas passam do limite e depois limpa as palavras que
-/// ficaram sem documento ([`Engine::collect_empty_words`]).
+/// Editar grava um remendo pequeno (`pov:` / `psv:`) em vez de um pedaço no
+/// meio da lista. A busca aplica o remendo em cima da base; a lista grande não
+/// é regravada a cada leitura. Esta thread incorpora os remendos e compacta
+/// quando as edições acumuladas passam do limite, e depois limpa as palavras
+/// que ficaram sem documento ([`Engine::collect_empty_words`]).
 ///
 /// Para ao ser descartada (espera a compactação em andamento terminar).
 pub struct Maintenance {

@@ -26,8 +26,9 @@ use crate::engine::cache::EpochCache;
 use crate::engine::empty_words::MaybeEmpty;
 use crate::engine::keys::{
     DOC, Key, MERGE_OPERATOR, META_DOC_COUNT, META_INFLECTIONS, META_MAYBE_EMPTY, META_NEXT_DOC, META_NEXT_NODE,
-    META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, ROOT_ID,
+    META_OVERLAYS, META_STEMMING, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, POST, POV, ROOT_ID,
 };
+use crate::engine::overlays::Overlays;
 use crate::engine::meta::{
     Features, full_merge, partial_merge, previous_merge_operator, read_counter, resolve_format, resolve_languages,
     resolve_stemming, stored_format_error,
@@ -41,10 +42,12 @@ mod config;
 mod conjunction;
 mod diagnostics;
 mod empty_words;
-mod maintenance;
 mod groups;
 mod keys;
+mod maintenance;
+mod merge_trace;
 mod meta;
+mod overlays;
 mod phrase;
 mod prefix;
 mod ranking;
@@ -57,6 +60,7 @@ mod tests;
 
 pub use self::config::{Config, InflectionMode};
 pub use self::maintenance::{Maintenance, MaintenanceOptions};
+pub use self::merge_trace::{MergeTrace, set_merge_trace, take_merge_trace};
 pub use self::conjunction::intersect;
 pub use self::meta::FORMAT_VERSION;
 pub use self::view::reads_on_this_thread;
@@ -84,6 +88,8 @@ pub struct Engine {
     nodes: EpochCache<TrieNode>,
     /// Palavras que podem ter ficado sem documento.
     maybe_empty: MaybeEmpty,
+    /// Termos com remendo de edição ainda não incorporado na lista.
+    overlays: Overlays,
     /// Documentos substituídos ou removidos desde a última compactação.
     pending_edits: AtomicU64,
     /// Guardadas para ler as estatísticas depois do `open`.
@@ -165,6 +171,21 @@ impl Engine {
         if let Some(v) = db.get_pinned(META_MAYBE_EMPTY)? {
             maybe_empty.add(codec::decode_node_set(&v)?);
         }
+        let overlays = Overlays::default();
+        if let Some(v) = db.get_pinned(META_OVERLAYS)? {
+            for id in codec::decode_node_set(&v)? {
+                let base = db.get(Key::new(POST, id).as_ref())?;
+                let base_len = match &base {
+                    Some(b) => codec::list_len(b)?,
+                    None => 0,
+                };
+                let delta = match db.get(Key::new(POV, id).as_ref())? {
+                    Some(v) => codec::peek_delta(&v)?,
+                    None => 0,
+                };
+                overlays.observe(id, base_len, delta);
+            }
+        }
         let writer = Mutex::new(WriterState {
             next_node_id,
             next_doc_id,
@@ -185,6 +206,7 @@ impl Engine {
             norms: EpochCache::default(),
             nodes: EpochCache::default(),
             maybe_empty,
+            overlays,
             pending_edits: AtomicU64::new(0),
             opts,
         })
@@ -198,6 +220,7 @@ impl Engine {
         let mut state = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let cache = std::mem::take(&mut state.cache);
         let analyzer = std::mem::take(&mut state.analyzer);
+        let doc_floor = state.next_doc_id;
         IndexBatch {
             engine: self,
             next_node_id: state.next_node_id,
@@ -213,6 +236,7 @@ impl Engine {
             repeated: false,
             labels: Vec::new(),
             analyzer,
+            doc_floor,
         }
     }
 
@@ -301,6 +325,12 @@ impl Engine {
     /// Compacta o banco inteiro: une os pedaços pendentes das listas de
     /// postagem e descarta versões antigas. Num índice grande leva minutos.
     pub fn compact(&self) {
+        // Incorpora os remendos antes: a compactação do RocksDB não enxerga
+        // `pov:` junto com `post:`. A trava impede um commit no meio.
+        {
+            let _guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.fold_overlays();
+        }
         // As edições que chegarem durante a compactação podem ficar fora dela.
         let before = self.pending_edits.load(AtomicOrdering::Acquire);
         self.db.compact_range::<&[u8], &[u8]>(None, None);

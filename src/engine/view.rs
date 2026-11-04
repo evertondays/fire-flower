@@ -8,7 +8,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{DocId, Engine, Error, IndexStats, Posting, Result, codec};
 use crate::codec::{DocLens, NORM_BLOCK_DOCS, NormBlock, TrieNode};
-use crate::engine::keys::{Key, META_DOC_COUNT, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POST, ROOT_ID};
+use crate::codec::{OverlayPost, PosEdit};
+use crate::engine::keys::{Key, META_DOC_COUNT, META_TOTAL_LEN, META_TOTAL_TITLE_LEN, NODE, NORM, POS, POST, POV, PSV, ROOT_ID};
 
 type Snapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DB>;
 
@@ -20,10 +21,123 @@ pub(super) struct View<'a> {
     pub(super) engine: &'a Engine,
 }
 
+/// Lista `post:` como a busca vê: a base (presa ao snapshot) e, se o termo
+/// foi editado, o remendo já decodificado.
+pub(super) struct PostSource<'a> {
+    base: Option<rocksdb::DBPinnableSlice<'a>>,
+    pub(super) edits: Vec<OverlayPost>,
+    df_delta: i64,
+}
+
+impl PostSource<'_> {
+    /// df com o remendo aplicado, sem percorrer as entradas.
+    pub(super) fn len(&self) -> Result<usize> {
+        Ok(codec::live_len(self.base.as_deref(), self.df_delta)? as usize)
+    }
+
+    pub(super) fn docs(&self) -> Result<Vec<DocId>> {
+        codec::apply_docs(self.base.as_deref(), &self.edits)
+    }
+
+    pub(super) fn postings(&self) -> Result<Vec<Posting>> {
+        codec::apply_postings(self.base.as_deref(), &self.edits)
+    }
+
+    /// Bytes da base. Só no caminho sem remendo (aí a base existe).
+    pub(super) fn base(&self) -> &[u8] {
+        self.base.as_deref().unwrap_or(&[])
+    }
+}
+
+/// Lista `pos:` e o remendo de posições.
+pub(super) struct PosSource<'a> {
+    base: Option<rocksdb::DBPinnableSlice<'a>>,
+    pub(super) edits: Vec<PosEdit>,
+}
+
+impl PosSource<'_> {
+    /// Bytes da base, ou uma lista vazia se as posições estão só no remendo.
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.base.as_deref().unwrap_or(&[0, 0])
+    }
+}
+
 impl View<'_> {
-    /// Bytes da lista `post:` de um nó, presos ao snapshot (sem cópia).
-    pub(super) fn post_bytes(&self, node: u64) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
-        self.snap.get_bytes(Key::new(POST, node).as_ref())
+    /// Lista `post:` do nó, com o remendo se este snapshot precisa dele.
+    pub(super) fn post_source(&self, node: u64) -> Result<Option<PostSource<'_>>> {
+        let base = self.snap.get_bytes(Key::new(POST, node).as_ref())?;
+        if !self.engine.overlays.applies(node, self.epoch) {
+            return Ok(base.map(|base| PostSource { base: Some(base), edits: Vec::new(), df_delta: 0 }));
+        }
+        let (df_delta, edits) = match self.snap.get_bytes(Key::new(POV, node).as_ref())? {
+            Some(v) => codec::decode_post_edits(&v)?,
+            None => (0, Vec::new()),
+        };
+        if base.is_none() && edits.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PostSource { base, edits, df_delta }))
+    }
+
+    /// Várias listas `post:`, na ordem de `ids`.
+    pub(super) fn post_sources(&self, ids: impl Iterator<Item = u64>) -> Result<Vec<Option<PostSource<'_>>>> {
+        let ids: Vec<u64> = ids.collect();
+        let bases = self.get_many(POST, ids.iter().copied())?;
+        let mut edits_of: FxHashMap<u64, (i64, Vec<OverlayPost>)> = FxHashMap::default();
+        let need: Vec<u64> = ids.iter().copied().filter(|&id| self.engine.overlays.applies(id, self.epoch)).collect();
+        if !need.is_empty() {
+            for (&id, value) in need.iter().zip(self.get_many(POV, need.iter().copied())?) {
+                if let Some(v) = value {
+                    edits_of.insert(id, codec::decode_post_edits(&v)?);
+                }
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .zip(bases)
+            .map(|(id, base)| {
+                let (df_delta, edits) = edits_of.remove(&id).unwrap_or((0, Vec::new()));
+                if base.is_none() && edits.is_empty() {
+                    None
+                } else {
+                    Some(PostSource { base, edits, df_delta })
+                }
+            })
+            .collect())
+    }
+
+    /// Lista `pos:` do nó. Erro se o termo não tem posições neste snapshot.
+    pub(super) fn pos_source(&self, node: u64) -> Result<PosSource<'_>> {
+        let base = self.snap.get_bytes(Key::new(POS, node).as_ref())?;
+        let edits = if self.engine.overlays.applies(node, self.epoch) {
+            match self.snap.get_bytes(Key::new(PSV, node).as_ref())? {
+                Some(v) => codec::decode_pos_edits(&v)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        if base.is_none() && edits.iter().all(|e| e.positions.is_none()) {
+            return Err(Error::Corrupt(format!("termo do nó {node} sem posições")));
+        }
+        Ok(PosSource { base, edits })
+    }
+
+    /// Posições do termo, com o remendo. Vazio se não há lista.
+    pub(super) fn positions_applied(&self, node: u64) -> Result<Vec<(DocId, Vec<u32>)>> {
+        let base = self.snap.get_bytes(Key::new(POS, node).as_ref())?;
+        let edits = if self.engine.overlays.applies(node, self.epoch) {
+            match self.snap.get_bytes(Key::new(PSV, node).as_ref())? {
+                Some(v) => codec::decode_pos_edits(&v)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        if base.is_none() && edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        codec::apply_positions(base.as_deref(), &edits)
     }
 
     pub(super) fn stats(&self) -> Result<IndexStats> {
@@ -95,15 +209,15 @@ impl View<'_> {
     }
 
     pub(super) fn load_docs(&self, node_id: u64) -> Result<Vec<DocId>> {
-        match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
-            Some(v) => codec::decode_docs(&v),
+        match self.post_source(node_id)? {
+            Some(src) => src.docs(),
             None => Ok(Vec::new()),
         }
     }
 
     pub(super) fn load_postings(&self, node_id: u64) -> Result<Vec<Posting>> {
-        match self.snap.get_bytes(Key::new(POST, node_id).as_ref())? {
-            Some(v) => codec::decode_postings(&v),
+        match self.post_source(node_id)? {
+            Some(src) => src.postings(),
             None => Ok(Vec::new()),
         }
     }

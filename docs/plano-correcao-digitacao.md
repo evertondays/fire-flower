@@ -298,6 +298,23 @@ de outra palavra mais frequente.
 - Metade do `t-miss` (palavra que existe + uma letra no fim) passa a achar
   resultados; o "não achou nada" é medido pelo `t-miss-far`.
 
+### A/B contra a `main` (correção desligada, o padrão)
+
+`perf.py all --scale full` na `main` (`d33a37e`) e logo depois na branch
+(`a2e65e0`), na mesma máquina, cada uma com a sua pasta de bancos:
+
+- **Latência:** os 31 conjuntos de antes ficam entre −12% e +5% no p50
+  (`t-len-3`: +0,4 µs sobre 7 µs, com o p99 menor); nenhum passa do ruído.
+  `t-mid` 17 → 17 µs, `t-freq` 336 → 332 µs, `rank-freq` 1.039 → 969 µs,
+  `phrase-2` 521 → 520 µs, `p-2` 3.154 → 3.156 µs.
+- **Carga da Wikipédia inteira:** 119,1 e 120,4 s → 121,4 e 122,6 s (+2%).
+  A indexação não mudou nesta branch; fica dentro dos ±5% de binários
+  diferentes (seção 11 das diretrizes).
+- **Banco compactado e compactação:** iguais (1.503,5 MB; 5,4 s).
+- **Concorrência** (`mixed`, 1/4/8 threads, com e sem escrita): iguais.
+- **Corretude** (oráculos de 10k e 100k, idempotência, lotes, reabrir) e
+  **relevância**: iguais.
+
 ### Desvios do plano
 
 - **2 erros e o dicionário em memória (B) ficaram fora** (Fase 0).

@@ -15,8 +15,9 @@ use crate::corpus::{Corpus, Doc, stem};
 use crate::edits::{EditPlanArgs, final_docs};
 use crate::env::save_result;
 use crate::rng::Rng;
+use crate::typos::typo;
 use self::check::Check;
-use self::index::{OPos, OTerm, Oracle, doc_tokens, trie_order};
+use self::index::{OPos, OTerm, Oracle, TypoParams, doc_tokens, trie_order};
 
 mod check;
 mod index;
@@ -98,6 +99,13 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
         inflector: engine.inflector().is_on().then(|| engine.inflector().clone()),
         alpha: engine.config().inflection_weight,
         mode: engine.config().inflection_mode,
+        typos: (engine.config().typos != fire_flower::TypoMode::Off).then(|| TypoParams {
+            weight: engine.config().typo_weight,
+            min_len: engine.config().typo_min_len,
+            min_df: engine.config().typo_min_df,
+            max_terms: engine.config().max_typo_terms,
+        }),
+        by_first: HashMap::default(),
     };
     let mut sampled_docs: Vec<Vec<String>> = Vec::new();
     let mut phrase_docs: Vec<Vec<String>> = Vec::new();
@@ -183,6 +191,14 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
         }
         o.by_root = by_root;
     }
+    if o.typos.is_some() {
+        for word in o.terms.keys() {
+            let chars: Vec<char> = word.chars().collect();
+            o.by_first.entry(chars[0]).or_default().push(chars);
+        }
+    }
+    // Flexões ou correção: a resposta sai da busca do oráculo, não da interseção direta.
+    let resolves = o.inflector.is_some() || o.typos.is_some();
     let mut vocab: Vec<&str> = o.terms.keys().map(String::as_str).collect();
     vocab.sort_unstable();
     eprintln!("oráculo pronto: {docs} docs, {} termos ({:.0}s)", vocab.len(), started.elapsed().as_secs_f64());
@@ -395,7 +411,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
             (0..k).map(|_| rng.pick(&frequent).to_string()).collect()
         };
         let query = terms.iter().map(|t| word(t)).collect::<Vec<_>>().join(" ");
-        let expected = if o.inflector.is_some() {
+        let expected = if resolves {
             o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default()
         } else {
             let mut expected = o.terms[&terms[0]].docs.clone();
@@ -500,7 +516,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
         }
         let expected: Vec<DocId> = match kept.len() {
             0 => Vec::new(),
-            1 if o.inflector.is_some() => o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default(),
+            1 if resolves => o.resolve(&vocab, &parse(&query)).map(|(_, docs)| docs).unwrap_or_default(),
             1 => o.terms.get(&kept[0].1).map(|t| t.docs.clone()).unwrap_or_default(),
             _ => {
                 let parts: Option<Vec<(u32, &OTerm, &OPos)>> =
@@ -538,6 +554,47 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
     ranking.notes.push("termo frequente, termo qualquer, E, termo + prefixo, frase e título; BM25F; notas com diferença relativa < 1e-4".into());
     checks.push(ranking);
 
+    // 14. Correção de digitação: uma palavra de um artigo com um erro gerado,
+    //     sozinha ou com outra do mesmo artigo, e palavras raras (df < mínimo)
+    //     que existem. Documentos, top 10 e as trocas.
+    if let Some(p) = &o.typos {
+        let mut typos = Check::new("correção de digitação");
+        let (mut corrected, mut cases) = (0usize, 0usize);
+        let weak: Vec<&str> = vocab.iter().copied().filter(|t| o.terms[*t].docs.len() < p.min_df && t.chars().count() >= p.min_len).collect();
+        for i in 0..if stemmer.is_on() { 0 } else { args.rank_queries } {
+            let doc = rng.pick(&sampled_docs);
+            let words: Vec<&String> = doc.iter().filter(|t| t.chars().count() >= p.min_len).collect();
+            let query = match i % 3 {
+                2 if !weak.is_empty() => rng.pick(&weak).to_string(),
+                _ if !words.is_empty() => {
+                    let right = rng.pick(&words).to_string();
+                    let Some(wrong) = typo(&right, &mut rng) else { continue };
+                    if i % 3 == 1 { format!("{wrong} {}", rng.pick(doc)) } else { wrong }
+                }
+                _ => continue,
+            };
+            let clauses = parse(&query);
+            let Some((_, expected)) = o.resolve(&vocab, &clauses) else { continue };
+            cases += 1;
+            typos.compare(&query, &engine.search(&query)?, &expected);
+            let got = engine.search_ranked(&query, 10)?;
+            let fixes = o.corrections(&vocab, &clauses).unwrap_or_default();
+            corrected += usize::from(!fixes.is_empty());
+            typos.compare(&format!("{query} (trocas)"), &got.corrections, &fixes);
+            if let Some((want, total)) = o.rank(&vocab, &clauses, 10) {
+                typos.verdict(&format!("{query} (top 10)"), got.total == total && same_ranking(&got.hits, &want), || {
+                    let g: Vec<(DocId, f64)> = got.hits.iter().map(|h| (h.doc, h.score)).collect();
+                    (format!("total {} {g:?}", got.total), format!("total {total} {want:?}"))
+                });
+            }
+        }
+        typos.notes.push(format!(
+            "{cases} consultas ({corrected} com correção): documentos, trocas e top 10 de cada{}",
+            if stemmer.is_on() { "; pulado com stemming" } else { "" }
+        ));
+        checks.push(typos);
+    }
+
     // Relatório.
     let total: usize = checks.iter().map(|c| c.divergences).sum();
     println!("\n{:<24} {:>8} {:>12}", "verificação", "cases", "divergências");
@@ -568,6 +625,7 @@ pub(crate) fn oracle(args: OracleArgs) -> AnyResult {
                 "docs": docs, "oracle_terms": vocab.len(), "divergences": total, "positions": has_positions,
                 "stemming": stemmer.stemming().code(),
                 "inflections": engine.inflector().stemming().code(),
+                "typos": o.typos.is_some(),
                 "checks": checks.iter().map(Check::json).collect::<Vec<_>>(), "relevance": relevance }),
     )?;
     if total > 0 {

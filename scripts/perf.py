@@ -15,6 +15,7 @@
                                               #   [--reproduce: roda antes o cenário que colapsava]
     python3 scripts/perf.py stemming          # stemming ligado vs. desligado (A/B no mesmo binário)
     python3 scripts/perf.py edits             # edição e remoção (docs/analise-edicao.md, plano A); até 100k
+    python3 scripts/perf.py typos             # correção de digitação: oráculo, relevância e latência com e sem
     python3 scripts/perf.py report         # escreve RESULTADOS.md no repositório de resultados
     python3 scripts/perf.py compare A.json B.json
 
@@ -408,7 +409,7 @@ def bench(path, scale, sets, label, threads=1, extra=()):
     files = [os.path.join(qdir, f"{s}.txt") for s in sets] if sets else [qdir]
     # Conjuntos novos (frases, ranking) aparecem quando o `wiki queries` muda.
     if not os.path.isdir(qdir) or not all(os.path.exists(f) for f in files) \
-            or not all(os.path.exists(os.path.join(qdir, f)) for f in ("rank-freq.txt", "t-inflection.txt")):
+            or not all(os.path.exists(os.path.join(qdir, f)) for f in ("rank-freq.txt", "t-inflection.txt", "t-typo.txt")):
         phase_queries(scale)
     wiki("bench", "--db", path, "--queries", *files, "--threads", threads, "--label", label, *extra)
 
@@ -941,6 +942,69 @@ def phase_bindings(scale):
     return True
 
 
+# Conjuntos da correção de digitação, medidos com e sem `--typos`: as palavras
+# com erro (busca e top 10), a que não tem correção possível, os inexistentes
+# de antes e dois de controle (palavras que existem: a correção não roda).
+TYPO_SETS = ["t-typo", "rank-typo", "t-miss-far", "t-miss", "t-mid", "titles"]
+
+
+def phase_typos(scale):
+    """Correção de digitação (docs/plano-correcao-digitacao.md), no mesmo
+    binário: oráculo com a correção, relevância com e sem, e a latência dos
+    conjuntos com erro com e sem."""
+    small = smaller(scale, "10k")
+    step(f"oráculo {small} com a correção")
+    ok = wiki("oracle", "--db", ensure_loaded(small), "--corpus", corpus(small), "--typos",
+              "--label", f"{small}-typos", check=False) == 0
+    rel = smaller(scale, "100k")
+    sets = os.path.join(PROJECT, "bench", "relevance", rel)
+    for on in (False, True):
+        step(f"relevância {rel} {'com' if on else 'sem'} a correção")
+        wiki("relevance", "--db", ensure_loaded(rel), "--corpus", corpus(rel), "--sets", sets, "--brief",
+             *(["--typos"] if on else []), "--label", f"{rel}-typos-{'on' if on else 'off'}")
+    path = ensure_loaded(scale)
+    for on in (False, True):
+        step(f"latência {scale} {'com' if on else 'sem'} a correção")
+        bench(path, scale, TYPO_SETS, f"typos-{scale}-{'on' if on else 'off'}", extra=["--typos"] if on else [])
+    return ok
+
+
+def typos_section(R, scale):
+    rel = smaller(scale, "100k")
+    rels = {on: latest(R, "relevance", f"{rel}-typos-{on}") for on in ("off", "on")}
+    benches = {on: latest(R, "bench", f"typos-{scale}-{on}") for on in ("off", "on")}
+    oracle = latest(R, "oracle", f"{smaller(scale, '10k')}-typos")
+    if not (rels["on"] or benches["on"]):
+        return []
+    L = [f"## Correção de digitação ({scale}; relevância em {rel})", "",
+         f"Palavras que não estão no índice somam as palavras a um erro delas "
+         f"([docs/plano-correcao-digitacao.md]({DOCS_URL}/plano-correcao-digitacao.md)). Mesmo binário, "
+         "com e sem `--typos`.", ""]
+    if oracle:
+        L += [f"Oráculo ({fmt(oracle['docs'])} docs, com a correção): "
+              f"{'zero divergências' if oracle['divergences'] == 0 else str(oracle['divergences']) + ' divergências'}.", ""]
+    if rels["off"] and rels["on"]:
+        off = {c["set"]: c for c in rels["off"]["sets"]}
+        L += ["| Conjunto | Consultas | top-1 sem | top-1 com | top-10 sem | top-10 com |", "|---|---|---|---|---|---|"]
+        for c in rels["on"]["sets"]:
+            o = off.get(c["set"])
+            if not o:
+                continue
+            L.append(f"| `{c['set']}` | {c['queries']} | {fmt(o['top1'] * 100, 1)}% | {fmt(c['top1'] * 100, 1)}% | "
+                     f"{fmt(o['top10'] * 100, 1)}% | {fmt(c['top10'] * 100, 1)}% |")
+        L.append("")
+    if benches["off"] and benches["on"]:
+        off = {x["set"]: x for x in benches["off"]["sets"]}
+        L += ["| Conjunto | p50 sem | p50 com | p99 sem | p99 com | resultados com (média) | Gets/consulta com |",
+              "|---|---|---|---|---|---|---|"]
+        for x in benches["on"]["sets"]:
+            o = off.get(x["set"], {})
+            L.append(f"| `{x['set']}` | {us(o.get('p50_us'))} | {us(x['p50_us'])} | {us(o.get('p99_us'))} | "
+                     f"{us(x['p99_us'])} | {fmt(x['mean_results'], 1)} | {fmt(x['gets_per_query'], 1)} |")
+        L += ["", f"<sub>{benches['on']['_file']}</sub>", ""]
+    return L
+
+
 def phase_relevance(scale):
     """Plano de relevância: top-1/top-3/top-10/MRR em conjuntos com resposta
     conhecida, gerados da fatia (até 100k) e versionados em bench/relevance/."""
@@ -1354,6 +1418,7 @@ def cmd_report(scale):
     L += relevance_section(R, scale)
     L += stemming_section(R, scale)
     L += edits_section(R, scale)
+    L += typos_section(R, scale)
     L += bindings_section(R, scale)
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
@@ -1470,6 +1535,7 @@ def main():
                         ("stemming", "stemming ligado vs. desligado (A/B no mesmo binário)"),
                         ("edits", "edição e remoção: oráculo, vazão, latência antes e depois de compactar"),
                         ("bindings", "binding Node contra o nativo (latência, leitores, carga)"),
+                        ("typos", "correção de digitação: oráculo, relevância e latência com e sem"),
                         ("report", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
@@ -1513,7 +1579,7 @@ def main():
         result = {"correctness": phase_correctness, "queries": phase_queries, "latency": phase_latency,
                   "concurrency": phase_concurrency, "phrases": phase_phrases,
                   "relevance": phase_relevance, "stemming": phase_stemming, "edits": phase_edits,
-                  "bindings": phase_bindings}[args.cmd](scale)
+                  "bindings": phase_bindings, "typos": phase_typos}[args.cmd](scale)
         ok = result is not False
     cmd_report(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

@@ -118,6 +118,14 @@ pub(crate) fn config_json(config: &Config) -> Value {
             fire_flower::InflectionMode::Always => json!("always"),
             fire_flower::InflectionMode::IfFewer(n) => json!(n),
         },
+        "typos": match config.typos {
+            fire_flower::TypoMode::Off => "off",
+            fire_flower::TypoMode::Missing => "missing",
+        },
+        "typo_weight": config.typo_weight,
+        "typo_min_len": config.typo_min_len,
+        "typo_min_df": config.typo_min_df,
+        "max_typo_terms": config.max_typo_terms,
     })
 }
 

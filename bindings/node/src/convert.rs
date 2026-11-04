@@ -3,7 +3,7 @@
 
 use std::ptr;
 
-use fire_flower::{Config, DocId, Hit, Language, Stemming};
+use fire_flower::{Config, DocId, Hit, Language, Stemming, TypoMode};
 use napi::bindgen_prelude::*;
 use napi::{check_status, sys};
 use napi_derive::napi;
@@ -25,6 +25,8 @@ pub struct OpenOptions {
     pub refresh_ms: Option<u32>,
     pub create_if_missing: Option<bool>,
     pub metrics: Option<bool>,
+    /// Corrige erros de digitação nas palavras que não estão no índice.
+    pub typos: Option<bool>,
 }
 
 /// Um documento de `Engine.index`. O texto pode vir num `Buffer` (UTF-8):
@@ -73,6 +75,9 @@ pub(crate) fn config(o: OpenOptions) -> Result<(Config, Mode)> {
         config.create_if_missing = create;
     }
     config.metrics = o.metrics.unwrap_or(false);
+    if o.typos.unwrap_or(false) {
+        config.typos = TypoMode::Missing;
+    }
     Ok((config, mode))
 }
 

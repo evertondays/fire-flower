@@ -111,6 +111,10 @@ impl App {
                 if self.clauses.is_empty() {
                     spans.push(Span::styled("(só stopwords)", Style::new().fg(MUTED).italic()));
                 }
+                if !self.corrections.is_empty() {
+                    spans.push(Span::styled("  corrigido: ", Style::new().fg(MUTED)));
+                    spans.push(Span::styled(crate::describe_corrections(&self.corrections), Style::new().fg(ACCENT)));
+                }
                 Line::from(spans)
             }
         };

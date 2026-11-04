@@ -22,6 +22,12 @@ export interface OpenOptions {
   createIfMissing?: boolean;
   /** Liga as métricas do motor (ver `engine.metrics()`). */
   metrics?: boolean;
+  /**
+   * Corrige erros de digitação: uma palavra que não está no índice soma as
+   * palavras a um erro dela (uma letra trocada, faltando, sobrando ou
+   * invertida; a primeira letra fica). Padrão: não.
+   */
+  typos?: boolean;
 }
 
 export interface Doc {

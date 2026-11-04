@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use fire_flower::analysis::{self, stopwords};
-use fire_flower::{Config, Engine, Language, Stemming};
+use fire_flower::{Config, Correction, Engine, Language, Stemming, TypoMode};
 
 /// Motor de busca full-text embutido: Trie persistida no RocksDB.
 #[derive(Parser)]
@@ -30,6 +30,9 @@ enum Command {
     Tui {
         /// Pasta do banco
         db: PathBuf,
+        /// Corrige erros de digitação nas palavras que não estão no índice
+        #[arg(long)]
+        typos: bool,
     },
     /// Indexa arquivos de texto/HTML (pastas recursivamente)
     Index {
@@ -111,6 +114,10 @@ enum Command {
         /// Ordena por ID do documento, sem ranking
         #[arg(long)]
         by_id: bool,
+        /// Corrige erros de digitação nas palavras que não estão no índice
+        /// (uma letra trocada, faltando, sobrando ou invertida)
+        #[arg(long)]
+        typos: bool,
     },
     /// Autocompletar: palavras indexadas que começam com o prefixo
     Suggest {
@@ -220,9 +227,9 @@ type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Tui { db } => open_reader(&db).and_then(|engine| {
+        Command::Tui { db, typos } => open_reader(&db, typos).and_then(|engine| {
             let path = db.clone();
-            let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, Config::reader()));
+            let reopen: tui::Reopen = Box::new(move || Engine::open_read_only(&path, reader_config(typos)));
             tui::run(engine, &db.display().to_string(), reopen).map_err(Into::into)
         }),
         Command::Index { db, paths, sync, languages, positions, stemming, metrics } => {
@@ -265,7 +272,7 @@ fn main() -> ExitCode {
             }
             Ok(())
         }),
-        Command::Search { db, query, limit, by_id } => search(&db, &query.join(" "), limit, by_id),
+        Command::Search { db, query, limit, by_id, typos } => search(&db, &query.join(" "), limit, by_id, typos),
         Command::Suggest { db, prefix, limit } => suggest(&db, &prefix, limit),
         Command::Monitor { db, serve, json, metrics_file } => {
             monitor::run(monitor::Options { db, metrics_file, serve, json })
@@ -282,8 +289,18 @@ fn main() -> ExitCode {
 
 /// Abre um banco que já existe só para leitura, ao lado de quem o grava: a
 /// TUI, `search` e `suggest` não travam o banco nem disputam memória com ele.
-fn open_reader(db: &Path) -> Result<Engine, Box<dyn std::error::Error>> {
-    Ok(Engine::open_read_only(db, Config::reader())?)
+fn open_reader(db: &Path, typos: bool) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(Engine::open_read_only(db, reader_config(typos))?)
+}
+
+/// A `Config` de quem só lê, com ou sem a correção de digitação.
+fn reader_config(typos: bool) -> Config {
+    Config { typos: if typos { TypoMode::Missing } else { TypoMode::Off }, ..Config::reader() }
+}
+
+/// `fracesa → francesa, francesas; pernanbuco → pernambuco`.
+pub(crate) fn describe_corrections(corrections: &[Correction]) -> String {
+    corrections.iter().map(|c| format!("{} → {}", c.from, c.to.join(", "))).collect::<Vec<_>>().join("; ")
 }
 
 /// Abre um banco que já existe para gravar (`delete`, `compact`): um caminho
@@ -416,17 +433,19 @@ fn index(db: &Path, paths: &[PathBuf], sync: bool, creation: Creation, metrics: 
     Ok(())
 }
 
-fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
-    let engine = open_reader(db)?;
+fn search(db: &Path, query: &str, limit: usize, by_id: bool, typos: bool) -> AnyResult {
+    let engine = open_reader(db, typos)?;
     let started = Instant::now();
     // Por ID: todos os documentos em ordem. Ranqueado: só os `limit` melhores.
-    let (hits, total) = if by_id {
+    let (hits, total, corrections) = if by_id {
         let docs = engine.search(query)?;
         let total = docs.len();
-        (docs.into_iter().take(limit).map(|doc| (doc, None)).collect::<Vec<_>>(), total)
+        // As trocas só saem da busca ranqueada (sem resultados, só o total).
+        let corrections = if typos { engine.search_ranked(query, 0)?.corrections } else { Vec::new() };
+        (docs.into_iter().take(limit).map(|doc| (doc, None)).collect::<Vec<_>>(), total, corrections)
     } else {
         let top = engine.search_ranked(query, limit)?;
-        (top.hits.into_iter().map(|h| (h.doc, Some(h.score))).collect(), top.total)
+        (top.hits.into_iter().map(|h| (h.doc, Some(h.score))).collect(), top.total, top.corrections)
     };
     let elapsed = started.elapsed();
 
@@ -448,11 +467,14 @@ fn search(db: &Path, query: &str, limit: usize, by_id: bool) -> AnyResult {
         println!("... e mais {}", total - hits.len());
     }
     println!("{total} resultado(s) em {elapsed:.2?}");
+    if !corrections.is_empty() {
+        println!("corrigido: {}", describe_corrections(&corrections));
+    }
     Ok(())
 }
 
 fn suggest(db: &Path, prefix: &str, limit: usize) -> AnyResult {
-    let engine = open_reader(db)?;
+    let engine = open_reader(db, false)?;
     for word in engine.suggest(prefix, limit)? {
         println!("{word}");
     }

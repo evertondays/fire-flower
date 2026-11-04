@@ -243,8 +243,65 @@ as metas com folga na latência.
 ## 11. Checklist
 
 - [x] Fase 0: sonda na Wikipédia inteira (`examples/typo_probe.rs`); df do vocabulário; T4 decidida (FST não medido: com 1 erro a Trie basta)
-- [ ] Fase 1: `rel-typo`, `rel-typo-manual`, `rel-typo-typing`, `t-typo`, `t-miss-far`, `s-typo`; oráculo com correção
-- [ ] Fase 2: autômato, percurso, grupos na busca e no ranking, métricas; oráculo e A/B
-- [ ] Fase 3: CLI, TUI, bindings, README e como-funciona
+- [x] Fase 1 (parte): `rel-typo` (100k e 10k), `t-typo`, `rank-typo`, `t-miss-far`; oráculo com correção
+- [ ] Fase 1 (resto): `rel-typo-manual` (erros reais à mão), `rel-typo-typing` e `s-typo` (com a Fase 4)
+- [x] Fase 2: percurso, grupos na busca e no ranking; oráculo e A/B (as métricas ficaram para depois)
+- [x] Fase 3: CLI, TUI, binding Node (só a opção: as trocas ainda não chegam ao JS), README e como-funciona
 - [ ] Fase 4: prefixo e autocompletar com erro (ou registrado como fora)
-- [ ] Fase 5: grade e decisão do padrão
+- [ ] Fase 5: grade (γ, `typo_min_len`, `typo_min_df`, `IfFewer`) e decisão do padrão
+
+---
+
+## 12. Como ficou (04/11/2026)
+
+Branch `typo-correction`. O que entrou: `TypoMode::Missing` com 1 erro, a
+primeira letra fixa e o percurso na Trie (A); as correções entram como o
+grupo das flexões, com peso γ = 0,5; `TopHits::corrections`; `--typos` na
+CLI, no TUI e no harness; `typos: true` no binding Node. O padrão continua
+`Off` até a Fase 5. Formato do banco sem mudança.
+
+### Corretude
+
+- Oráculo de 10k (`wiki oracle --typos`): zero divergências, inclusive nas
+  1.000 consultas com erro gerado ou palavra rara (710 corrigidas:
+  documentos, trocas e top 10). Sem `--typos`, também zero.
+- Teste do percurso contra a distância calculada por força bruta, num
+  vocabulário denso de 3 letras (`typo_walk_finds_exactly_the_words_one_edit_away`).
+
+### Relevância (100k)
+
+| Conjunto | Sem correção | Com correção |
+|---|---|---|
+| `rel-typo` top-1 / top-10 (882 consultas) | 0,1% / 0,2% | **95,1% / 97,4%** |
+| `rel-title`, `rel-typing`, `rel-hub`, `rel-body`, `rel-manual`, `rel-plural` | — | iguais (o modo só mexe em palavras ausentes ou com df 1) |
+
+Os 2,6% que ficam de fora do top-10 são, em geral, erros que caem a um erro
+de outra palavra mais frequente.
+
+### Latência (Wikipédia inteira, cache quente, 1 thread)
+
+| Conjunto | p50 sem | p50 com | p99 sem | p99 com | Gets/consulta com |
+|---|---|---|---|---|---|
+| `t-typo` | 4 µs (0 resultados) | 358 µs | 18 µs | 828 µs | 101 |
+| `rank-typo` | 9 µs (0 resultados) | 439 µs | 23 µs | 1,4 ms | 104 |
+| `t-miss-far` | 0 µs | 73 µs | 4 µs | 277 µs | 6,7 |
+| `t-miss` | 1 µs | 185 µs | 22 µs | 792 µs | 68 |
+| `t-mid` (palavras que existem) | 15 µs | 16 µs | 44 µs | 46 µs | 4,7 |
+| `titles` | 43 µs | 52 µs | 1,5 ms | 1,5 ms | 14,2 |
+
+- As metas de `t-typo` (≤ 1 ms / ≤ 3 ms) e `t-miss-far` (≤ 100 µs) fecham.
+- **`titles` fica ~20% mais lento no p50 com a correção ligada**, e acha 404
+  documentos em média em vez de 374: os títulos têm palavras com df 1 (nomes
+  próprios), que pelo T6 contam como fracas e somam as correções. O artigo
+  continua em 1º (`rel-title` igual). Se isso pesar, a Fase 5 pode medir
+  `typo_min_df = 1` (só palavras ausentes).
+- Metade do `t-miss` (palavra que existe + uma letra no fim) passa a achar
+  resultados; o "não achou nada" é medido pelo `t-miss-far`.
+
+### Desvios do plano
+
+- **2 erros e o dicionário em memória (B) ficaram fora** (Fase 0).
+- **`IfFewer` não foi implementado:** só `Off` e `Missing`.
+- **Métricas** (termos corrigidos, nós visitados) ficaram para depois.
+- **O binding Node só liga a correção:** devolver as trocas exige mudar o
+  buffer de resultados, que hoje é só números.

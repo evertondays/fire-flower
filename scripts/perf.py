@@ -886,6 +886,61 @@ def edits_section(R, scale):
     return L
 
 
+# ---------------------------------------------------------------- bindings
+
+NODE_HARNESS = os.path.join(PROJECT, "bench", "node")
+# Leitores em paralelo do binding: worker_threads contra threads do Rust.
+BINDING_THREADS = [1, 2, 4, 8]
+# Rodadas alternando nativo e Node (as diferenças são de µs).
+BINDING_ROUNDS = 3
+
+
+def node(script, *args):
+    return run(["node", os.path.join(NODE_HARNESS, script), *map(str, args)])
+
+
+def phase_bindings(scale):
+    """Bindings (docs/plano-bindings.md): o binding Node contra o nativo na
+    mesma máquina e no mesmo banco. O nativo mede com `--plain` (sem
+    PerfContext nem estatísticas do RocksDB), como uma aplicação."""
+    step("compilando o binding Node (release)")
+    run(["node", os.path.join(PROJECT, "bindings", "node", "scripts", "build.js")])
+    path = db(f"ptwiki-{scale}")
+    if not os.path.isdir(path):
+        step(f"carga {scale}")
+        fresh(path)
+        wiki("load", "--db", path, "--corpus", corpus(scale), "--batch", BATCH, "--label", f"ptwiki-{scale}")
+    qdir = queries_dir(scale)
+    if not os.path.isdir(qdir):
+        phase_queries(scale)
+    for r in range(BINDING_ROUNDS):
+        step(f"latência, rodada {r + 1} de {BINDING_ROUNDS}: nativo e Node")
+        # Os 10 melhores em todo conjunto (a medida do plano) e a operação de
+        # cada conjunto (search devolve todos os IDs: mostra o custo de listas grandes).
+        for suffix, mode in (("-top10", ["--mode", "top10"]), ("", [])):
+            wiki("bench", "--db", path, "--queries", qdir, "--plain", *mode, "--label", f"bindings-{scale}-native{suffix}")
+            node("bench.js", "--db", path, "--queries", qdir, *mode, "--label", f"bindings-{scale}-node{suffix}")
+    step("leitores em paralelo: threads do Rust e worker_threads (os 10 melhores do mixed)")
+    mixed = os.path.join(qdir, "mixed.txt")
+    for t in BINDING_THREADS:
+        wiki("bench", "--db", path, "--queries", mixed, "--threads", t, "--plain", "--mode", "top10",
+             "--label", f"bindings-{scale}-native-t{t}")
+    node("workers.js", "--db", path, "--queries", mixed, "--mode", "top10", "--threads", *BINDING_THREADS,
+         "--label", f"bindings-{scale}-node")
+    load_scale = smaller(scale, "100k")
+    tmp = db("tmp-bindings")
+    for r in range(BINDING_ROUNDS):
+        step(f"carga {load_scale}, rodada {r + 1} de {BINDING_ROUNDS}: nativo e Node (lote de {BATCH})")
+        fresh(tmp)
+        wiki("load", "--db", tmp, "--corpus", corpus(load_scale), "--batch", BATCH, "--plain",
+             "--label", f"bindings-{load_scale}-native")
+        fresh(tmp)
+        node("load.js", "--db", tmp, "--corpus", corpus(load_scale), "--batch", BATCH,
+             "--label", f"bindings-{load_scale}-node")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return True
+
+
 def phase_relevance(scale):
     """Plano de relevância: top-1/top-3/top-10/MRR em conjuntos com resposta
     conhecida, gerados da fatia (até 100k) e versionados em bench/relevance/."""
@@ -998,6 +1053,72 @@ def long_load_section(R, scale):
 
 
 # ------------------------------------------------------------------ comparação
+
+def bindings_section(R, scale):
+    """O binding Node contra o nativo: mediana das rodadas alternadas."""
+    def runs(kind, label):
+        return [r for r in R if r.get("kind") == kind and r.get("label") == label]
+    def med(rs, name, field):
+        vals = [x[field] for r in rs for x in r["sets"] if x["set"] == name]
+        return statistics.median(vals) if vals else None
+    def table(suffix, sets=None):
+        native, node_ = runs("bench", f"bindings-{scale}-native{suffix}"), runs("bench", f"bindings-{scale}-node{suffix}")
+        if not native or not node_:
+            return [], None, None
+        out = ["| Conjunto | p50 nativo | p50 Node | Δ | fronteira | p99 nativo | p99 Node |",
+               "|---|---|---|---|---|---|---|"]
+        for s in native[-1]["sets"]:
+            if sets and s["mode"] not in sets:
+                continue
+            n50, b50 = med(native, s["set"], "p50_us"), med(node_, s["set"], "p50_us")
+            n99, b99 = med(native, s["set"], "p99_us"), med(node_, s["set"], "p99_us")
+            inside = med(node_, s["set"], "inside_p50_us")
+            if b50 is None:
+                continue
+            edge = f"{fmt(b50 - inside, 2)} µs" if inside is not None else "—"
+            out.append(f"| {s['set']} | {us(n50)} | {us(b50)} | {fmt(b50 - n50, 2)} µs ({pct(b50, n50):+.1f}%) "
+                       f"| {edge} | {us(n99)} | {us(b99)} |")
+        return out, native, node_
+    top, native, node_ = table("-top10")
+    if not top:
+        return []
+    L = [f"## Binding Node ({scale})", "",
+         f"Mediana de {len(node_)} rodadas alternando o `wiki bench --plain` e o `bench/node/bench.js` no mesmo "
+         "banco ([docs/plano-bindings.md](" + DOCS_URL + "/plano-bindings.md)).", "",
+         "Δ é o Node contra o `wiki` (outro processo); **fronteira** é o Node contra a mesma consulta rodada "
+         "dentro do addon, no processo do Node: o custo de atravessar do JS para o Rust. O resto do Δ é rodar "
+         "dentro do processo do Node (V8, GC e suas threads disputando o cache da CPU).", "",
+         "### Os 10 melhores (`searchTopSync`, a medida do plano)", ""] + top
+    every, _, _ = table("", sets={"search", "suggest"})
+    if every:
+        L += ["", "### A operação de cada conjunto (`searchSync` devolve todos os IDs; `suggestSync`)", ""] + every
+    last = node_[-1]
+    noop = statistics.median([r["noop_ns"] for r in node_ if "noop_ns" in r] or [0])
+    labels_node = statistics.median([r["labels_10_us"] for r in node_ if "labels_10_us" in r] or [0])
+    labels_native = statistics.median([r["labels_10_us"] for r in native if "labels_10_us" in r] or [0])
+    L += ["", f"- Chamada vazia: {fmt(noop, 1)} ns (meta ≤ 200 ns).",
+          f"- Rótulos de 10 resultados: Node {fmt(labels_node, 2)} µs, nativo {fmt(labels_native, 2)} µs "
+          f"(meta ≤ nativo + 2 µs)."]
+    if last.get("async"):
+        a = last["async"]
+        L.append(f"- `t-mid` síncrono {fmt(a['sync_p50_us'], 1)} µs, assíncrono (pool do libuv) "
+                 f"{fmt(a['async_p50_us'], 1)} µs.")
+    workers = latest(R, "workers", f"bindings-{scale}-node")
+    if workers:
+        L += ["", "| Leitores | qps nativo (threads) | qps Node (worker_threads) | Δ |", "|---|---|---|---|"]
+        for w in workers["sets"]:
+            n = latest(R, "bench", f"bindings-{scale}-native-t{w['threads']}")
+            nq = n["sets"][0]["qps"] if n else None
+            L.append(f"| {w['threads']} | {fmt(nq)} | {fmt(w['qps'])} | {pct(w['qps'], nq):+.1f}% |" if nq
+                     else f"| {w['threads']} | — | {fmt(w['qps'])} | — |")
+    load_scale = smaller(scale, "100k")
+    ln, lb = runs("load", f"bindings-{load_scale}-native"), runs("load", f"bindings-{load_scale}-node")
+    if ln and lb:
+        n, b = statistics.median(r["docs_per_s"] for r in ln), statistics.median(r["docs_per_s"] for r in lb)
+        L += ["", f"- Carga {load_scale} (lote de {BATCH}): nativo {fmt(n)} docs/s, Node {fmt(b)} docs/s "
+              f"({b / n * 100:.1f}% do nativo; meta ≥ 97%)."]
+    return L + [""]
+
 
 def pct(new, old):
     return (new - old) / old * 100 if old else 0.0
@@ -1233,6 +1354,7 @@ def cmd_report(scale):
     L += relevance_section(R, scale)
     L += stemming_section(R, scale)
     L += edits_section(R, scale)
+    L += bindings_section(R, scale)
     L += [f"## Metas (linha de base em {scale})", "", "| Métrica | Linha de base | Meta |", "|---|---|---|",
           f"| Divergências do oráculo | {divs if divs is not None else '—'} | **0** |",
           f"| Carga sem swap (aumento < 64 MB) | {swap_txt} | **sim** |",
@@ -1347,6 +1469,7 @@ def main():
                         ("relevance", "ordenação: consultas de resposta conhecida"),
                         ("stemming", "stemming ligado vs. desligado (A/B no mesmo binário)"),
                         ("edits", "edição e remoção: oráculo, vazão, latência antes e depois de compactar"),
+                        ("bindings", "binding Node contra o nativo (latência, leitores, carga)"),
                         ("report", "gera RESULTADOS.md no repositório de resultados")):
         sub.add_parser(name, parents=[common], help=help_)
     pr = sub.add_parser("pr", parents=[common], help="Fase 8")
@@ -1389,7 +1512,8 @@ def main():
     else:
         result = {"correctness": phase_correctness, "queries": phase_queries, "latency": phase_latency,
                   "concurrency": phase_concurrency, "phrases": phase_phrases,
-                  "relevance": phase_relevance, "stemming": phase_stemming, "edits": phase_edits}[args.cmd](scale)
+                  "relevance": phase_relevance, "stemming": phase_stemming, "edits": phase_edits,
+                  "bindings": phase_bindings}[args.cmd](scale)
         ok = result is not False
     cmd_report(scale)
     status = f"{GREEN}pronto" if ok else f"{RED}terminou com falhas"

@@ -167,3 +167,71 @@ binários continuou em +8,6% (301,6 → 327,6 µs; `and-freq` +3,6%). Com builds
 de alinhamento fixo (`-align-all-functions=6 -align-all-nofallthru-blocks=6`)
 a diferença some: 315,7 → 318,0 µs (+0,7%), `and-freq` +0,3%. É alinhamento
 do código, como no A/B do monitoramento; a Fase 0 não perde nada.
+
+## Resultado da Fase 1 (28/10/2026)
+
+`perf.py bindings --scale full`: o binding contra o `wiki` (`--plain`, sem
+PerfContext nem estatísticas), no mesmo banco, 3 rodadas alternadas.
+
+| Medida | Meta | Resultado |
+|---|---|---|
+| Chamada vazia | ≤ 0,2 µs | 0,099 µs |
+| `searchTopSync` k = 10, `t-mid` p50 | ≤ nativo + max(1 µs, 5%) | 56 µs contra 55 µs (+0,24 µs) |
+| `rank-freq`, `phrase-freq` p50 (top 10) | ≤ nativo + 2% | +0,9% e −2,7% |
+| Rótulos de 10 resultados | ≤ `MultiGet` nativo + 2 µs | +1,6 µs no mesmo processo; +3,2 µs contra o `wiki` |
+| Carga 100k (lote 10k) | ≥ 97% | 89% a 94% (ver abaixo) |
+| Busca assíncrona | medir | +50 µs (ida e volta ao pool do libuv): só para consultas de ms |
+| Leitores em `worker_threads` (top 10 do `mixed`) | escala como o Rust | 1, 2, 4 e 8 workers: −7%, −4%, −4% e −18% do nativo |
+
+O caminho até aí:
+
+- **Método de classe do napi-rs: ~240 ns por chamada** (desembrulhar o
+  objeto e conferir a classe). Com a feature `napi8`, mais ~120 ns de type
+  tag. O addon expõe funções soltas sobre um handle (`External` lido direto,
+  conferido por um número mágico): 364 → 99 ns.
+- **Criar um `Float64Array` custa ~550 ns no Node 24**, inclusive no próprio
+  JS (o buffer fica fora do heap, com contabilidade no GC), e o do napi-rs
+  ainda é externo, com finalizador. `searchTopSync` escreve num buffer de
+  trabalho do `Engine` JS e o `TopHits` copia os k resultados para `number[]`
+  (~30 ns). **Desvio do plano original:** `TopHits.ids` e `scores` são
+  `number[]`, não `Float64Array`. `searchSync` (todos os IDs) e as promessas
+  continuam em `Float64Array`, com memória do V8.
+- **Rótulos numa string só** (separados por `\0`): uma string criada na
+  fronteira em vez de dez.
+- **Carga:** com o próximo lote montado enquanto o anterior grava, o parse
+  do JSON e a conversão das strings (1,5 s em 100k) ficam escondidos; o
+  event loop passa 13,8 s de 18 s esperando o commit. O que falta para 97% é
+  o próprio commit (o mesmo código Rust) rodar ~5% mais devagar dentro do
+  processo do Node, disputando a CPU com o V8 e o GC; uma arena só do malloc
+  piora (19,4 s). Fica como investigação.
+- **Fronteira contra processo:** o harness roda cada consulta também dentro
+  do addon, no processo do Node. A diferença para a chamada pelo JS (de 1,3
+  a 3,8 µs nas consultas curtas) inclui o trabalho JS entre as buscas
+  disputando o cache; a diferença para o `wiki` varia de rodada para rodada
+  em ±5 µs.
+
+## Resultado da Fase 2 (28/10/2026)
+
+- **`Reader` no core:** a instância só leitura atual num `ArcSwap` (pegá-la
+  não tem trava) e `refresh()`, que lista a pasta no máximo a cada
+  `min_interval` e reabre se o nome ou o tamanho do WAL, do MANIFEST ou do
+  `CURRENT` mudaram. O escritor não paga nada. `refresh_now()` confere sem
+  esperar o intervalo.
+- **Teste entre processos:** o próprio binário de teste, chamado de novo
+  como escritor, grava 60 commits com compactações enquanto o `Reader` reabre
+  e busca: nenhum commit pela metade, nenhuma volta no tempo. O mesmo no Node
+  (`readOnly` com `refreshMs`, o escritor num processo filho).
+- **Node:** `{ readOnly: true, refreshMs }` confere a pasta no pool de
+  threads a cada `refreshMs` (o timer não segura o processo) e
+  `engine.refresh()` confere na hora.
+- **Custo de reabrir (`wiki reopen`, 100k em lotes de 5.000):** ~12 ms por MB
+  de WAL, que a instância só leitura repete na memória. Com o WAL cheio da
+  carga (até 91 MB), de 0,1 a 1,1 s (média 0,6 s); com `Config::max_wal_bytes`
+  de 16 MB no escritor, média 0,36 s (o lote em si já escreve ~25 MB). Com
+  commits pequenos, o WAL tem KB. No Node a reabertura roda no pool de
+  threads; um leitor síncrono (o PHP no começo do request) sentiria esse
+  tempo, e é o ponto a decidir na Fase 3.
+- **Primeira busca depois de reabrir:** ~1,6 ms contra 0,12 ms da segunda,
+  mesmo com o block cache compartilhado entre as instâncias: os caches de
+  nós e de tamanhos do motor nascem vazios.
+

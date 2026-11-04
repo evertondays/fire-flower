@@ -5,3 +5,4 @@
 !src/
 !benches/
 !crates/
+!bindings/node/Cargo.toml

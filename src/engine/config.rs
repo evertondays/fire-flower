@@ -111,6 +111,13 @@ pub struct Config {
     /// De quanto em quanto tempo a amostradora grava o snapshot; as
     /// propriedades do RocksDB são relidas a cada 5 snapshots.
     pub metrics_interval: Duration,
+    /// Tamanho da memtable do RocksDB no processo que grava (o WAL a
+    /// acompanha: até ~2× isso). Um leitor em outro processo
+    /// ([`crate::Reader`]) repete o WAL ao reabrir, ~12 ms por MB: com o padrão
+    /// (`None`: 64 MB, WAL de até ~90 MB numa carga) reabrir leva até ~1 s.
+    /// Menor, reabrir fica mais barato e os flushes, mais frequentes. Só vale
+    /// para quem grava.
+    pub max_wal_bytes: Option<u64>,
 }
 
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
@@ -186,6 +193,7 @@ impl Default for Config {
             metrics: false,
             metrics_file: None,
             metrics_interval: Duration::from_secs(1),
+            max_wal_bytes: None,
         }
     }
 }

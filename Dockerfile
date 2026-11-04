@@ -25,9 +25,13 @@ WORKDIR /src
 # minutos para compilar) só é refeita quando o Cargo.toml ou o Cargo.lock mudam.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/fire-flower-cli/Cargo.toml crates/fire-flower-cli/
-RUN mkdir -p src benches crates/fire-flower-cli/src \
+# O binding Node é membro do workspace: o cargo precisa do manifesto, mas a
+# imagem não o compila (fonte vazio, sem build.rs).
+COPY bindings/node/Cargo.toml bindings/node/
+RUN mkdir -p src benches crates/fire-flower-cli/src bindings/node/src \
  && echo 'fn main() {}' > crates/fire-flower-cli/src/main.rs \
- && touch src/lib.rs benches/micro.rs \
+ && echo 'fn main() {}' > bindings/node/build.rs \
+ && touch src/lib.rs benches/micro.rs bindings/node/src/lib.rs \
  && cargo build --release --locked --bin fire-flower \
  && rm -rf src benches crates/fire-flower-cli/src
 

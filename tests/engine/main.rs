@@ -16,6 +16,7 @@ mod reader;
 mod ranking;
 mod search;
 mod stemming;
+mod typos;
 mod storage;
 mod writer;
 

@@ -35,7 +35,7 @@ pub mod query;
 
 pub use engine::{
     CommitStats, CompactStats, Config, Engine, FORMAT_VERSION, IndexBatch, InflectionMode, MAX_EXTERNAL_ID_BYTES,
-    Maintenance, MaintenanceOptions, OwnedBatch, Reader,
+    Maintenance, MaintenanceOptions, OwnedBatch, Reader, TypoMode,
 };
 pub use error::{Error, Result};
 
@@ -96,6 +96,17 @@ pub struct TopHits {
     pub hits: Vec<Hit>,
     /// Documentos que satisfazem a consulta (não só os devolvidos).
     pub total: usize,
+    /// As palavras corrigidas ([`Config::typos`]), na ordem da consulta.
+    pub corrections: Vec<Correction>,
+}
+
+/// Uma palavra da consulta que a busca corrigiu ([`Config::typos`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Correction {
+    /// A palavra como foi buscada (normalizada).
+    pub from: String,
+    /// As palavras do índice somadas no lugar dela, da de maior df para a de menor.
+    pub to: Vec<String>,
 }
 
 /// Estatísticas do índice usadas pelo BM25.

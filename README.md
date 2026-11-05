@@ -20,6 +20,10 @@ Suporta:
   gravados nele;
 - busca por **frase** (`"casa de papel"`): os termos em sequência, com as
   stopwords contando como buraco;
+- **correção de erros de digitação** opcional (`--typos`,
+  `Config::typos`): uma palavra que não está no índice soma as palavras a um
+  erro dela (`revolucao fracesa` acha a "Revolução Francesa"), com a troca no
+  resultado. Vale por busca, em qualquer banco;
 - **ranking BM25F**: os resultados saem por relevância (`search_top`), com o
   título como campo de peso próprio (`add_titled`; `k1 = 1,2`, `b = 0,75`,
   peso do título 50); `search` continua devolvendo todos os IDs em ordem;
@@ -122,6 +126,11 @@ Busca interativa, com resultados enquanto você digita:
 | `Ctrl+R` | reabre o banco para ver o que foi gravado desde a abertura |
 | `Esc` | volta / sai |
 
+Com `fire-flower tui --typos`, uma palavra que não está no índice é corrigida
+(ver "Busca sem interface"): a linha "consulta:" mostra a troca e a prévia
+destaca as palavras corrigidas. A palavra que está sendo digitada é prefixo e
+não é corrigida; a correção vale depois do espaço.
+
 A TUI, `search` e `suggest` abrem o banco **só para leitura**: funcionam ao
 lado de um `index` ou de uma aplicação que está gravando no mesmo banco, sem
 travá-lo, com block cache de 32 MB. A visão é a do momento da abertura; a TUI
@@ -218,6 +227,22 @@ simples no shell:
 ./target/release/fire-flower search /tmp/indice '"revolução francesa" 1789'
 ```
 
+Com `--typos`, uma palavra que não está no índice (ou está em um documento
+só) soma as palavras a um erro dela: uma letra trocada, faltando, sobrando ou
+duas vizinhas invertidas, com a primeira letra igual, em palavras de 5 letras
+ou mais. As trocas saem depois dos resultados:
+
+```bash
+./target/release/fire-flower search /tmp/indice revolucao fracesa --typos
+# 11.460	1672	Revolução Francesa
+# ...
+# corrigido: fracesa → francesa, fracena, fraces
+```
+
+Frases e prefixos não são corrigidos. Na Wikipédia inteira, achar as
+correções de uma palavra custa ~0,4 ms (p50; p99 < 1 ms); consultas cujas
+palavras existem não mudam.
+
 ```bash
 ./target/release/fire-flower suggest /tmp/indice prog 10
 ```
@@ -299,7 +324,7 @@ assert_eq!(engine.suggest("es", 5)?, ["estudante"]);
 // Os 10 mais relevantes (BM25): Vec<Hit { doc, score }>.
 let top = engine.search_top("coração", 10)?;
 // Com o total de documentos que casaram.
-let ranked = engine.search_ranked("coração", 10)?; // TopHits { hits, total }
+let ranked = engine.search_ranked("coração", 10)?; // TopHits { hits, total, corrections }
 
 // Editar e remover: o mesmo ID substitui o documento inteiro.
 let mut batch = engine.batch();
@@ -536,6 +561,15 @@ python3 scripts/perf.py all --scale 10k
   `Config::max_prefix_terms` termos (256); os demais são ignorados. No
   ranking, o prefixo conta como um termo só: o idf vem de todos os documentos
   que têm alguma completação, e o tf é a soma das completações no documento.
+- **Correção de digitação: um erro, desligada por padrão.** Com
+  `Config::typos` (`--typos`), só a palavra que não está no índice (ou tem df
+  1) é corrigida, com até um erro e a primeira letra igual; dois erros
+  custariam ~15× mais percorrendo a Trie
+  ([docs/plano-correcao-digitacao.md](docs/plano-correcao-digitacao.md)).
+  Frases, prefixos e o autocompletar não são corrigidos, e cada palavra é
+  corrigida sozinha: duas correções podem não aparecer juntas em nenhum
+  documento. No binding Node, `typos: true` liga a correção, mas as trocas
+  ainda não chegam ao JS.
 - **Plural desligado por padrão** ("casa" e "casas" são termos
   diferentes; use `--stemming pt-plural` ou `--inflections pt-plural`). O `pt-plural` só junta plural e
   singular; o Snowball (`pt`) junta também verbos e derivados, mas às vezes

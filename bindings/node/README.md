@@ -73,6 +73,9 @@ engine.close(); // ou: using engine = Engine.openSync(…)
   `FF_READ_ONLY`, `FF_CLOSED`, `FF_CONFIG`, `FF_CORRUPT`, `FF_DB`,
   `FF_ARGUMENT` (argumento inválido) e `FF_PANIC` (um pânico do Rust pego na
   fronteira, em vez de derrubar o processo).
+- **Erros de digitação:** com `{ typos: true }`, uma palavra que não está no
+  índice soma as palavras a um erro dela (ver o README do projeto). As
+  trocas feitas ainda não chegam ao JS.
 - **Métricas:** com `{ metrics: true }`, `engine.metrics()` devolve os
   contadores do motor (ver [docs/plano-monitoramento.md](../../docs/plano-monitoramento.md)).
 

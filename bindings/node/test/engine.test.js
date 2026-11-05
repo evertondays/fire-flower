@@ -76,6 +76,20 @@ test("texto em Buffer, sem conversão para string", () => {
   engine.close();
 });
 
+test("corrige erros de digitação com typos: true", async () => {
+  const dir = tempDir();
+  const engine = Engine.openSync(path.join(dir, "db"));
+  engine.indexSync(DOCS);
+  engine.close();
+  const plain = Engine.openSync(path.join(dir, "db"), { readOnly: true });
+  assert.equal(plain.searchTopSync("plaenta").total, 0);
+  plain.close();
+  const typos = Engine.openSync(path.join(dir, "db"), { readOnly: true, typos: true });
+  assert.deepEqual([...typos.searchSync("plaenta")], [1, 2]);
+  assert.equal(typos.searchTopSync("plaenta").total, 2);
+  typos.close();
+});
+
 test("erros com código estável", async () => {
   const dir = tempDir();
   await assert.rejects(

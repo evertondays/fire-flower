@@ -52,6 +52,7 @@ mod relevance;
 mod reopen;
 mod rng;
 mod sizes;
+mod typos;
 mod vocab;
 
 
@@ -218,7 +219,7 @@ enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[command(flatten)]
-        inflections: InflectionArgs,
+        search: SearchArgs,
         /// Compara com o estado depois do plano de edições (rode `wiki edit` antes, com o mesmo plano)
         #[arg(long)]
         edits: bool,
@@ -259,7 +260,7 @@ enum Cmd {
         #[arg(long)]
         brief: bool,
         #[command(flatten)]
-        inflections: InflectionArgs,
+        search: SearchArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -294,7 +295,7 @@ enum Cmd {
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
         #[command(flatten)]
-        inflections: InflectionArgs,
+        search: SearchArgs,
         #[arg(long)]
         label: Option<String>,
     },
@@ -374,15 +375,15 @@ fn main() -> AnyResult {
         Cmd::Edit { db, corpus, take, batch, max_ops, maintenance, plan, label } => {
             edit(&db, &corpus, take, batch.max(1), max_ops, plan, maintenance, label)
         }
-        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, inflections, edits, plan, label } => {
-            let config = inflections.apply(Config::default())?;
+        Cmd::Oracle { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, search, edits, plan, label } => {
+            let config = search.apply(Config::default())?;
             let edits = edits.then_some(plan);
             oracle(OracleArgs { db, corpus, take, remap_ids, sample_terms, and_queries, prefixes, titles, phrases, rank_queries, seed, config, edits, label })
         }
-        Cmd::Relevance { db, corpus, sets, manual, take, seed, per_set, generate, title_weight, title_b, brief, inflections, label } => {
+        Cmd::Relevance { db, corpus, sets, manual, take, seed, per_set, generate, title_weight, title_b, brief, search, label } => {
             let manual = manual.unwrap_or_else(|| project_dir().join("bench").join("relevance").join("manual.tsv"));
             let defaults = Config::default();
-            let config = inflections.apply(Config {
+            let config = search.apply(Config {
                 title_weight: title_weight.unwrap_or(defaults.title_weight),
                 title_b: title_b.unwrap_or(defaults.title_b),
                 ..defaults
@@ -390,11 +391,11 @@ fn main() -> AnyResult {
             run_relevance(&db, &corpus, &sets, &manual, take, seed, per_set, generate, config, brief, label)
         }
         Cmd::Bench {
-            db, queries, threads, passes, cold, perf_time, plain, mode, reader_cache, cache_mb, inflections, label,
+            db, queries, threads, passes, cold, perf_time, plain, mode, reader_cache, cache_mb, search, label,
         } => {
             let mode = mode.map(|m| Mode::parse(&m).ok_or(format!("modo desconhecido {m:?}: search, suggest ou top10")))
                 .transpose()?;
-            let mut config = inflections.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
+            let mut config = search.apply(Config { block_cache_bytes: cache_mb << 20, ..Config::default() })?;
             if let Some(depth) = reader_cache {
                 config.reader_cache_depth = if depth == "none" { None } else { Some(depth.parse()?) };
             }
@@ -415,19 +416,25 @@ fn main() -> AnyResult {
     }
 }
 
-/// Peso e modo das flexões na consulta (valem por busca; o banco precisa ter
-/// sido criado com `--inflections`).
+/// Opções que valem por busca: peso e modo das flexões (o banco precisa ter
+/// sido criado com `--inflections`) e a correção de erros de digitação.
 #[derive(clap::Args)]
-struct InflectionArgs {
+struct SearchArgs {
     /// α: quanto as flexões valem perto da palavra exata (0 a 1)
     #[arg(long)]
     inflection_weight: Option<f64>,
     /// "always" ou N: só quando a busca exata acha menos de N documentos
     #[arg(long)]
     inflection_mode: Option<String>,
+    /// Corrige as palavras que não estão no índice (`TypoMode::Missing`)
+    #[arg(long)]
+    typos: bool,
+    /// γ: quanto as correções valem (0 a 1)
+    #[arg(long)]
+    typo_weight: Option<f64>,
 }
 
-impl InflectionArgs {
+impl SearchArgs {
     fn apply(&self, mut config: Config) -> AnyResult<Config> {
         if let Some(w) = self.inflection_weight {
             config.inflection_weight = w;
@@ -437,6 +444,12 @@ impl InflectionArgs {
                 "always" => fire_flower::InflectionMode::Always,
                 n => fire_flower::InflectionMode::IfFewer(n.parse().map_err(|_| format!("modo das flexões: {m:?} (use sempre ou um número)"))?),
             };
+        }
+        if self.typos {
+            config.typos = fire_flower::TypoMode::Missing;
+        }
+        if let Some(w) = self.typo_weight {
+            config.typo_weight = w;
         }
         Ok(config)
     }

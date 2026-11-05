@@ -189,3 +189,68 @@ fn translated_ids_merge_in_order() {
     assert!(first_high(100) < a && a < b);
     assert_eq!(users_sorted(vec![4, first_high(1), first_high(100), a, b]), [1, 2, 4, 9, 100]);
 }
+
+/// Distância de Damerau-Levenshtein restrita (transposição de vizinhas vale
+/// 1), pela matriz inteira: a referência do percurso da correção.
+fn osa(a: &[char], b: &[char]) -> usize {
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+#[test]
+fn typo_walk_finds_exactly_the_words_one_edit_away() {
+    // Vocabulário denso (alfabeto de 3 letras): quase toda palavra tem vizinhos.
+    let mut seed = 7u64;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let word = |alphabet: &[u8], lo: u64, hi: u64, next: &mut dyn FnMut(u64) -> u64| -> String {
+        let len = lo + next(hi - lo + 1);
+        (0..len).map(|_| alphabet[next(alphabet.len() as u64) as usize] as char).collect()
+    };
+    let vocab: Vec<String> = (0..1500).map(|_| word(b"abc", 2, 7, &mut next)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::Config { languages: Some(vec![]), ..crate::Config::default() };
+    let engine = crate::Engine::open(dir.path(), config).unwrap();
+    let mut batch = engine.batch();
+    for (i, chunk) in vocab.chunks(10).enumerate() {
+        batch.add_document(i as u64 + 1, &chunk.join(" ")).unwrap();
+    }
+    batch.commit().unwrap();
+    let mut vocab: Vec<Vec<char>> = vocab.iter().map(|w| w.chars().collect()).collect();
+    vocab.sort();
+    vocab.dedup();
+
+    let view = engine.view();
+    for _ in 0..400 {
+        // Consultas com uma letra fora do vocabulário, às vezes.
+        let q: Vec<char> = word(b"abcd", 1, 8, &mut next).chars().collect();
+        let term: String = q.iter().collect();
+        let mut got: Vec<String> = view.words_near(&term).unwrap().into_iter().map(|(w, _)| w).collect();
+        got.sort();
+        let want: Vec<String> = vocab
+            .iter()
+            .filter(|w| w[0] == q[0] && **w != q && osa(w, &q) == 1)
+            .map(|w| w.iter().collect())
+            .collect();
+        assert_eq!(got, want, "palavras a um erro de {term:?}");
+    }
+}

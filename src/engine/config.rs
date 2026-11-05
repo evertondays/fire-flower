@@ -79,6 +79,24 @@ pub struct Config {
     pub inflection_weight: f64,
     /// Quando somar as flexões (vale por busca).
     pub inflection_mode: InflectionMode,
+    /// Correção de erros de digitação (`docs/plano-correcao-digitacao.md`):
+    /// uma palavra da consulta que não está no índice soma as palavras a um
+    /// erro dela (letra trocada, faltando, sobrando ou duas vizinhas
+    /// invertidas), com a primeira letra igual. Vale por busca (não fica
+    /// gravado) e funciona em qualquer banco.
+    pub typos: TypoMode,
+    /// Quanto as correções valem (γ, de 0 a 1), como as flexões: `tf~ = tf~_exata
+    /// + γ · tf~_correções`, com o idf do maior df do grupo.
+    pub typo_weight: f64,
+    /// Letras mínimas de uma palavra para ela ser corrigida. Palavras curtas
+    /// têm vizinhos demais (`casa`: cada, caso, cama, capa, cara…).
+    pub typo_min_len: usize,
+    /// df mínimo de uma palavra para ela contar como existente e de uma
+    /// correção para ela valer. Na Wikipédia, 63% dos termos têm df 1, muitos
+    /// deles erros do próprio texto.
+    pub typo_min_df: usize,
+    /// Quantas correções uma palavra soma no máximo (as de maior df).
+    pub max_typo_terms: usize,
     /// Filtros de Bloom e índices dos SSTs em partições de 4 KB (ligado por
     /// padrão). Desligar volta ao filtro inteiro, que num banco grande passa
     /// do tamanho de uma parte do block cache e é relido a cada `Get`; existe
@@ -120,6 +138,17 @@ pub struct Config {
     pub max_wal_bytes: Option<u64>,
 }
 
+/// Quando a busca corrige uma palavra ([`Config::typos`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypoMode {
+    /// Nunca.
+    Off,
+    /// Só a palavra que não está no índice, ou está em menos de
+    /// [`Config::typo_min_df`] documentos, e não tem flexões. As consultas
+    /// cujas palavras existem ficam como sem correção.
+    Missing,
+}
+
 /// Quando a busca soma as flexões de uma palavra ([`Config::inflections`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InflectionMode {
@@ -145,7 +174,8 @@ impl Config {
             && in_unit(self.title_b)
             && self.title_weight.is_finite()
             && self.title_weight >= 0.0
-            && in_unit(self.inflection_weight);
+            && in_unit(self.inflection_weight)
+            && in_unit(self.typo_weight);
         if self.metrics_interval.is_zero() {
             return Err(Error::Config("Config::metrics_interval precisa ser maior que zero".into()));
         }
@@ -154,8 +184,9 @@ impl Config {
         } else {
             Err(Error::Config(format!(
                 "parâmetros de ranking inválidos: k1 = {}, b = {}, peso do título = {}, b do título = {}, \
-                 peso das flexões = {} (k1 e peso ≥ 0; b e peso das flexões entre 0 e 1)",
-                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b, self.inflection_weight
+                 peso das flexões = {}, peso das correções = {} (k1 e peso ≥ 0; b e pesos das flexões e das \
+                 correções entre 0 e 1)",
+                self.bm25_k1, self.bm25_b, self.title_weight, self.title_b, self.inflection_weight, self.typo_weight
             )))
         }
     }
@@ -180,6 +211,12 @@ impl Default for Config {
             // "Só se faltar" não ajuda: "planetas" já acha documentos demais.
             inflection_weight: 0.5,
             inflection_mode: InflectionMode::Always,
+            // Desligada até a Fase 5 do plano de correção escolher os padrões.
+            typos: TypoMode::Off,
+            typo_weight: 0.5,
+            typo_min_len: 5,
+            typo_min_df: 2,
+            max_typo_terms: 8,
             partition_filters: true,
             // Os padrões do Lucene e do Elasticsearch.
             bm25_k1: 1.2,

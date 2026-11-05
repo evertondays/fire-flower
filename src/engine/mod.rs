@@ -58,6 +58,7 @@ mod purge;
 mod ranking;
 mod reader;
 mod search;
+mod typos;
 mod versions;
 mod view;
 mod writer;
@@ -65,7 +66,7 @@ mod writer;
 mod tests;
 
 
-pub use self::config::{Config, InflectionMode};
+pub use self::config::{Config, InflectionMode, TypoMode};
 pub use self::empty_words::CompactStats;
 pub use self::external::MAX_EXTERNAL_ID_BYTES;
 pub use self::maintenance::{Maintenance, MaintenanceOptions};

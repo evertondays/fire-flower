@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fire_flower::{DocId, Engine, Hit};
+use fire_flower::{Correction, DocId, Engine, Hit};
 use fire_flower::analysis::normalize_term;
 use fire_flower::query::{Clause, QueryTerm};
 use ratatui::DefaultTerminal;
@@ -87,6 +87,8 @@ struct App {
     results: Vec<Hit>,
     /// Quantos documentos casaram ao todo.
     total: usize,
+    /// As palavras corrigidas (`fire-flower tui --typos`).
+    corrections: Vec<Correction>,
     selected: usize,
     offset: usize,
     elapsed: Duration,
@@ -128,6 +130,7 @@ impl App {
             suggestion: 0,
             results: Vec::new(),
             total: 0,
+            corrections: Vec::new(),
             selected: 0,
             offset: 0,
             elapsed: Duration::ZERO,
@@ -199,13 +202,16 @@ impl App {
             self.suggestions.iter().position(|s| Some(s) != self.current_word.as_ref()).unwrap_or(0);
 
         let started = Instant::now();
-        (self.results, self.total) = match self.engine.search_ranked(&self.effective, MAX_RESULTS) {
-            Ok(top) => (top.hits, top.total),
+        (self.results, self.total, self.corrections) = match self.engine.search_ranked(&self.effective, MAX_RESULTS) {
+            Ok(top) => (top.hits, top.total, top.corrections),
             Err(e) => {
                 self.error = Some(e.to_string());
-                (Vec::new(), 0)
+                (Vec::new(), 0, Vec::new())
             }
         };
+        // As palavras que entraram no lugar das digitadas também são destacadas.
+        let fixed = self.corrections.iter().flat_map(|c| &c.to);
+        self.terms.extend(fixed.map(|w| QueryTerm { text: w.clone(), prefix: false, stem: None }));
         self.elapsed = started.elapsed();
         self.selected = 0;
         self.offset = 0;

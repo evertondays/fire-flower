@@ -1005,6 +1005,61 @@ leva ~200 µs, e devolver todos os IDs do mesmo termo, ~45 µs. A maior parte
 da diferença é decodificar a lista com tf e passar por ela de novo: para ir
 além, é preciso não decodificar a lista inteira (ver "Possíveis evoluções").
 
+### 6.7 Erros de digitação: `revolucao fracesa`
+
+Com `Config::typos = TypoMode::Missing` (`--typos` na CLI), uma palavra que
+não está no índice deixa de zerar a busca
+([plano-correcao-digitacao.md](plano-correcao-digitacao.md)). Sem a
+correção, `fracesa` não existe na Trie e o E sai vazio na hora (seção 6.2).
+
+**Quando corrige.** Só um termo exato (fora de frase e de prefixo) que tem
+menos de `typo_min_df` documentos (2: ausente, ou num documento só, o que na
+Wikipédia costuma ser um erro do próprio texto), que não tem flexões no
+índice e que tem pelo menos `typo_min_len` letras (5: palavras curtas têm
+vizinhos demais, `casa` → cada, caso, cama, capa, cara). Uma consulta cujas
+palavras existem não muda nada: a decisão usa o tamanho da lista, que a
+busca já lê do cabeçalho.
+
+**Quais correções.** As palavras da Trie a **um erro** (letra trocada,
+faltando, sobrando ou duas vizinhas invertidas: a distância de
+Damerau-Levenshtein restrita), com a **primeira letra igual** e df ≥
+`typo_min_df`. Ficam as `max_typo_terms` (8) de maior df; no empate, a
+ordem alfabética.
+
+**Como acha.** `src/engine/typos.rs` percorre a Trie em largura a partir do
+nó da primeira letra, levando em cada nó a linha da matriz de distâncias
+entre a palavra até ali e cada prefixo do termo:
+
+```text
+termo: f r a c e s a          nó "fr":   [2, 1, 0, 1, 2, 3, 4, 5]
+                              nó "fra":  [3, 2, 1, 0, 1, 2, 3, 4]
+                              nó "fran": [4, 3, 2, 1, 1, 2, 3, 4]
+                              …
+                              nó "francesa" (fim de palavra): última posição = 1 ✓
+```
+
+Um ramo para quando nenhuma posição da linha fica em 1 ou menos: de `fr`, o
+filho `x` continua (`frx` pode ser `fra` com uma letra trocada), mas `frxz`
+para, porque precisaria de dois erros em qualquer alinhamento. Os nós de cada nível são lidos juntos, os rasos do cache de nós e o
+resto num `MultiGet`, como no autocompletar. Na Wikipédia inteira, uma
+palavra visita ~400 nós e lê ~80 fora do cache. Fixar a primeira letra corta
+os nós em ~16× (sem ela, o percurso desce por todos os filhos da raiz); dois
+erros leriam ~2.300 nós por palavra (7,5 ms), por isso ficaram de fora.
+
+**Como pontua.** O termo vira um grupo, o mesmo das flexões (seção 5.1): a
+palavra exata, se existe, com peso 1, e as correções com peso γ
+(`typo_weight`, 0,5): `tf~ = tf~_exata + γ · tf~_correções`, com o idf do
+maior df do grupo. O E usa a união das listas e o top-k, o limite superior
+do grupo. O resultado traz as trocas (`TopHits::corrections`:
+`fracesa → francesa, fracena, fraces`).
+
+**Custo** (Wikipédia inteira, cache quente): uma palavra com erro leva
+358 µs no p50 e 828 µs no p99 (`t-typo`, contando a busca das correções); uma
+palavra sem nenhuma correção possível, 73 µs (`t-miss-far`). Sem a correção,
+as duas levavam ~1–4 µs para não achar nada. Consultas com palavras raras que
+existem (df 1) também somam as correções: nos títulos, o p50 vai de 43 para
+52 µs.
+
 ---
 
 ## 7. Concorrência: um escritor, muitos leitores
@@ -1264,7 +1319,8 @@ src/
 │   ├── conjunction.rs  o E entre listas: cursores que saltam blocos, intersect
 │   ├── prefix.rs       prefixos e autocompletar
 │   ├── phrase.rs       frases: conferência das posições
-│   ├── groups.rs       grupos de flexões na consulta
+│   ├── groups.rs       grupos de flexões e de correções na consulta
+│   ├── typos.rs        correção de digitação: palavras a um erro (percurso na Trie)
 │   ├── diagnostics.rs  medições para o harness de performance
 │   ├── metrics/        métricas: shards e somas (mod.rs), snapshot gravado (snapshot.rs),
 │   │                   thread amostradora (sampler.rs)
@@ -1312,6 +1368,7 @@ engine.suggest("cor", 10)?;        // Vec<String>
 | AND de *n* termos | *n* buscas + interseções | retorna cedo se algum termo não existe |
 | Prefixo | 1 `get` por nó visitado + 1 por lista | limitado a 256 termos |
 | Frase de *n* termos | as *n* listas `post:` + *n* listas `pos:` | posições só conferidas nos documentos que passaram no E |
+| Termo com erro (`--typos`) | ~400 nós visitados, ~80 `get`s fora do cache + as listas das correções | só termos com df < 2; ~0,4 ms na Wikipédia inteira |
 | Top *k* (BM25) | o E + 2 `get`s (estatísticas) + tamanho dos documentos que podem entrar no top | blocos de `norm:` em cache |
 | Indexar um lote | tokenizar + 1 caminho na Trie por termo distinto do lote + os blocos de `norm:` tocados | nós no cache do escritor não são relidos |
 | Substituir ou remover | o mesmo que indexar (as entradas novas entram no fim das listas) + 1 `put ver:` | a versão antiga fica nas listas até a compactação; a busca a pula com um teste por entrada |

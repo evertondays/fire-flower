@@ -1,9 +1,11 @@
 //! O índice ingênuo do oráculo: listas por termo, posições e a busca.
 
-use fire_flower::DocId;
+use fire_flower::{Correction, DocId};
 use fire_flower::analysis::{TITLE_GAP, tokenize};
 use fire_flower::query::Clause;
 use rustc_hash::FxHashMap as HashMap;
+
+use crate::typos::one_edit;
 
 /// Ordem do autocompletar e da expansão de prefixo: comprimento, depois alfabética.
 pub(crate) fn trie_order(a: &&str, b: &&str) -> std::cmp::Ordering {
@@ -133,13 +135,26 @@ pub(crate) struct Oracle {
     pub(crate) inflector: Option<fire_flower::Stemmer>,
     pub(crate) alpha: f64,
     pub(crate) mode: fire_flower::InflectionMode,
+    /// Correção de digitação (`None` desligada) e o vocabulário pela primeira
+    /// letra, para a força bruta.
+    pub(crate) typos: Option<TypoParams>,
+    pub(crate) by_first: HashMap<char, Vec<Vec<char>>>,
+}
+
+/// As regras da correção, do `Config` do motor.
+pub(crate) struct TypoParams {
+    pub(crate) weight: f64,
+    pub(crate) min_len: usize,
+    pub(crate) min_df: usize,
+    pub(crate) max_terms: usize,
 }
 
 /// Uma parte da consulta resolvida no oráculo.
 pub(crate) enum OClause<'a> {
     Term(&'a OTerm),
-    /// Palavra com flexões: a exata (se existe), as outras e o maior df entre elas.
-    Group(Option<&'a OTerm>, Vec<&'a OTerm>, usize),
+    /// Palavra com flexões ou correções: a exata (se existe), as outras, o
+    /// maior df entre elas, o peso das outras (α ou γ) e, numa correção, a troca.
+    Group { exact: Option<&'a OTerm>, others: Vec<&'a OTerm>, df: usize, weight: f64, fixed: Option<Correction> },
     /// As completações e o df do conjunto (documentos com alguma delas).
     Prefix(Vec<&'a OTerm>, usize),
     Phrase(Vec<(u32, &'a OTerm, &'a OPos)>),
@@ -213,6 +228,36 @@ impl Oracle {
             .unwrap_or_default()
     }
 
+    /// As correções de `term` por força bruta: com a correção ligada, termo
+    /// fraco (df < mínimo) e de pelo menos `min_len` letras, as palavras do
+    /// vocabulário a um erro, com a mesma primeira letra e df ≥ mínimo, da de
+    /// maior df para a de menor (no empate, alfabética), até `max_terms`.
+    pub(crate) fn fixes(&self, term: &str) -> Vec<(String, &OTerm)> {
+        let Some(p) = &self.typos else { return Vec::new() };
+        let q: Vec<char> = term.chars().collect();
+        if q.len() < p.min_len || self.terms.get(term).is_some_and(|t| t.docs.len() >= p.min_df) {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, &OTerm)> = self
+            .by_first
+            .get(&q[0])
+            .into_iter()
+            .flatten()
+            .filter(|w| one_edit(w, &q))
+            .map(|w| w.iter().collect::<String>())
+            .filter_map(|w| self.terms.get(&w).filter(|t| t.docs.len() >= p.min_df).map(|t| (w, t)))
+            .collect();
+        out.sort_by(|a, b| b.1.docs.len().cmp(&a.1.docs.len()).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(p.max_terms);
+        out
+    }
+
+    /// As trocas que a busca ranqueada faz (vazio se ela não acha nada).
+    pub(crate) fn corrections(&self, vocab: &[&str], clauses: &[Clause]) -> Option<Vec<Correction>> {
+        let (resolved, _) = self.resolve(vocab, clauses)?;
+        Some(resolved.into_iter().filter_map(|c| if let OClause::Group { fixed, .. } = c { fixed } else { None }).collect())
+    }
+
     /// Se a consulta soma as flexões, pelo modo: com `IfFewer(n)`, só quando
     /// a busca exata acha menos de `n` documentos.
     pub(crate) fn should_expand(&self, vocab: &[&str], clauses: &[Clause]) -> Option<bool> {
@@ -239,7 +284,14 @@ impl Oracle {
                 Clause::Term(t) if !t.prefix => {
                     let exact = self.terms.get(&t.text);
                     let others = if expand { self.variants(&t.text) } else { Vec::new() };
-                    if others.is_empty() {
+                    let fixes = if others.is_empty() { self.fixes(&t.text) } else { Vec::new() };
+                    if !fixes.is_empty() {
+                        let df = exact.iter().map(|t| t.docs.len()).chain(fixes.iter().map(|f| f.1.docs.len())).max().unwrap_or(0);
+                        let fixed = Correction { from: t.text.clone(), to: fixes.iter().map(|f| f.0.clone()).collect() };
+                        let weight = self.typos.as_ref().map_or(0.0, |p| p.weight);
+                        let others = fixes.into_iter().map(|f| f.1).collect();
+                        resolved.push(OClause::Group { exact, others, df, weight, fixed: Some(fixed) });
+                    } else if others.is_empty() {
                         match exact {
                             Some(term) => resolved.push(OClause::Term(term)),
                             None => return empty(),
@@ -247,7 +299,7 @@ impl Oracle {
                     } else {
                         // idf do maior df entre as palavras (como o motor e o `SynonymQuery` do Lucene).
                         let df = exact.iter().chain(&others).map(|t| t.docs.len()).max().unwrap_or(0);
-                        resolved.push(OClause::Group(exact, others, df));
+                        resolved.push(OClause::Group { exact, others, df, weight: self.alpha, fixed: None });
                     }
                 }
                 Clause::Term(t) => {
@@ -284,7 +336,7 @@ impl Oracle {
         for c in &resolved {
             match c {
                 OClause::Term(t) => sets.push(t.docs.clone()),
-                OClause::Group(exact, others, _) => {
+                OClause::Group { exact, others, .. } => {
                     let mut all: Vec<DocId> = exact.iter().chain(others).flat_map(|t| t.docs.iter().copied()).collect();
                     all.sort_unstable();
                     all.dedup();
@@ -326,11 +378,12 @@ impl Oracle {
                             let (tf, title_tf) = t.tfs_of(d).unwrap_or((0, 0));
                             self.bm25(self.idf(t.docs.len()), tf, title_tf, d)
                         }
-                        // Um termo só: tf~ = tf~_exata + α · tf~_flexões, idf do maior df.
-                        OClause::Group(exact, others, df) => {
+                        // Um termo só: tf~ = tf~_exata + α · tf~_flexões (ou γ ·
+                        // tf~_correções), idf do maior df.
+                        OClause::Group { exact, others, df, weight, .. } => {
                             let (tf, title_tf) = exact.and_then(|t| t.tfs_of(d)).unwrap_or((0, 0));
                             let (vtf, vtitle) = others.iter().filter_map(|t| t.tfs_of(d)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-                            let ptf = self.pseudo_tf(tf, title_tf, d) + self.alpha * self.pseudo_tf(vtf, vtitle, d);
+                            let ptf = self.pseudo_tf(tf, title_tf, d) + weight * self.pseudo_tf(vtf, vtitle, d);
                             self.saturate(self.idf(*df), ptf)
                         }
                         // Um termo só: idf do conjunto, tf somado (R1 do plano de relevância).

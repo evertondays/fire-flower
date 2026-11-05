@@ -14,6 +14,7 @@ use crate::corpus::Corpus;
 use crate::env::project_dir;
 use crate::relevance::regular_inflections;
 use crate::rng::Rng;
+use crate::typos::{one_edit, typo};
 use crate::vocab::{VocabEntry, read_vocab};
 
 /// Artigos cujos tokens o `queries` guarda para sortear frases.
@@ -245,6 +246,47 @@ pub(crate) fn queries(vocab_path: &Path, corpus_path: &Path, stopwords: &Stopwor
         .filter(|t| regular_inflections(t).iter().any(|v| df.get(v.as_str()).is_some_and(|&n| n >= 10)))
         .collect();
     sets.insert("t-inflection".into(), sample(&mut frng, &with_other));
+
+    // Erros de digitação (docs/plano-correcao-digitacao.md), com gerador
+    // próprio: palavras de frequência média (5+ letras, só a–z) com um erro
+    // gerado que não está no índice ou tem df 1 (`t-typo`, e `rank-typo` para o
+    // top 10), e palavras sem nenhuma correção possível, a um erro de alguma
+    // palavra com df ≥ 2 e a mesma primeira letra (`t-miss-far`: o custo de
+    // procurar e não achar).
+    let mut trng = Rng(seed ^ 0x7e70_5eed);
+    let pool: Vec<&str> =
+        medium.iter().copied().filter(|t| t.len() >= 5 && t.bytes().all(|b| b.is_ascii_lowercase())).collect();
+    let mut typos = Vec::new();
+    for _ in 0..per_set * 20 {
+        if typos.len() >= per_set || pool.is_empty() {
+            break;
+        }
+        let right = *trng.pick(&pool);
+        if let Some(wrong) = typo(right, &mut trng)
+            && df.get(wrong.as_str()).is_none_or(|&n| n < 2)
+        {
+            typos.push(wrong);
+        }
+    }
+    sets.insert("rank-typo".into(), typos.clone());
+    sets.insert("t-typo".into(), typos);
+    let mut near: HashMap<(char, usize), Vec<Vec<char>>> = HashMap::default();
+    for v in vocab.iter().filter(|v| v.df >= 2) {
+        let chars: Vec<char> = v.term.chars().collect();
+        near.entry((chars[0], chars.len())).or_default().push(chars);
+    }
+    let mut far = Vec::new();
+    while far.len() < per_set {
+        let w: Vec<char> = (0..trng.range(6, 10)).map(|_| (b'a' + trng.below(26) as u8) as char).collect();
+        let reachable = (w.len() - 1..=w.len() + 1)
+            .filter_map(|n| near.get(&(w[0], n)))
+            .any(|words| words.iter().any(|other| one_edit(other, &w)));
+        let w: String = w.into_iter().collect();
+        if !reachable && !known.contains(w.as_str()) {
+            far.push(w);
+        }
+    }
+    sets.insert("t-miss-far".into(), far);
 
     let out = out.unwrap_or_else(|| project_dir().join("bench/queries"));
     std::fs::create_dir_all(&out)?;

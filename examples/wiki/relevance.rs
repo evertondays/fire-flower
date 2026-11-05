@@ -14,6 +14,7 @@ use crate::AnyResult;
 use crate::corpus::{Corpus, stem};
 use crate::env::{config_json, save_result};
 use crate::rng::Rng;
+use crate::typos::typo;
 
 /// Uma consulta com resposta conhecida: algum dos `expected` tem que vir no topo.
 pub(crate) struct RelCase {
@@ -25,13 +26,14 @@ pub(crate) struct RelCase {
 
 /// Conjuntos gerados do corpus e a posição que conta como acerto em cada um
 /// (a métrica principal; top-1, top-3, top-10 e MRR saem para todos).
-pub(crate) const REL_SETS: [(&str, usize); 6] = [
+pub(crate) const REL_SETS: [(&str, usize); 7] = [
     ("rel-title", 1),
     ("rel-typing", 1),
     ("rel-hub", 1),
     ("rel-body", 10),
     ("rel-inflection", 10),
     ("rel-plural", 10),
+    ("rel-typo", 10),
 ];
 
 /// Plural e singular regulares de uma palavra normalizada (sem acentos),
@@ -125,10 +127,16 @@ pub(crate) fn reservoir<T>(rng: &mut Rng, kept: &mut Vec<T>, seen: usize, n: usi
 ///   flexão mais comum do mesmo radical (Snowball do português) que não está
 ///   no artigo ("eleitos" → "eleito"): o artigo no top-10. Sem stemming não
 ///   tem como achar; mede o que o stemming recupera.
+/// - `rel-typo`: as consultas do `rel-title` com um erro de digitação gerado
+///   numa palavra de 5+ letras que está em 2 ou mais documentos (a correção
+///   pode achá-la), sem que a palavra errada esteja no índice (df < 2): o
+///   artigo no top-10 (`docs/plano-correcao-digitacao.md`).
 pub(crate) fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &Stopwords, seed: u64, per_set: usize) -> AnyResult<Vec<(&'static str, Vec<RelCase>)>> {
     let mut rng = Rng(seed);
     let mut titles: Vec<(DocId, String, Vec<String>)> = Vec::new();
     let mut df: HashMap<String, u32> = HashMap::default();
+    // df no índice inteiro (título e texto), para o `rel-typo`.
+    let mut index_df: HashMap<String, u32> = HashMap::default();
     let mut by_title: Vec<RelCase> = Vec::new();
     let mut typing: Vec<RelCase> = Vec::new();
     let mut body_docs: Vec<(DocId, String, Vec<String>)> = Vec::new();
@@ -139,6 +147,10 @@ pub(crate) fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &St
         let body_terms = index_terms(&doc.body, stopwords);
         for t in &body_terms {
             *df.entry(t.clone()).or_insert(0) += 1;
+        }
+        let in_doc: HashSet<&String> = title_terms.iter().chain(&body_terms).collect();
+        for t in in_doc {
+            *index_df.entry(t.clone()).or_insert(0) += 1;
         }
         if title_terms.is_empty() {
             continue;
@@ -285,6 +297,30 @@ pub(crate) fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &St
         }
         plural.push(RelCase { query: format!("{} {}", pairs[a], pairs[b]), expected: vec![*id], title: title.clone() });
     }
+    // Digitação: gerador próprio (os conjuntos acima não mudam).
+    let mut trng = Rng(seed ^ 0x7e70_5eed);
+    let mut typos: Vec<RelCase> = Vec::new();
+    for case in &by_title {
+        let tokens = tokenize(&case.query);
+        let spots: Vec<usize> = (0..tokens.len())
+            .filter(|&i| {
+                let t = &tokens[i];
+                !stopwords.contains(t)
+                    && t.len() >= 5
+                    && t.bytes().all(|b| b.is_ascii_lowercase())
+                    && index_df.get(t).is_some_and(|&n| n >= 2)
+            })
+            .collect();
+        if spots.is_empty() {
+            continue;
+        }
+        let i = spots[trng.below(spots.len())];
+        let fresh = |w: &String| index_df.get(w).is_none_or(|&n| n < 2);
+        let Some(wrong) = (0..5).find_map(|_| typo(&tokens[i], &mut trng).filter(fresh)) else { continue };
+        let mut words = tokens.clone();
+        words[i] = wrong;
+        typos.push(RelCase { query: words.join(" "), expected: case.expected.clone(), title: case.title.clone() });
+    }
     Ok(vec![
         ("rel-title", by_title),
         ("rel-typing", typing),
@@ -292,6 +328,7 @@ pub(crate) fn generate_rel_sets(corpus: &Path, take: Option<u64>, stopwords: &St
         ("rel-body", body_cases),
         ("rel-inflection", inflected),
         ("rel-plural", plural),
+        ("rel-typo", typos),
     ])
 }
 

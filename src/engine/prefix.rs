@@ -121,7 +121,7 @@ impl View<'_> {
 
     /// Vários nós à mesma `depth`, na ordem de `ids`: os rasos do cache, o
     /// resto num `MultiGet` só.
-    fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
+    pub(super) fn nodes_many(&self, ids: impl Iterator<Item = u64>, depth: usize) -> Result<Vec<Arc<TrieNode>>> {
         let cached = self.engine.config.reader_cache_depth.is_some_and(|max| depth <= max);
         let mut out: Vec<Option<Arc<TrieNode>>> = Vec::new();
         let mut missing: Vec<(usize, u64)> = Vec::new();

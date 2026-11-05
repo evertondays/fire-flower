@@ -170,15 +170,15 @@ fn run(seed: u64, positions: bool) {
 
 #[test]
 pub(crate) fn random_edits_match_the_model() {
-    for seed in 1..=12 {
-        run(seed * 0x9E37_79B9_7F4A_7C15, true);
+    for seed in 1..=12u64 {
+        run(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), true);
     }
 }
 
 #[test]
 pub(crate) fn random_edits_match_the_model_without_positions() {
-    for seed in 1..=6 {
-        run(seed * 0x2545_F491_4F6C_DD1D, false);
+    for seed in 1..=6u64 {
+        run(seed.wrapping_mul(0x2545_F491_4F6C_DD1D), false);
     }
 }
 

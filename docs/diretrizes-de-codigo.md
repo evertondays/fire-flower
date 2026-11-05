@@ -142,8 +142,12 @@ Antes de abrir um PR:
 cargo test --release --all-targets
 cargo test --release --doc
 cargo clippy --release --all-targets   # zero warnings
+cargo test --all-targets               # debug: estouro de inteiro vira panic
 ```
 
+- O CI (`.github/workflows/rust.yml`) roda clippy, os testes em debug e os
+  doctests em todo PR. Em release, um estouro dá a volta em silêncio e o
+  teste pode passar com a conta errada.
 - Bug corrigido ganha um teste que falhava antes.
 - Mudança no índice, na busca ou no ranking passa pelo **oráculo**, que
   compara o motor com um índice ingênuo em memória e precisa dar **zero

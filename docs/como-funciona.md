@@ -1123,11 +1123,25 @@ segundo `Engine::open` falha, com uma mensagem que sugere o próximo item.
   que for gravado depois só aparece abrindo de novo (~30 ms no 100k);
 - lotes e `compact()` dão `Error::ReadOnly`.
 
-Se o processo que grava apaga um WAL ou SST antigo (fim de um flush ou de uma
-compactação) bem no meio da abertura, ela falha com "arquivo não existe";
-`open_read_only` tenta de novo até 5 vezes. A TUI, `search` e `suggest` da
-CLI abrem assim, com `Config::reader()` (block cache de 32 MB, sem criar
-banco).
+O RocksDB não garante essa abertura com outro processo gravando: ele lê o
+MANIFEST (a lista de SSTs) e depois lista e repete os WALs. Um flush ou uma
+compactação do outro processo no meio disso causa dois problemas:
+
+- um SST ou WAL listado some antes de ser aberto, e a abertura falha com
+  "arquivo não existe";
+- pior, um flush termina entre as duas leituras: o MANIFEST lido ainda não
+  tem o SST novo, e o WAL que ele substituiu já foi apagado. A abertura dá
+  certo, mas faltam os commits daquele WAL, e os do WAL seguinte estão lá: um
+  buraco no meio. O `Reader` via menos documentos depois de reabrir. Num teste
+  com flush a cada 3 commits, isso acontecia em toda rodada.
+
+O processo que grava só apaga um WAL ou SST depois de registrar a troca no
+MANIFEST. Por isso, `open_read_only` compara o nome e o tamanho do `CURRENT`
+e dos `MANIFEST-*` antes e depois de abrir: se mudaram, ou se faltou um
+arquivo, abre de novo (até 20 vezes, com 20 ms entre elas). Abrir de novo
+como instância secundária não resolveria: na abertura, ela também ignora os
+WALs que o primário já apagou. A TUI, `search` e `suggest` da CLI abrem
+assim, com `Config::reader()` (block cache de 32 MB, sem criar banco).
 
 O `Reader` faz isso sozinho para quem lê sem parar (workers do PHP-FPM, um
 cluster do Node):
@@ -1149,9 +1163,9 @@ cluster do Node):
   (cada lote escreve ~25 MB de WAL). `Config::max_wal_bytes` no processo que
   grava encolhe a memtable e o WAL (16 MB: média de 0,6 para 0,36 s).
 
-Um teste roda o escritor em outro processo, com commits e compactações,
-enquanto o `Reader` reabre e busca: nenhum commit pela metade, nenhuma volta
-no tempo.
+Um teste roda o escritor em outro processo, com 300 commits sem pausa e
+flush e compactação a cada 3, enquanto o `Reader` reabre e busca: nenhum
+commit pela metade, nenhuma volta no tempo.
 
 ### Métricas sem custo
 

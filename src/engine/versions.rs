@@ -53,7 +53,7 @@ pub(super) fn first_high(doc: DocId) -> u64 {
 
 /// O ID interno da versão seguinte a `id` (da faixa alta), se ainda houver.
 pub(super) fn next_high(id: u64) -> Option<u64> {
-    ((id - FIRST_VERSION) >> DOC_BITS < MAX_VERSION).then_some(id + (1 << DOC_BITS))
+    ((id - FIRST_VERSION) >> DOC_BITS < MAX_VERSION).then(|| id + (1 << DOC_BITS))
 }
 
 /// O ID do usuário de um ID interno.

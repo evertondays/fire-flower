@@ -1,0 +1,52 @@
+# Core e CLI: testes, doctests e clippy.
+#
+# Os testes rodam em debug, como `cargo test` no README: em debug, um estouro
+# de inteiro vira panic. Em release a conta dá a volta em silêncio, e dois
+# estouros passaram despercebidos assim. Os testes do binding Node ficam no
+# node.yml, e a imagem Docker, no docker.yml.
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # O RocksDB é compilado do fonte (C++) e o bindgen precisa da libclang.
+      - name: Dependências do sistema
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Guarda o RocksDB compilado: só recompila quando o Cargo.lock muda.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Clippy (zero avisos)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Testes (debug)
+        run: cargo test --all-targets
+
+      - name: Doctests
+        run: cargo test --doc

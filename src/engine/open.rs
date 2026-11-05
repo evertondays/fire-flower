@@ -131,25 +131,7 @@ impl Engine {
                 DB::open_cf_descriptors(&opts, path, [default_cf])
             }
         };
-        let mut opened = open();
-        // Só leitura, ao lado de quem grava: um WAL ou SST listado pode sumir
-        // no meio da abertura (o outro processo terminou um flush ou uma
-        // compactação). É passageiro; a próxima tentativa vê os arquivos novos.
-        for _ in 0..READ_ONLY_RETRIES {
-            match &opened {
-                Err(e) if read_only && is_missing_file(e) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    opened = open();
-                }
-                _ => break,
-            }
-        }
-        let db = match opened {
-            Ok(db) => db,
-            // Um banco antigo com merges pendentes no WAL falha já na
-            // recuperação, porque o merge operator não entende o formato antigo.
-            Err(e) => return Err(stored_format_error(path).unwrap_or_else(|| open_error(path, e))),
-        };
+        let db = if read_only { open_beside_writer(path, open)? } else { open().map_err(|e| failed(path, e))? };
         let writable = !read_only;
         let positions = resolve_format(&db, config.positions, writable)?;
         let next_node_id = read_counter(&db, META_NEXT_NODE)?.unwrap_or(ROOT_ID + 1);
@@ -256,9 +238,73 @@ fn open_error(path: &Path, e: rocksdb::Error) -> Error {
     }
 }
 
-/// Quantas vezes `open_read_only` tenta de novo quando um arquivo some no
-/// meio da abertura.
-const READ_ONLY_RETRIES: usize = 5;
+/// O erro de abertura: um banco antigo com merges pendentes no WAL falha já
+/// na recuperação, porque o merge operator não entende o formato antigo.
+fn failed(path: &Path, e: rocksdb::Error) -> Error {
+    stored_format_error(path).unwrap_or_else(|| open_error(path, e))
+}
+
+/// Quantas vezes a abertura só leitura tenta de novo quando o outro processo
+/// mexeu nos arquivos no meio dela.
+const READ_ONLY_RETRIES: usize = 20;
+
+/// Abre só para leitura ao lado de um processo que grava. O RocksDB lê o
+/// MANIFEST e depois lista e repete os WALs; ele não garante essa leitura com
+/// outro processo gravando, e duas corridas aparecem:
+///
+/// - um SST ou WAL listado no MANIFEST some antes de ser aberto (o outro
+///   processo terminou uma compactação): a abertura falha com arquivo
+///   ausente;
+/// - um flush termina no meio: o MANIFEST lido ainda não tem o SST novo e o
+///   WAL que ele substituiu já foi apagado. A abertura dá certo, mas sem os
+///   commits daquele WAL e com os do WAL seguinte: um buraco no meio, e o
+///   `Reader` "voltava no tempo".
+///
+/// O primário só apaga um WAL ou SST depois de registrar a troca no MANIFEST.
+/// Se o `CURRENT` e o MANIFEST estão iguais (nome e tamanho) antes e depois
+/// da abertura, nenhum arquivo que ela precisava sumiu. Senão, abre de novo.
+/// A secondary instance do RocksDB não evita isso: na abertura, ela também
+/// ignora os WALs que o primário já apagou.
+fn open_beside_writer(path: &Path, open: impl Fn() -> std::result::Result<DB, rocksdb::Error>) -> Result<DB> {
+    let mut attempt = 0;
+    loop {
+        let before = manifest_stamp(path);
+        let opened = open();
+        let stable = manifest_stamp(path) == before;
+        match opened {
+            Ok(db) if stable => return Ok(db),
+            Err(e) if !is_missing_file(&e) => return Err(failed(path, e)),
+            Err(e) if attempt == READ_ONLY_RETRIES => return Err(failed(path, e)),
+            Ok(_) if attempt == READ_ONLY_RETRIES => {
+                return Err(Error::Open(format!(
+                    "{}: o MANIFEST mudou durante {READ_ONLY_RETRIES} aberturas seguidas; tente de novo",
+                    path.display()
+                )));
+            }
+            _ => {}
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Nome e tamanho do `CURRENT` e dos `MANIFEST-*`: mudam a cada flush ou
+/// compactação do processo que grava.
+fn manifest_stamp(path: &Path) -> Vec<(std::ffi::OsString, u64)> {
+    let mut files: Vec<_> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name == "CURRENT" || name.starts_with("MANIFEST-")
+        })
+        .filter_map(|e| Some((e.file_name(), e.metadata().ok()?.len())))
+        .collect();
+    files.sort_unstable();
+    files
+}
 
 fn is_missing_file(e: &rocksdb::Error) -> bool {
     let text = e.to_string();

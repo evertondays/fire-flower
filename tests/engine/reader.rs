@@ -50,7 +50,7 @@ fn refresh_waits_for_the_minimum_interval() {
 }
 
 const CHILD_DB: &str = "FF_TEST_WRITER_DB";
-const CHILD_COMMITS: u64 = 60;
+const CHILD_COMMITS: u64 = 300;
 
 /// O escritor em outro processo: o próprio binário de teste, chamado de novo
 /// só com este teste e `FF_TEST_WRITER_DB`. Sem a variável, não faz nada.
@@ -66,10 +66,12 @@ fn writer_child_process() {
         batch.add_document(i * 2, "beta comum").unwrap();
         batch.add_document(i * 2 + 1, "gama comum").unwrap();
         batch.commit().unwrap();
-        if i % 20 == 0 {
-            engine.compact().unwrap(); // apaga SSTs e versões mortas com leitores abertos
+        // Flush e compactação a cada 3 commits: apagam WALs, SSTs e versões
+        // mortas com leitores abrindo. Com menos, a corrida de um flush no
+        // meio da abertura (`open_beside_writer`) quase nunca aparecia.
+        if i % 3 == 0 {
+            engine.compact().unwrap();
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
